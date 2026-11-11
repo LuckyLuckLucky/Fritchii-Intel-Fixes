@@ -1,0 +1,40 @@
+From c1b47f2d6e26bb1bee55c90c88be95ccb61c3f31 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:54 +0100
+Subject: [PATCH 09/14] vulkan_device: "Automatic" movie upscaler stays on the
+ bilinear copy on Intel's 8x16x16 path
+
+With cooperative matrices on, g_native_tensor_ops made "Automatic" run the game's own movie
+network (32-lane tensor programs f9ea14a22394f5b1, eff3ccbe1438679d, ...). On Intel's 8x16x16
+path it drew a pink line and speckled columns over OoT's title movie. Gameplay HMMA programs keep
+the matrices.
+
+Tested: Arc B580, title screen screenshots at fixed frame counts are clean.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/vulkan_common/vulkan_device.cpp | 8 ++++++--
+ 1 file changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 76030535d..c8688158a 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1904,8 +1904,12 @@ void Device::RemoveUnsuitableExtensions() {
+                                            features.cooperative_matrix,
+                                            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+     }
+-    VideoCommon::Nx2Perf::g_native_tensor_ops.store(extensions.cooperative_matrix,
+-                                                    std::memory_order_relaxed);
++    // Picks the movie upscaler (Automatic: the game's own network where tensor operations are
++    // native). Not on Intel's 8x16x16 path: OoT's movie network (its 32-lane compute programs,
++    // f9ea14a22394f5b1 and others) drew a pink line and speckled columns over the title movie on
++    // an Arc B580, the bilinear copy does not. The gameplay HMMA programs keep the matrices.
++    VideoCommon::Nx2Perf::g_native_tensor_ops.store(
++        extensions.cooperative_matrix && !cooperative_hmma_8x16x16, std::memory_order_relaxed);
+ 
+     // VK_KHR_workgroup_memory_explicit_layout
+     extensions.workgroup_memory_explicit_layout =
+-- 
+2.56.1.windows.1
+

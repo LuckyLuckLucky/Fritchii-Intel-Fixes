@@ -1,0 +1,156 @@
+From 2e8904c25777dae5eede7fc39a5cb28e6d058391 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:54 +0100
+Subject: [PATCH 08/14] spirv: Intel's 8x16x16 HMMA rounds after each K=8 half,
+ as the guest
+
+HMMA.16816.F16 rounds the accumulator to fp16 after each K=8 group (the software path does
+too); one K=16 matrix product rounds once. Offline, 42 of OoT's 55 tensor shaders differed from
+the software path, in up to 25% of outputs, sometimes inf on one side only.
+
+On 8-row matrices a K=16 HMMA is now two products: B with its upper K half zeroed, then its
+lower half (second B tile, 512 scratch words per subgroup instead of 384), with a subgroup
+barrier between. NVIDIA/AMD (16-row) paths unchanged.
+
+Verified offline: differences gone to fp16 rounding, bit-identical for inputs within 0.05,
+spirv-val 55/55. Cost on the hot 64x36 pass: 1.4 -> 2.0 ms (still 7.5x faster than software).
+In game (owner, B580): steady 40 fps in smaller areas.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../backend/spirv/emit_spirv_tensor.cpp       | 72 +++++++++++++------
+ 1 file changed, 52 insertions(+), 20 deletions(-)
+
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+index c20996d0c..dbb222e30 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+@@ -117,23 +117,40 @@ void SubgroupBarrier(EmitContext& ctx) {
+     ctx.OpControlBarrier(scope, scope, ctx.Const(SubgroupBarrierSemantics));
+ }
+ 
++// Shared memory words per subgroup for the cooperative HMMA tiles: A, B and C. Intel's 8-row
++// matrices add a second B tile, for the upper K half of a K=16 product (see below).
++u32 CooperativeScratchWordsPerSubgroup(const Profile& profile) {
++    return profile.support_cooperative_hmma_8x16x16 ? 512U : 384U;
++}
++
+ // One HMMA.16816.F16 (or .1688 with zero upper halves) of a 32-lane warp on 16x16x16 matrices: the
+ // NVIDIA fragments go to row-major A, column-major B (columns 8-15 zero) and row-major C tiles in
+ // shared memory, one cooperative-matrix multiply-add replaces the per-lane emulation, and each lane
+ // reads its two D words back from where it wrote C. With 8-row matrices (Intel Xe2's 8x16x16) the
+ // top and bottom halves of A and C are two products with the same B.
+ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& types,
+-                               u32 scratch_word, Id a, Id b, Id c) {
++                               u32 scratch_word, Id a, Id b, Id c, u32 depth) {
+     const Id u32ty = ctx.U32[1];
+     const auto imm = [&](u32 value) { return ctx.Const(value); };
+     const auto add = [&](Id lhs, Id rhs) { return ctx.OpIAdd(u32ty, lhs, rhs); };
+     const Id lane = ctx.OpBitwiseAnd(u32ty, ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id),
+                                      imm(31));
+     const Id subgroup = ctx.OpLoad(u32ty, ctx.tensor_subgroup_id);
+-    const Id base = add(imm(scratch_word), ctx.OpIMul(u32ty, subgroup, imm(384)));
++    const Id base = add(imm(scratch_word),
++                        ctx.OpIMul(u32ty, subgroup, imm(CooperativeScratchWordsPerSubgroup(ctx.profile))));
+     const Id tile_a = base;
+     const Id tile_b = add(base, imm(128));
+     const Id tile_c = add(base, imm(256));
++    // HMMA.16816.F16 rounds the accumulator to fp16 after each K=8 group (the software path does
++    // the same), but one K=16 matrix product rounds once. On Intel's 8-row matrices a K=16 HMMA
++    // is two products, with B's upper K half zero and then its lower half, so the fp16
++    // accumulator in between gives the guest's midpoint rounding. One product rounding once
++    // differed from the guest in up to a quarter of the outputs and overflowed to infinity where
++    // the guest does not (red lines in OoT's menu, Arc B580). Only B is split: zeroing A too
++    // (exact even for an infinity in A) cost OoT's 64x36 pass 2.8 ms instead of 2.0 ms. K=8 and
++    // the 16-row paths keep one product.
++    const bool split_k = depth == 16 && types.rows == 8;
++    const Id tile_b_high = add(base, imm(384));
+     const Id g = ctx.OpShiftRightLogical(u32ty, lane, imm(2));
+     const Id t = ctx.OpBitwiseAnd(u32ty, lane, imm(3));
+     // Word of (row, first column pair) in a 16x16 fp16 tile with 8 words a row/column.
+@@ -147,10 +164,18 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
+     store(tile_a, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, a, 2));
+     store(tile_a, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, a, 3));
+     // B column g holds k pairs t (b0) and t+4 (b1); columns 8-15 (words 64-127) are zero.
++    // Split: tile_b holds only the lower K half (b0) and tile_b_high only the upper (b1).
+     store(tile_b, row_lo, ctx.OpCompositeExtract(u32ty, b, 0));
+-    store(tile_b, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
++    store(tile_b, add(row_lo, imm(4)),
++          split_k ? ctx.u32_zero_value : ctx.OpCompositeExtract(u32ty, b, 1));
+     store(tile_b, add(lane, imm(64)), ctx.u32_zero_value);
+     store(tile_b, add(lane, imm(96)), ctx.u32_zero_value);
++    if (split_k) {
++        store(tile_b_high, row_lo, ctx.u32_zero_value);
++        store(tile_b_high, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
++        store(tile_b_high, add(lane, imm(64)), ctx.u32_zero_value);
++        store(tile_b_high, add(lane, imm(96)), ctx.u32_zero_value);
++    }
+     store(tile_c, row_lo, ctx.OpCompositeExtract(u32ty, c, 0));
+     store(tile_c, row_hi, ctx.OpCompositeExtract(u32ty, c, 1));
+     SubgroupBarrier(ctx);
+@@ -161,22 +186,29 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
+     };
+     // Eight rows of a tile are 64 words. The first product emits what the 16-row path always did,
+     // in the same order (A, B, C), so its SPIR-V is unchanged on NVIDIA and AMD.
+-    std::optional<Id> matrix_b;
+-    for (u32 row = 0; row < 16; row += types.rows) {
+-        const Id rows_a = row == 0 ? tile_a : add(tile_a, imm(row * 8));
+-        const Id rows_c = row == 0 ? tile_c : add(tile_c, imm(row * 8));
+-        const Id matrix_a = load(types.matrix_a, rows_a, LayoutRowMajor);
+-        if (!matrix_b) {
+-            matrix_b = load(types.matrix_b, tile_b, LayoutColumnMajor);
++    for (u32 half = 0; half < (split_k ? 2U : 1U); ++half) {
++        if (half == 1) {
++            // The first K half's fp16 results are in tile_c for the second.
++            SubgroupBarrier(ctx);
++        }
++        std::optional<Id> matrix_b;
++        for (u32 row = 0; row < 16; row += types.rows) {
++            const Id rows_a = row == 0 ? tile_a : add(tile_a, imm(row * 8));
++            const Id rows_c = row == 0 ? tile_c : add(tile_c, imm(row * 8));
++            const Id matrix_a = load(types.matrix_a, rows_a, LayoutRowMajor);
++            if (!matrix_b) {
++                matrix_b = load(types.matrix_b, half == 0 ? tile_b : tile_b_high,
++                                LayoutColumnMajor);
++            }
++            const Id matrix_c = load(types.matrix_c, rows_c, LayoutRowMajor);
++            // OpCooperativeMatrixMulAddKHR and OpCooperativeMatrixStoreKHR %pointer %object
++            // %layout %stride after PatchCooperativeHmma.
++            const Id matrix_d = ctx.OpSelect(types.matrix_c, matrix_a, *matrix_b, matrix_c);
++            const std::array<Sirit::MemoryAccessLiteral, 2> store_operands{
++                imm(LayoutRowMajor).value, stride.value};
++            ctx.OpStore(SharedWord(ctx, rows_c), matrix_d,
++                        std::span<const Sirit::MemoryAccessLiteral>(store_operands));
+         }
+-        const Id matrix_c = load(types.matrix_c, rows_c, LayoutRowMajor);
+-        // OpCooperativeMatrixMulAddKHR and OpCooperativeMatrixStoreKHR %pointer %object %layout
+-        // %stride after PatchCooperativeHmma.
+-        const Id matrix_d = ctx.OpSelect(types.matrix_c, matrix_a, *matrix_b, matrix_c);
+-        const std::array<Sirit::MemoryAccessLiteral, 2> store_operands{imm(LayoutRowMajor).value,
+-                                                                       stride.value};
+-        ctx.OpStore(SharedWord(ctx, rows_c), matrix_d,
+-                    std::span<const Sirit::MemoryAccessLiteral>(store_operands));
+     }
+     SubgroupBarrier(ctx);
+     const Id d0 = ctx.OpLoad(u32ty, SharedWord(ctx, add(tile_c, row_lo)));
+@@ -203,7 +235,7 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
+                             program.workgroup_size[2];
+     const u32 subgroups = invocations / GUEST_WARP_LANES;
+     const u32 scratch_offset = (program.shared_memory_size + 15U) & ~15U;
+-    const u32 total = scratch_offset + subgroups * 384U * 4U;
++    const u32 total = scratch_offset + subgroups * CooperativeScratchWordsPerSubgroup(profile) * 4U;
+     // Past the device limit the pipeline would fail to build: keep the emulation.
+     if (profile.max_compute_shared_memory_size != 0 &&
+         total > profile.max_compute_shared_memory_size) {
+@@ -369,7 +401,7 @@ Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
+     }
+     if (ctx.tensor_scratch_word) {
+         return EmitCooperativeTensorMulAdd(ctx, *ctx.cooperative_hmma, *ctx.tensor_scratch_word, a,
+-                                           b, c);
++                                           b, c, depth);
+     }
+     if (depth == 16 && ctx.cooperative_hmma) {
+         return EmitCooperativeHmma(ctx, *ctx.cooperative_hmma, ctx.U32[1], ctx.U32[2], a, b, c);
+-- 
+2.56.1.windows.1
+

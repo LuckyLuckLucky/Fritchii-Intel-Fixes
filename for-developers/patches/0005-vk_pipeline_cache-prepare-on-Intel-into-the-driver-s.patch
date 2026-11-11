@@ -1,0 +1,109 @@
+From ab7185965e0ba9552bedbdeec92927aac8a3535a Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:52 +0100
+Subject: [PATCH 05/14] vk_pipeline_cache: prepare on Intel, into the driver's
+ own shader cache
+
+DriverCachesPipelines listed only NVIDIA and AMD, so the preparation was skipped on Intel. Intel's
+Windows driver keeps a persistent per-program disk cache (%LOCALAPPDATA%Low/Intel/ShaderCache):
+measured on a B580, a 9.7 s compile came back in 1.4 ms in a new process.
+
+IntelDriverCache(): Intel's Windows driver counts as caching pipelines. As with
+EDEN_NX2_AMD_APP_CACHE on AMD, our VkPipelineCache file stays on for pipelines built in play
+(512 MiB cap) and the preparation's builds go to the driver's cache only (AppCacheBesideDriver).
+EDEN_NX2_INTEL_DRIVER_CACHE=0 restores the old behaviour.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/nx2_precompile.h               |  3 +-
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 32 ++++++++++++++++---
+ 2 files changed, 29 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/nx2_precompile.h b/src/video_core/nx2_precompile.h
+index aacc2082b..88b1e9af1 100644
+--- a/src/video_core/nx2_precompile.h
++++ b/src/video_core/nx2_precompile.h
+@@ -28,7 +28,8 @@ namespace VideoCommon::Nx2Precompile {
+ 
+ /// EDEN_NX2_PRECOMPILE: 0 (the default) off; 1 prepares a title's precompiled pipelines in the
+ /// background where the driver keeps a pipeline cache of its own (NVIDIA, AMD's proprietary
+-/// driver); 2 also on other drivers. Read when first asked, after nx2_switches.txt is applied.
++/// driver, Intel's Windows driver); 2 also on other drivers. Read when first asked, after
++/// nx2_switches.txt is applied.
+ [[nodiscard]] int Mode();
+ 
+ /// EDEN_NX2_PRECOMPILED_FORCE=1 (#895's switch): prepare again although the stamp says it is done.
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 69d890652..2d221175a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -666,11 +666,33 @@ bool AmdAppCache(const Device& device) {
+     return enabled && device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+ }
+ 
++/// Intel's Windows driver keeps a disk cache of its own (%LOCALAPPDATA%Low\Intel\ShaderCache,
++/// one file per program: ~476 MB for Lichii after a session on an Arc B580), so the preparation
++/// can build into it. Our VkPipelineCache file is kept beside it for what play builds, as
++/// EDEN_NX2_AMD_APP_CACHE does on AMD: the boot rebuilds of earlier sessions' pipelines read it
++/// (3014 pipelines in 7 s), whatever the driver's cache evicted. EDEN_NX2_INTEL_DRIVER_CACHE=0
++/// treats Intel as before (no preparation, our file only).
++bool IntelDriverCache(const Device& device) {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_INTEL_DRIVER_CACHE");
++        return value == nullptr || value[0] != '0';
++    }();
++    return enabled && device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
++}
++
++/// Our VkPipelineCache file is kept although the driver caches pipelines itself: the
++/// preparation's builds then go to the driver's cache only (PlayPipelineCache).
++bool AppCacheBesideDriver(const Device& device) {
++    return AmdAppCache(device) || IntelDriverCache(device);
++}
++
+ bool DriverCachesPipelines(const Device& device) {
+     switch (device.GetDriverID()) {
+     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+     case VK_DRIVER_ID_AMD_PROPRIETARY:
+         return true;
++    case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
++        return IntelDriverCache(device);
+     default:
+         return false;
+     }
+@@ -691,7 +713,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       texture_cache{texture_cache_}, shader_notify{shader_notify_},
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+-                                (!DriverCachesPipelines(device_) || AmdAppCache(device_))},
++                                (!DriverCachesPipelines(device_) || AppCacheBesideDriver(device_))},
+       oot_visual_workaround{[] {
+           const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+           return value != nullptr && std::string_view{value} == "1";
+@@ -2765,8 +2787,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         LogDriverCacheFolder(device, "at boot");
+         LOG_INFO(Render_Vulkan, "Our VkPipelineCache file: {}",
+                  !use_vulkan_pipeline_cache  ? "off (the driver's own cache only)"
+-                 : AmdAppCache(device)        ? "on for pipelines built in play "
+-                                                "(EDEN_NX2_AMD_APP_CACHE, up to 512 MiB)"
++                 : AppCacheBesideDriver(device) ? "on for pipelines built in play "
++                                                "(beside the driver's cache, up to 512 MiB)"
+                                               : "on");
+         LOG_INFO(Render_Vulkan, "VK_KHR_pipeline_binary: {}",
+                  device.GetAvailableExtensions().contains("VK_KHR_pipeline_binary")
+@@ -5404,10 +5426,10 @@ vk::PipelineCache& PipelineCache::PlayPipelineCache() {
+     // gigabytes. With EDEN_NX2_AMD_APP_CACHE, past 512 MiB no new pipeline goes into it either
+     // (a VkPipelineCache can't evict; the file is read into RAM at every boot).
+     constexpr size_t AmdAppCacheCap = size_t{512} << 20;
+-    if (t_precompile_build && AmdAppCache(device)) {
++    if (t_precompile_build && AppCacheBesideDriver(device)) {
+         return no_pipeline_cache;
+     }
+-    if (AmdAppCache(device) &&
++    if (AppCacheBesideDriver(device) &&
+         last_cache_size.load(std::memory_order_relaxed) >= AmdAppCacheCap) {
+         return no_pipeline_cache;
+     }
+-- 
+2.56.1.windows.1
+

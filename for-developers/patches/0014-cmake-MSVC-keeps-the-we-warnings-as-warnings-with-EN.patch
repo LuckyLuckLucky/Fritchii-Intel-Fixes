@@ -1,0 +1,37 @@
+From 9211083cf77ecb13d57f4c66df719f0fb2319a88 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:57 +0100
+Subject: [PATCH 14/14] cmake: MSVC keeps the /we warnings as warnings with
+ ENABLE_WERROR=OFF
+
+The tree is built with clang-cl; MSVC turns 16 style warnings into errors and stopped on the
+first shadowed name (frizti_settings.cpp). With ENABLE_WERROR=OFF they stay warnings (/w1NNNN).
+Default builds (ENABLE_WERROR=ON) are unchanged. Build only, optional to merge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/CMakeLists.txt | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 62624942c..63e8c1aaa 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -140,6 +140,14 @@ if (MSVC AND NOT CXX_CLANG)
+             /W4
+             /WX-
+         )
++        # ENABLE_WERROR=OFF keeps the warnings above as warnings: the tree is built with clang-cl,
++        # so an MSVC build otherwise stops on its first shadowed name.
++        if (NOT ENABLE_WERROR)
++            add_compile_options(
++                /w14062 /w14189 /w14265 /w14388 /w14389 /w14456 /w14457 /w14458 /w14459
++                /w14547 /w14549 /w14555 /w14826 /w15038 /w15233 /w15245
++            )
++        endif()
+     endif()
+ 
+     if (ARCHITECTURE_x86_64)
+-- 
+2.56.1.windows.1
+

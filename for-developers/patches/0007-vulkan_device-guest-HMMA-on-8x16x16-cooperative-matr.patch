@@ -1,0 +1,52 @@
+From 7c32c68472118c376ba3dc944fe2d14a46d20d64 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:53 +0100
+Subject: [PATCH 07/14] vulkan_device: guest HMMA on 8x16x16 cooperative
+ matrices on Intel's Windows driver
+
+OoT's compute shader 6bd913e1f34e83eb (64x36 tile pass, once per frame) emulated HMMA with
+32-lane shuffles: 13.5 ms of GPU time per frame on an Arc B580 (SIMD32, 12,480 B of register
+spill per lane), ~65% of the frame in slow outdoor scenes. The 8x16x16 path (Lichii#779, Mesa
+ANV) was off on Intel Windows because the driver's float16 is "broken"; but that workaround only
+disables float16 arithmetic in translated shaders (float16_math), and the device keeps
+shaderFloat16 for the matrices.
+
+Offline on the B580 (same shader and inputs): 15.1 ms -> 1.25 ms, 75,795 -> 14,098 instructions,
+compile 9.6 s -> 2.0 s. EDEN_NX2_NO_COOP_MATRIX=1 goes back to the software path.
+
+Tested: owner, B580: outdoor areas 20-30 fps -> ~40 fps.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/video_core/vulkan_common/vulkan_device.cpp | 13 ++++++++-----
+ 1 file changed, 8 insertions(+), 5 deletions(-)
+
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index 34e69d087..76030535d 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1886,13 +1886,16 @@ void Device::RemoveUnsuitableExtensions() {
+         cooperative_hmma_16x16x16 =
+             usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+         // Intel Xe2 (ANV) only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so
+-        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779). Not Intel's Windows
+-        // driver: the constructor turns its shaderFloat16 off after this check ("Intel has broken
+-        // float16 math"), and the matrices need it; #779 was measured on Mesa ANV.
++        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779, measured on Mesa
++        // ANV). Intel's Windows driver too: its "broken float16 math" workaround only turns off
++        // float16 arithmetic in translated shaders (float16_math); the device keeps shaderFloat16
++        // for the matrices (see where float16_math is set). Arc B580, driver 101.9150: the
++        // software HMMA of OoT's 64x36 tile pass spilled 12 KB of scratch per lane at SIMD32 and
++        // took 13.5-15 ms a frame; on 8x16x16 matrices the same dispatch took 1.3 ms.
++        // EDEN_NX2_NO_COOP_MATRIX=1 goes back to the software path.
+         constexpr u32 intel_vendor_id = 0x8086;
+         cooperative_hmma_8x16x16 =
+-            usable && properties.properties.vendorID == intel_vendor_id &&
+-            driver_id != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && has_shape(8, 16) &&
++            usable && properties.properties.vendorID == intel_vendor_id && has_shape(8, 16) &&
+             IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+         extensions.cooperative_matrix =
+             cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x16x16;
+-- 
+2.56.1.windows.1
+

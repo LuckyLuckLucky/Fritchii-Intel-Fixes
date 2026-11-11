@@ -1,0 +1,194 @@
+From d5c49fcf391fa84a9eb4685de00d8f8dcbe78f79 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:49 +0100
+Subject: [PATCH 01/14] vulkan: dynamic primitive topology follows the
+ pipeline's tessellation stages
+
+With extended dynamic state the rasterizer recorded the guest topology (TRIANGLE_LIST) for
+pipelines with tessellation stages; only the static state was corrected to PATCH_LIST in
+FillStates. Intel honours the dynamic value as given (dynamicPrimitiveTopologyUnrestricted), so
+triangle lists went into the hull/domain shaders: random light beams and stray stretched
+triangles in OoT on Arc. NVIDIA treats tessellated input as patches anyway.
+
+The dynamic topology now uses FillStates' rules (PATCH_LIST with tessellation, POINT_LIST for
+patches without), and the state tracker re-records it when only the pipeline changes.
+Primitive restart support is checked against the same host topology.
+
+Tested: Arc B580 (owner) and Arc 140V (tester), light beams gone. Valid Vulkan everywhere.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  |  3 +++
+ .../renderer_vulkan/vk_graphics_pipeline.h    |  6 +++++
+ .../renderer_vulkan/vk_rasterizer.cpp         | 22 ++++++++++++++-----
+ .../renderer_vulkan/vk_rasterizer.h           |  2 ++
+ .../renderer_vulkan/vk_state_tracker.cpp      |  1 +
+ .../renderer_vulkan/vk_state_tracker.h        | 12 ++++++++++
+ 6 files changed, 40 insertions(+), 6 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 142ca79c7..efd983003 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -749,6 +749,9 @@ GraphicsPipeline::GraphicsPipeline(
+     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+         present_stages[stage] = infos[stage] != nullptr;
+     }
++    // Mesh pipelines can hold the mesh program in slot 1; the pipeline cache drops pipelines
++    // with only one of the two tessellation stages.
++    has_tessellation = !IsMeshPipeline() && (present_stages[1] || present_stages[2]);
+     configure_func = ConfigureFunc(present_stages, stage_infos);
+     build.emplace(worker_thread, std::move(func));
+ }
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index f1e203485..0df5c83dc 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -196,6 +196,11 @@ public:
+         return stage_infos[0].is_task || stage_infos[0].is_mesh;
+     }
+ 
++    /// Has tessellation control and evaluation stages: drawn as a patch list.
++    [[nodiscard]] bool HasTessellation() const noexcept {
++        return has_tessellation;
++    }
++
+     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
+     [[nodiscard]] bool IsEmulatedMesh() const noexcept {
+         return mesh_emulation.has_value();
+@@ -420,6 +425,7 @@ private:
+     size_t num_image_elements{};
+     std::vector<SampledImage> sampled_images;
+     u32 num_textures{};
++    bool has_tessellation{};
+     bool fragment_has_color0_output{};
+     u32 zero_texture_handles{};
+     u32 color_output_mask{};
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 7d973646f..222e8826f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -3888,7 +3888,19 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
+     }
+     const auto topology = maxwell3d->draw_manager.draw_state.topology;
+     const bool topology_changed = !emulated_mesh && state_tracker.ChangePrimitiveTopology(topology);
+-    if (topology_changed) {
++    // The dynamic topology follows the bound pipeline the way its static one does (FillStates):
++    // a patch list with tessellation stages, points for patches without them. Intel honours the
++    // dynamic topology as given (dynamicPrimitiveTopologyUnrestricted), so a tessellation
++    // pipeline drawn as a triangle list put stray, stretched triangles on screen.
++    dynamic_host_topology = MaxwellToVK::PrimitiveTopology(device, topology);
++    if (pipeline != nullptr && pipeline->HasTessellation()) {
++        dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
++    } else if (dynamic_host_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
++        dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++    }
++    const bool host_topology_changed =
++        !emulated_mesh && state_tracker.ChangeHostPrimitiveTopology(dynamic_host_topology);
++    if (topology_changed || host_topology_changed) {
+         flags[Dirty::DepthBiasEnable] = true;
+         flags[Dirty::PrimitiveRestartEnable] = true;
+     }
+@@ -3912,9 +3924,8 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
+             UpdateDepthWriteEnable(regs);
+             UpdateStencilTestEnable(regs);
+         }
+-        if (topology_changed) {
+-            scheduler.Record([topology_vk = MaxwellToVK::PrimitiveTopology(device, topology)](
+-                                 vk::CommandBuffer cmdbuf) {
++        if (host_topology_changed) {
++            scheduler.Record([topology_vk = dynamic_host_topology](vk::CommandBuffer cmdbuf) {
+                 cmdbuf.SetPrimitiveTopologyEXT(topology_vk);
+             });
+         }
+@@ -4352,8 +4363,7 @@ void RasterizerVulkan::UpdatePrimitiveRestartEnable(Tegra::Engines::Maxwell3D::R
+     if (device.IsMoltenVK()) {
+         enable = true;
+     } else if (enable) {
+-        const auto topology = MaxwellToVK::PrimitiveTopology(device, maxwell3d->draw_manager.draw_state.topology);
+-        enable = IsPrimitiveRestartSupported(device, topology);
++        enable = IsPrimitiveRestartSupported(device, dynamic_host_topology);
+     }
+ 
+     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 63018f511..92cf6a63e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -345,6 +345,8 @@ private:
+     } oot_actor, oot_previous_actor;
+     u64 render_trace_frame = 0;
+     u32 render_trace_draws = 0;
++    /// The topology UpdateDynamicStates gives the draw (see there).
++    VkPrimitiveTopology dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+     u32 render_trace_clears = 0;
+     bool pending_native_work{};
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.cpp b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+index 0b132c97d..28351a7bc 100644
+--- a/src/video_core/renderer_vulkan/vk_state_tracker.cpp
++++ b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+@@ -264,6 +264,7 @@ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
+ void StateTracker::InvalidateState() {
+     flags->set();
+     current_topology = INVALID_TOPOLOGY;
++    current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+     stencil_reset = true;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.h b/src/video_core/renderer_vulkan/vk_state_tracker.h
+index 50cc337d9..fada035eb 100644
+--- a/src/video_core/renderer_vulkan/vk_state_tracker.h
++++ b/src/video_core/renderer_vulkan/vk_state_tracker.h
+@@ -12,6 +12,7 @@
+ #include "common/common_types.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/vulkan_common/vulkan.h"
+ 
+ namespace Tegra {
+ namespace Control {
+@@ -86,6 +87,7 @@ public:
+     void InvalidateCommandBufferState() {
+         (*flags) |= invalidation_flags;
+         current_topology = INVALID_TOPOLOGY;
++        current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+         stencil_reset = true;
+     }
+ 
+@@ -97,6 +99,7 @@ public:
+             (*flags)[index] = true;
+         }
+         current_topology = INVALID_TOPOLOGY;
++        current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+     }
+ 
+     void InvalidateViewports() {
+@@ -296,6 +299,14 @@ public:
+         return has_changed;
+     }
+ 
++    /// The topology last given to vkCmdSetPrimitiveTopologyEXT, which also follows the bound
++    /// pipeline's tessellation stages.
++    bool ChangeHostPrimitiveTopology(VkPrimitiveTopology new_topology) {
++        const bool has_changed = current_host_topology != new_topology;
++        current_host_topology = new_topology;
++        return has_changed;
++    }
++
+     void SetupTables(Tegra::Control::ChannelState& channel_state);
+ 
+     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
+@@ -321,6 +332,7 @@ private:
+     Tegra::Engines::Maxwell3D::DirtyState::Flags default_flags;
+     Tegra::Engines::Maxwell3D::DirtyState::Flags invalidation_flags;
+     Maxwell::PrimitiveTopology current_topology = INVALID_TOPOLOGY;
++    VkPrimitiveTopology current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+     bool two_sided_stencil = false;
+     StencilProperties front{};
+     StencilProperties back{};
+
+base-commit: 4f5c53149b7e17d1c24445f68d79a83a3b2a17f9
+-- 
+2.56.1.windows.1
+

@@ -1,0 +1,95 @@
+From 1c2fb66c397b290018388d5db3f7b75fc218d84a Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:55 +0100
+Subject: [PATCH 11/14] vulkan: optional 16-lane compute shaders on Intel (off
+ by default)
+
+Intel's driver compiles OoT's large global-memory compute shaders (24-31k instructions) at SIMD16
+and SIMD32 and often keeps SIMD32 with ~5.7 KB of spill. Required 16 lanes compile ~2.6x faster
+without spills, but run slower in game (Hyrule Field ~35 vs ~39.5 fps on a B580), so this is off.
+
+EDEN_NX2_INTEL_COMPUTE_SIMD16=1 applies it to shaders with global memory accesses, 2 to every
+compute shader without warp operations. Default: pipelines exactly as before. Optional to merge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_compute_pipeline.cpp   | 21 +++++++++++++----
+ src/video_core/vulkan_common/vulkan_device.h  | 23 +++++++++++++++++++
+ 2 files changed, 40 insertions(+), 4 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index ec9ace455..d9632408b 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -280,6 +280,22 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                                    info.uses_quad_shuffles || info.uses_fswzadd ||
+                                    info.uses_cooperative_matrix;
++        // Shaders without them may be given a narrower size where the driver's choice spills
++        // (Intel, Device::NarrowComputeSubgroupSize).
++        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT narrow_subgroup_size_ci{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++            .pNext = nullptr,
++            .requiredSubgroupSize = uses_warp_ops
++                                        ? 0
++                                        : device.NarrowComputeSubgroupSize(info.uses_global_memory),
++        };
++        const void* const stage_next =
++            device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
++                    device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
++                ? static_cast<const void*>(&subgroup_size_ci)
++            : narrow_subgroup_size_ci.requiredSubgroupSize != 0
++                ? static_cast<const void*>(&narrow_subgroup_size_ci)
++                : nullptr;
+         VkPipelineCreateFlags flags{};
+         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+@@ -296,10 +312,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             .flags = flags,
+             .stage{
+                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+-                             ? &subgroup_size_ci
+-                             : nullptr,
++                .pNext = stage_next,
+                 .flags = info.uses_cooperative_matrix
+                              ? VkPipelineShaderStageCreateFlags{
+                                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 10bce2f51..8551e7802 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -566,6 +566,29 @@ FN_MAX_LIMIT_LIST
+                control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
+     }
+ 
++    /// The subgroup size to require for compute shaders without warp-width operations, 0 for the
++    /// driver's choice. Intel (Xe2) compiles large compute shaders SIMD32 with register spills
++    /// (5.7 KB of scratch for Ocarina of Time's global memory shaders) after also compiling them
++    /// SIMD16: 16 lanes build ~2.6x faster without spills, but run slower (Hyrule Field on a
++    /// B580: ~35 instead of ~39.5 fps; f84d5909908cc5ea 0.14 instead of 0.07 ms a dispatch), so
++    /// it is off unless asked for. EDEN_NX2_INTEL_COMPUTE_SIMD16: 0 (default) off, 1 shaders with
++    /// global memory accesses, 2 every shader without warp operations.
++    u32 NarrowComputeSubgroupSize(bool uses_global_memory) const {
++        constexpr u32 narrow = 16;
++        static const int mode = [] {
++            const char* value = std::getenv("EDEN_NX2_INTEL_COMPUTE_SIMD16");
++            return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 0;
++        }();
++        const auto& control = properties.subgroup_size_control;
++        const bool applies = mode == 2 || (mode == 1 && uses_global_memory);
++        return applies && properties.properties.vendorID == 0x8086 &&
++                       extensions.subgroup_size_control &&
++                       IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
++                       control.minSubgroupSize <= narrow && narrow <= control.maxSubgroupSize
++                   ? narrow
++                   : 0;
++    }
++
+     /// Returns true if a stage may run in subgroups narrower than the guest's warp (Intel runs
+     /// fragment and vertex shaders SIMD8 or SIMD16, and those cannot be given a size).
+     bool IsWarpSizePotentiallySmallerThanGuest() const {
+-- 
+2.56.1.windows.1
+

@@ -1,0 +1,1013 @@
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 62624942c..63e8c1aaa 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -140,6 +140,14 @@ if (MSVC AND NOT CXX_CLANG)
+             /W4
+             /WX-
+         )
++        # ENABLE_WERROR=OFF keeps the warnings above as warnings: the tree is built with clang-cl,
++        # so an MSVC build otherwise stops on its first shadowed name.
++        if (NOT ENABLE_WERROR)
++            add_compile_options(
++                /w14062 /w14189 /w14265 /w14388 /w14389 /w14456 /w14457 /w14458 /w14459
++                /w14547 /w14549 /w14555 /w14826 /w15038 /w15233 /w15245
++            )
++        endif()
+     endif()
+ 
+     if (ARCHITECTURE_x86_64)
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv.cpp b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+index 5f0583919..110df007c 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv.cpp
+@@ -598,7 +598,8 @@ void RewriteOpcodes(std::vector<u32>& code, std::span<const std::pair<u32, spv::
+             return;
+         }
+         if (opcode == spv::Op::OpGroupNonUniformShuffleXor ||
+-            opcode == spv::Op::OpGroupNonUniformQuadBroadcast) {
++            opcode == spv::Op::OpGroupNonUniformQuadBroadcast ||
++            opcode == spv::Op::OpAtomicFMaxEXT) {
+             const auto it{std::ranges::find(rewrites, code[offset + 2],
+                                             &std::pair<u32, spv::Op>::first)};
+             if (it != rewrites.end()) {
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+index 88e93f3b6..1446cf624 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_atomic.cpp
+@@ -374,6 +374,16 @@ Id EmitStorageAtomicExchange32x2(EmitContext& ctx, const IR::Value& binding,
+ 
+ Id EmitStorageAtomicAddF32(EmitContext& ctx, const IR::Value& binding, const IR::Value& offset,
+                            Id value) {
++    if (ctx.native_f32_atomic_add) {
++        // OpAtomicFAddEXT, which Sirit lacks: emitted as OpAtomicFMaxEXT (the same words) and
++        // rewritten after assembly (RewriteOpcodes).
++        const Id pointer{StoragePointer(ctx, ctx.storage_types.F32, &StorageDefinitions::F32,
++                                        binding, offset, sizeof(f32))};
++        const auto [scope, semantics]{AtomicArgs(ctx)};
++        const Id result{ctx.OpAtomicFMax(ctx.F32[1], pointer, scope, semantics, value)};
++        ctx.opcode_rewrites.emplace_back(result.value, spv::Op::OpAtomicFAddEXT);
++        return result;
++    }
+     const Id ssbo{ctx.ssbos[binding.U32()].U32};
+     const Id base_index{StorageIndex(ctx, offset, sizeof(u32))};
+     return ctx.OpFunctionCall(ctx.F32[1], ctx.f32_add_cas, base_index, value, ssbo);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+index c20996d0c..dbb222e30 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_tensor.cpp
+@@ -117,23 +117,40 @@ void SubgroupBarrier(EmitContext& ctx) {
+     ctx.OpControlBarrier(scope, scope, ctx.Const(SubgroupBarrierSemantics));
+ }
+ 
++// Shared memory words per subgroup for the cooperative HMMA tiles: A, B and C. Intel's 8-row
++// matrices add a second B tile, for the upper K half of a K=16 product (see below).
++u32 CooperativeScratchWordsPerSubgroup(const Profile& profile) {
++    return profile.support_cooperative_hmma_8x16x16 ? 512U : 384U;
++}
++
+ // One HMMA.16816.F16 (or .1688 with zero upper halves) of a 32-lane warp on 16x16x16 matrices: the
+ // NVIDIA fragments go to row-major A, column-major B (columns 8-15 zero) and row-major C tiles in
+ // shared memory, one cooperative-matrix multiply-add replaces the per-lane emulation, and each lane
+ // reads its two D words back from where it wrote C. With 8-row matrices (Intel Xe2's 8x16x16) the
+ // top and bottom halves of A and C are two products with the same B.
+ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& types,
+-                               u32 scratch_word, Id a, Id b, Id c) {
++                               u32 scratch_word, Id a, Id b, Id c, u32 depth) {
+     const Id u32ty = ctx.U32[1];
+     const auto imm = [&](u32 value) { return ctx.Const(value); };
+     const auto add = [&](Id lhs, Id rhs) { return ctx.OpIAdd(u32ty, lhs, rhs); };
+     const Id lane = ctx.OpBitwiseAnd(u32ty, ctx.OpLoad(u32ty, ctx.subgroup_local_invocation_id),
+                                      imm(31));
+     const Id subgroup = ctx.OpLoad(u32ty, ctx.tensor_subgroup_id);
+-    const Id base = add(imm(scratch_word), ctx.OpIMul(u32ty, subgroup, imm(384)));
++    const Id base = add(imm(scratch_word),
++                        ctx.OpIMul(u32ty, subgroup, imm(CooperativeScratchWordsPerSubgroup(ctx.profile))));
+     const Id tile_a = base;
+     const Id tile_b = add(base, imm(128));
+     const Id tile_c = add(base, imm(256));
++    // HMMA.16816.F16 rounds the accumulator to fp16 after each K=8 group (the software path does
++    // the same), but one K=16 matrix product rounds once. On Intel's 8-row matrices a K=16 HMMA
++    // is two products, with B's upper K half zero and then its lower half, so the fp16
++    // accumulator in between gives the guest's midpoint rounding. One product rounding once
++    // differed from the guest in up to a quarter of the outputs and overflowed to infinity where
++    // the guest does not (red lines in OoT's menu, Arc B580). Only B is split: zeroing A too
++    // (exact even for an infinity in A) cost OoT's 64x36 pass 2.8 ms instead of 2.0 ms. K=8 and
++    // the 16-row paths keep one product.
++    const bool split_k = depth == 16 && types.rows == 8;
++    const Id tile_b_high = add(base, imm(384));
+     const Id g = ctx.OpShiftRightLogical(u32ty, lane, imm(2));
+     const Id t = ctx.OpBitwiseAnd(u32ty, lane, imm(3));
+     // Word of (row, first column pair) in a 16x16 fp16 tile with 8 words a row/column.
+@@ -147,10 +164,18 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
+     store(tile_a, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, a, 2));
+     store(tile_a, add(row_hi, imm(4)), ctx.OpCompositeExtract(u32ty, a, 3));
+     // B column g holds k pairs t (b0) and t+4 (b1); columns 8-15 (words 64-127) are zero.
++    // Split: tile_b holds only the lower K half (b0) and tile_b_high only the upper (b1).
+     store(tile_b, row_lo, ctx.OpCompositeExtract(u32ty, b, 0));
+-    store(tile_b, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
++    store(tile_b, add(row_lo, imm(4)),
++          split_k ? ctx.u32_zero_value : ctx.OpCompositeExtract(u32ty, b, 1));
+     store(tile_b, add(lane, imm(64)), ctx.u32_zero_value);
+     store(tile_b, add(lane, imm(96)), ctx.u32_zero_value);
++    if (split_k) {
++        store(tile_b_high, row_lo, ctx.u32_zero_value);
++        store(tile_b_high, add(row_lo, imm(4)), ctx.OpCompositeExtract(u32ty, b, 1));
++        store(tile_b_high, add(lane, imm(64)), ctx.u32_zero_value);
++        store(tile_b_high, add(lane, imm(96)), ctx.u32_zero_value);
++    }
+     store(tile_c, row_lo, ctx.OpCompositeExtract(u32ty, c, 0));
+     store(tile_c, row_hi, ctx.OpCompositeExtract(u32ty, c, 1));
+     SubgroupBarrier(ctx);
+@@ -161,22 +186,29 @@ Id EmitCooperativeTensorMulAdd(EmitContext& ctx, const CooperativeHmmaTypes& typ
+     };
+     // Eight rows of a tile are 64 words. The first product emits what the 16-row path always did,
+     // in the same order (A, B, C), so its SPIR-V is unchanged on NVIDIA and AMD.
+-    std::optional<Id> matrix_b;
+-    for (u32 row = 0; row < 16; row += types.rows) {
+-        const Id rows_a = row == 0 ? tile_a : add(tile_a, imm(row * 8));
+-        const Id rows_c = row == 0 ? tile_c : add(tile_c, imm(row * 8));
+-        const Id matrix_a = load(types.matrix_a, rows_a, LayoutRowMajor);
+-        if (!matrix_b) {
+-            matrix_b = load(types.matrix_b, tile_b, LayoutColumnMajor);
++    for (u32 half = 0; half < (split_k ? 2U : 1U); ++half) {
++        if (half == 1) {
++            // The first K half's fp16 results are in tile_c for the second.
++            SubgroupBarrier(ctx);
++        }
++        std::optional<Id> matrix_b;
++        for (u32 row = 0; row < 16; row += types.rows) {
++            const Id rows_a = row == 0 ? tile_a : add(tile_a, imm(row * 8));
++            const Id rows_c = row == 0 ? tile_c : add(tile_c, imm(row * 8));
++            const Id matrix_a = load(types.matrix_a, rows_a, LayoutRowMajor);
++            if (!matrix_b) {
++                matrix_b = load(types.matrix_b, half == 0 ? tile_b : tile_b_high,
++                                LayoutColumnMajor);
++            }
++            const Id matrix_c = load(types.matrix_c, rows_c, LayoutRowMajor);
++            // OpCooperativeMatrixMulAddKHR and OpCooperativeMatrixStoreKHR %pointer %object
++            // %layout %stride after PatchCooperativeHmma.
++            const Id matrix_d = ctx.OpSelect(types.matrix_c, matrix_a, *matrix_b, matrix_c);
++            const std::array<Sirit::MemoryAccessLiteral, 2> store_operands{
++                imm(LayoutRowMajor).value, stride.value};
++            ctx.OpStore(SharedWord(ctx, rows_c), matrix_d,
++                        std::span<const Sirit::MemoryAccessLiteral>(store_operands));
+         }
+-        const Id matrix_c = load(types.matrix_c, rows_c, LayoutRowMajor);
+-        // OpCooperativeMatrixMulAddKHR and OpCooperativeMatrixStoreKHR %pointer %object %layout
+-        // %stride after PatchCooperativeHmma.
+-        const Id matrix_d = ctx.OpSelect(types.matrix_c, matrix_a, *matrix_b, matrix_c);
+-        const std::array<Sirit::MemoryAccessLiteral, 2> store_operands{imm(LayoutRowMajor).value,
+-                                                                       stride.value};
+-        ctx.OpStore(SharedWord(ctx, rows_c), matrix_d,
+-                    std::span<const Sirit::MemoryAccessLiteral>(store_operands));
+     }
+     SubgroupBarrier(ctx);
+     const Id d0 = ctx.OpLoad(u32ty, SharedWord(ctx, add(tile_c, row_lo)));
+@@ -203,7 +235,7 @@ std::optional<u32> ReserveCooperativeHmmaScratch(const Profile& profile, IR::Pro
+                             program.workgroup_size[2];
+     const u32 subgroups = invocations / GUEST_WARP_LANES;
+     const u32 scratch_offset = (program.shared_memory_size + 15U) & ~15U;
+-    const u32 total = scratch_offset + subgroups * 384U * 4U;
++    const u32 total = scratch_offset + subgroups * CooperativeScratchWordsPerSubgroup(profile) * 4U;
+     // Past the device limit the pipeline would fail to build: keep the emulation.
+     if (profile.max_compute_shared_memory_size != 0 &&
+         total > profile.max_compute_shared_memory_size) {
+@@ -369,7 +401,7 @@ Id EmitTensorMulAdd(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
+     }
+     if (ctx.tensor_scratch_word) {
+         return EmitCooperativeTensorMulAdd(ctx, *ctx.cooperative_hmma, *ctx.tensor_scratch_word, a,
+-                                           b, c);
++                                           b, c, depth);
+     }
+     if (depth == 16 && ctx.cooperative_hmma) {
+         return EmitCooperativeHmma(ctx, *ctx.cooperative_hmma, ctx.U32[1], ctx.U32[2], a, b, c);
+diff --git a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+index 999f008ca..c53c8e8e4 100644
+--- a/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
++++ b/src/shader_recompiler/backend/spirv/emit_spirv_warp.cpp
+@@ -90,6 +90,17 @@ Id GuestLane(EmitContext& ctx, Id index) {
+     return ctx.OpBitwiseAnd(ctx.U32[1], index, ctx.Const(31U));
+ }
+ 
++// A guest lane past a narrower host subgroup (Intel's SIMD16 fragment shaders) has no host
++// invocation, and shuffling from it is undefined: it is treated as out of the shuffle's range, so
++// the lane keeps its own value and the in-bounds predicate is false.
++Id InHostSubgroup(EmitContext& ctx, Id in_range, Id src_thread_id) {
++    if (!Sirit::ValidId(ctx.subgroup_size)) {
++        return in_range;
++    }
++    const Id size{ctx.OpLoad(ctx.U32[1], ctx.subgroup_size)};
++    return ctx.OpLogicalAnd(ctx.U1, in_range, ctx.OpULessThan(ctx.U1, src_thread_id, size));
++}
++
+ bool UseShuffleFallback(EmitContext& ctx) {
+     return ctx.profile.has_broken_spirv_subgroup_shuffle ||
+            (ctx.profile.has_broken_spirv_fragment_shuffle && ctx.stage == Stage::Fragment);
+@@ -247,7 +258,8 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
+ 
+     const Id lhs{ctx.OpBitwiseAnd(ctx.U32[1], GuestLane(ctx, index), not_seg_mask)};
+     const Id src_thread_id{ctx.OpBitwiseOr(ctx.U32[1], lhs, min_thread_id)};
+-    const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
++    const Id in_range{InHostSubgroup(
++        ctx, ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id), src_thread_id)};
+ 
+     SetInBoundsFlag(inst, in_range);
+     if (!StageSupportsSubgroups(ctx)) {
+@@ -291,7 +303,8 @@ Id EmitShuffleDown(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id clam
+     const Id thread_id{EmitLaneId(ctx)};
+     const Id max_thread_id{GetMaxThreadId(ctx, thread_id, clamp, segmentation_mask)};
+     const Id src_thread_id{ctx.OpIAdd(ctx.U32[1], thread_id, delta)};
+-    const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
++    const Id in_range{InHostSubgroup(
++        ctx, ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id), src_thread_id)};
+ 
+     SetInBoundsFlag(inst, in_range);
+     const Id shuffled{ShuffleRelative(ctx, value, delta, src_thread_id,
+@@ -309,7 +322,8 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
+     const Id thread_id{EmitLaneId(ctx)};
+     const Id max_thread_id{GetMaxThreadId(ctx, thread_id, clamp, segmentation_mask)};
+     const Id src_thread_id{ctx.OpBitwiseXor(ctx.U32[1], thread_id, mask)};
+-    const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
++    const Id in_range{InHostSubgroup(
++        ctx, ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id), src_thread_id)};
+ 
+     SetInBoundsFlag(inst, in_range);
+     const Id shuffled{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask)};
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+index 7e017593a..ea5d1fd5d 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.cpp
+@@ -1487,6 +1487,14 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
+     IR::Type used_types{profile.support_descriptor_aliasing ? info.used_storage_buffer_types
+                                                             : IR::Type::U32};
+     used_types |= IR::Type::U32;
++    // Float32 atomic adds on an aliased float view of the buffers, in hardware.
++    native_f32_atomic_add = info.uses_atomic_f32_add && profile.support_float32_atomic_add &&
++                            profile.support_descriptor_aliasing;
++    if (native_f32_atomic_add) {
++        used_types |= IR::Type::F32;
++        AddExtension("SPV_EXT_shader_atomic_float_add");
++        AddCapability(spv::Capability::AtomicFloat32AddEXT);
++    }
+     if (profile.support_int8 && profile.support_storage_buffer_8bit &&
+         True(used_types & IR::Type::U8)) {
+         DefineSsbos(*this, storage_types.U8, &StorageDefinitions::U8, info, binding, U8,
+@@ -1539,7 +1547,7 @@ void EmitContext::DefineStorageBuffers(const Info& info, u32& binding) {
+         decrement_cas_ssbo = CasLoop(*this, Operation::Decrement, storage_types.U32.array,
+                                      storage_types.U32.element, U32[1], spv::Scope::Device);
+     }
+-    if (info.uses_atomic_f32_add) {
++    if (info.uses_atomic_f32_add && !native_f32_atomic_add) {
+         f32_add_cas = CasLoop(*this, Operation::FPAdd, storage_types.U32.array,
+                               storage_types.U32.element, F32[1], spv::Scope::Device);
+     }
+@@ -1735,6 +1743,12 @@ void EmitContext::DefineInputs(const IR::Program& program) {
+         if (stage == Stage::Fragment) {
+             Decorate(subgroup_local_invocation_id, spv::Decoration::Flat);
+         }
++        if (info.uses_subgroup_shuffles && profile.warp_size_potentially_smaller_than_guest) {
++            subgroup_size = DefineInput(*this, U32[1], false, spv::BuiltIn::SubgroupSize);
++            if (stage == Stage::Fragment) {
++                Decorate(subgroup_size, spv::Decoration::Flat);
++            }
++        }
+     }
+     if (info.uses_fswzadd) {
+         const Id f32_one{Const(1.0f)};
+diff --git a/src/shader_recompiler/backend/spirv/spirv_emit_context.h b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+index 019a34078..d38fcb625 100644
+--- a/src/shader_recompiler/backend/spirv/spirv_emit_context.h
++++ b/src/shader_recompiler/backend/spirv/spirv_emit_context.h
+@@ -286,6 +286,9 @@ public:
+     Id sample_id{};
+     Id is_helper_invocation{};
+     Id subgroup_local_invocation_id{};
++    /// SubgroupSize, when the host subgroup may be narrower than the guest warp and the program
++    /// shuffles (Profile::warp_size_potentially_smaller_than_guest).
++    Id subgroup_size{};
+     Id subgroup_mask_eq{};
+     Id subgroup_mask_lt{};
+     Id subgroup_mask_le{};
+@@ -392,6 +395,8 @@ public:
+     Id tensor_subgroup_id{};
+     std::vector<Id> interfaces;
+     std::vector<std::pair<u32, spv::Op>> opcode_rewrites;
++    /// Storage float32 atomic adds use OpAtomicFAddEXT (Profile::support_float32_atomic_add).
++    bool native_f32_atomic_add{};
+ 
+     // Task and mesh programs. Their stage buffer: the task's output region is the task payload
+     // (the mesh stage's input region); the mesh output regions live in workgroup memory until
+diff --git a/src/shader_recompiler/profile.h b/src/shader_recompiler/profile.h
+index e0a2e1cae..6c3d0cce7 100644
+--- a/src/shader_recompiler/profile.h
++++ b/src/shader_recompiler/profile.h
+@@ -48,6 +48,9 @@ struct Profile {
+     bool support_demote_to_helper_invocation{};
+     bool support_int64_atomics{};
+     bool support_shared_int64_atomics{};
++    /// Storage buffer float32 atomic add in hardware (VK_EXT_shader_atomic_float), not a
++    /// compare-exchange loop.
++    bool support_float32_atomic_add{};
+     bool support_derivative_control{};
+     bool support_geometry_shader_passthrough{};
+     bool support_native_ndc{};
+@@ -67,6 +70,9 @@ struct Profile {
+     bool support_storage_texel_buffer_array_nonuniform_indexing{};
+ 
+     bool warp_size_potentially_larger_than_guest{};
++    /// Some stages may run in subgroups narrower than the guest's 32 lanes (Intel's SIMD8/16
++    /// fragment and vertex shaders): shuffles from lanes past the subgroup are kept in bounds.
++    bool warp_size_potentially_smaller_than_guest{};
+ 
+     bool lower_left_origin_mode{};
+     /// Fragment outputs have to be declared even if they are not written to avoid undefined values.
+diff --git a/src/video_core/nx2_precompile.h b/src/video_core/nx2_precompile.h
+index aacc2082b..88b1e9af1 100644
+--- a/src/video_core/nx2_precompile.h
++++ b/src/video_core/nx2_precompile.h
+@@ -28,7 +28,8 @@ namespace VideoCommon::Nx2Precompile {
+ 
+ /// EDEN_NX2_PRECOMPILE: 0 (the default) off; 1 prepares a title's precompiled pipelines in the
+ /// background where the driver keeps a pipeline cache of its own (NVIDIA, AMD's proprietary
+-/// driver); 2 also on other drivers. Read when first asked, after nx2_switches.txt is applied.
++/// driver, Intel's Windows driver); 2 also on other drivers. Read when first asked, after
++/// nx2_switches.txt is applied.
+ [[nodiscard]] int Mode();
+ 
+ /// EDEN_NX2_PRECOMPILED_FORCE=1 (#895's switch): prepare again although the stamp says it is done.
+diff --git a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+index ec9ace455..d9632408b 100644
+--- a/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_compute_pipeline.cpp
+@@ -280,6 +280,22 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+                                    info.uses_subgroup_shuffles || info.uses_subgroup_mask ||
+                                    info.uses_quad_shuffles || info.uses_fswzadd ||
+                                    info.uses_cooperative_matrix;
++        // Shaders without them may be given a narrower size where the driver's choice spills
++        // (Intel, Device::NarrowComputeSubgroupSize).
++        const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT narrow_subgroup_size_ci{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++            .pNext = nullptr,
++            .requiredSubgroupSize = uses_warp_ops
++                                        ? 0
++                                        : device.NarrowComputeSubgroupSize(info.uses_global_memory),
++        };
++        const void* const stage_next =
++            device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
++                    device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
++                ? static_cast<const void*>(&subgroup_size_ci)
++            : narrow_subgroup_size_ci.requiredSubgroupSize != 0
++                ? static_cast<const void*>(&narrow_subgroup_size_ci)
++                : nullptr;
+         VkPipelineCreateFlags flags{};
+         if (device.IsKhrPipelineExecutablePropertiesEnabled() && Settings::values.renderer_debug.GetValue()) {
+             flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+@@ -296,10 +312,7 @@ ComputePipeline::ComputePipeline(const Device& device_, Scheduler& scheduler, vk
+             .flags = flags,
+             .stage{
+                 .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-                .pNext = device.IsExtSubgroupSizeControlSupported() && uses_warp_ops &&
+-                                 device.IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT)
+-                             ? &subgroup_size_ci
+-                             : nullptr,
++                .pNext = stage_next,
+                 .flags = info.uses_cooperative_matrix
+                              ? VkPipelineShaderStageCreateFlags{
+                                    VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT}
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index 142ca79c7..39df2f868 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -237,6 +237,22 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits
+     return slot_stage;
+ }
+ 
++// Votes, ballots, lane ids and shuffles span the guest's 32-thread warp. NVIDIA always runs 32
++// lanes, but Intel picks SIMD16 or SIMD32 per shader: a task shader's ballot then saw half the
++// warp and its meshlet compaction dropped or repeated meshlets (flickering and missing foliage on
++// Arc). Only stages with these ops are pinned, as in compute pipelines; quad ops need no more
++// than 4 lanes.
++bool UsesWarpWidthOps(const Shader::Info& info) {
++    return info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
++           info.uses_subgroup_shuffles || info.uses_subgroup_mask;
++}
++
++const void* GuestWarpSizeChain(const Device& device, const Shader::Info& info,
++                               VkShaderStageFlagBits stage,
++                               const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT& ci) {
++    return UsesWarpWidthOps(info) && device.CanRequireGuestWarpSize(stage) ? &ci : nullptr;
++}
++
+ // The stage of a pipeline stage slot (vertex, tessellation control and evaluation, geometry,
+ // fragment).
+ VkShaderStageFlagBits SlotStage(size_t index) {
+@@ -749,6 +765,9 @@ GraphicsPipeline::GraphicsPipeline(
+     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+         present_stages[stage] = infos[stage] != nullptr;
+     }
++    // Mesh pipelines can hold the mesh program in slot 1; the pipeline cache drops pipelines
++    // with only one of the two tessellation stages.
++    has_tessellation = !IsMeshPipeline() && (present_stages[1] || present_stages[2]);
+     configure_func = ConfigureFunc(present_stages, stage_infos);
+     build.emplace(worker_thread, std::move(func));
+ }
+@@ -2300,7 +2319,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     PipelineStates states;
+     FillStates(states);
+     const bool is_mesh{states.is_mesh};
+-    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+         .pNext = nullptr,
+         .requiredSubgroupSize = GuestWarpSize,
+@@ -2315,19 +2334,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         }
+         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
+         const bool emulated_vertex{mesh_emulation && stage == 0};
+-        [[maybe_unused]] auto& stage_ci =
+-            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-                .pNext = nullptr,
+-                .flags = 0,
+-                .stage = emulated_vertex
+-                             ? VK_SHADER_STAGE_VERTEX_BIT
+-                             : StageFlag(stage_infos[stage],
+-                                         MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+-                .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
+-                .pName = "main",
+-                .pSpecializationInfo = nullptr,
+-            });
++        const VkShaderStageFlagBits stage_flag{
++            emulated_vertex ? VK_SHADER_STAGE_VERTEX_BIT
++                            : StageFlag(stage_infos[stage],
++                                        MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
++        shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++            .pNext = emulated_vertex ? nullptr
++                                     : GuestWarpSizeChain(device, stage_infos[stage], stage_flag,
++                                                          subgroup_size_ci),
++            .flags = 0,
++            .stage = stage_flag,
++            .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
++            .pName = "main",
++            .pSpecializationInfo = nullptr,
++        });
+     }
+     // Mesh emulation draws a plain triangle list without vertex attributes.
+     const VkPipelineVertexInputStateCreateInfo emulation_vertex_input{
+@@ -2519,6 +2540,11 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
+     // The library's own set layouts, identically defined to the linked pipeline's (same
+     // signature in the key), so the library outlives the pipeline that built it.
+     std::array<VkDescriptorSetLayout, NUM_STAGES> set_layouts{};
++    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++        .pNext = nullptr,
++        .requiredSubgroupSize = GuestWarpSize,
++    };
+     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+         if (!InPart(part, stage)) {
+@@ -2533,13 +2559,14 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
+         if (!spv_modules[stage]) {
+             continue;
+         }
+-        // Same stage info as the monolithic pipeline (MakePipeline), which sets no subgroup size.
++        // Same stage info as the monolithic pipeline (MakePipeline).
++        const VkShaderStageFlagBits stage_flag{
++            StageFlag(stage_infos[stage], MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
+         shader_stages.push_back({
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-            .pNext = nullptr,
++            .pNext = GuestWarpSizeChain(device, stage_infos[stage], stage_flag, subgroup_size_ci),
+             .flags = 0,
+-            .stage = StageFlag(stage_infos[stage],
+-                               MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
++            .stage = stage_flag,
+             .module = *spv_modules[stage],
+             .pName = "main",
+             .pSpecializationInfo = nullptr,
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index f1e203485..0df5c83dc 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -196,6 +196,11 @@ public:
+         return stage_infos[0].is_task || stage_infos[0].is_mesh;
+     }
+ 
++    /// Has tessellation control and evaluation stages: drawn as a patch list.
++    [[nodiscard]] bool HasTessellation() const noexcept {
++        return has_tessellation;
++    }
++
+     /// Mesh pipeline drawn through the compute emulation (MeshEmulationSetup).
+     [[nodiscard]] bool IsEmulatedMesh() const noexcept {
+         return mesh_emulation.has_value();
+@@ -420,6 +425,7 @@ private:
+     size_t num_image_elements{};
+     std::vector<SampledImage> sampled_images;
+     u32 num_textures{};
++    bool has_tessellation{};
+     bool fragment_has_color0_output{};
+     u32 zero_texture_handles{};
+     u32 color_output_mask{};
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 1bb0d45e4..cb4bfd90a 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -666,11 +666,33 @@ bool AmdAppCache(const Device& device) {
+     return enabled && device.GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY;
+ }
+ 
++/// Intel's Windows driver keeps a disk cache of its own (%LOCALAPPDATA%Low\Intel\ShaderCache,
++/// one file per program: ~476 MB for Lichii after a session on an Arc B580), so the preparation
++/// can build into it. Our VkPipelineCache file is kept beside it for what play builds, as
++/// EDEN_NX2_AMD_APP_CACHE does on AMD: the boot rebuilds of earlier sessions' pipelines read it
++/// (3014 pipelines in 7 s), whatever the driver's cache evicted. EDEN_NX2_INTEL_DRIVER_CACHE=0
++/// treats Intel as before (no preparation, our file only).
++bool IntelDriverCache(const Device& device) {
++    static const bool enabled = [] {
++        const char* value = std::getenv("EDEN_NX2_INTEL_DRIVER_CACHE");
++        return value == nullptr || value[0] != '0';
++    }();
++    return enabled && device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
++}
++
++/// Our VkPipelineCache file is kept although the driver caches pipelines itself: the
++/// preparation's builds then go to the driver's cache only (PlayPipelineCache).
++bool AppCacheBesideDriver(const Device& device) {
++    return AmdAppCache(device) || IntelDriverCache(device);
++}
++
+ bool DriverCachesPipelines(const Device& device) {
+     switch (device.GetDriverID()) {
+     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
+     case VK_DRIVER_ID_AMD_PROPRIETARY:
+         return true;
++    case VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS:
++        return IntelDriverCache(device);
+     default:
+         return false;
+     }
+@@ -691,7 +713,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+       texture_cache{texture_cache_}, shader_notify{shader_notify_},
+       use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
+-                                (!DriverCachesPipelines(device_) || AmdAppCache(device_))},
++                                (!DriverCachesPipelines(device_) || AppCacheBesideDriver(device_))},
+       oot_visual_workaround{[] {
+           const char* value = std::getenv("EDEN_NX2_OOT_VISUAL_WORKAROUND");
+           return value != nullptr && std::string_view{value} == "1";
+@@ -772,6 +794,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+             device.IsExtShaderDemoteToHelperInvocationSupported(),
+         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
+         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
++        .support_float32_atomic_add = device.IsFloat32AtomicAddSupported(),
+         .support_derivative_control = true,
+         .support_geometry_shader_passthrough = device.IsNvGeometryShaderPassthroughSupported(),
+         .support_native_ndc = device.IsExtDepthClipControlSupported(),
+@@ -788,6 +811,7 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+             device.IsStorageTexelBufferArrayNonUniformIndexingSupported(),
+ 
+         .warp_size_potentially_larger_than_guest = device.IsWarpSizePotentiallyBiggerThanGuest(),
++        .warp_size_potentially_smaller_than_guest = device.IsWarpSizePotentiallySmallerThanGuest(),
+ 
+         .lower_left_origin_mode = false,
+         .need_declared_frag_colors = false,
+@@ -2764,8 +2788,8 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
+         LogDriverCacheFolder(device, "at boot");
+         LOG_INFO(Render_Vulkan, "Our VkPipelineCache file: {}",
+                  !use_vulkan_pipeline_cache  ? "off (the driver's own cache only)"
+-                 : AmdAppCache(device)        ? "on for pipelines built in play "
+-                                                "(EDEN_NX2_AMD_APP_CACHE, up to 512 MiB)"
++                 : AppCacheBesideDriver(device) ? "on for pipelines built in play "
++                                                "(beside the driver's cache, up to 512 MiB)"
+                                               : "on");
+         LOG_INFO(Render_Vulkan, "VK_KHR_pipeline_binary: {}",
+                  device.GetAvailableExtensions().contains("VK_KHR_pipeline_binary")
+@@ -4307,6 +4331,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+     // preparation) one per host thread, at normal priority.
+     const size_t full_threads =
+         std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
++    // On Intel it does not build beside the game: there its compiles took the CPU from the game
++    // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
++    // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
++    // from Prepare Shaders Now (ShaderNotify::WarmMayBuild); the Preparing shaders screen runs it
++    // at full speed as before. EDEN_NX2_PRECOMPILE_WHILE_PLAYING=1 builds beside the game anyway.
++    static const bool while_playing = [] {
++        const char* value = std::getenv("EDEN_NX2_PRECOMPILE_WHILE_PLAYING");
++        return value != nullptr && value[0] == '1';
++    }();
++    const bool hold_beside_game = IntelDriverCache(device) && !while_playing;
++    const auto allowed_threads = [&](bool full) -> size_t {
++        if (full) {
++            return full_threads;
++        }
++        return hold_beside_game && !shader_notify.WarmMayBuild() ? 0 : threads;
++    };
+     const auto complete = [&](size_t index) {
+         const size_t finished = state.finished.fetch_add(1) + 1;
+         {
+@@ -4350,8 +4390,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+         in.exceptions(std::ifstream::failbit);
+         while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
+             const bool full = shader_notify.PrecompileFullSpeed();
+-            if (worker >= (full ? full_threads : threads)) {
+-                // Parked until full speed; done once every record is taken.
++            if (worker >= allowed_threads(full)) {
++                // Parked until full speed (or, on Intel, a pause); done once every record is
++                // taken.
+                 if (state.next.load() >= total) {
+                     break;
+                 }
+@@ -5403,10 +5444,10 @@ vk::PipelineCache& PipelineCache::PlayPipelineCache() {
+     // gigabytes. With EDEN_NX2_AMD_APP_CACHE, past 512 MiB no new pipeline goes into it either
+     // (a VkPipelineCache can't evict; the file is read into RAM at every boot).
+     constexpr size_t AmdAppCacheCap = size_t{512} << 20;
+-    if (t_precompile_build && AmdAppCache(device)) {
++    if (t_precompile_build && AppCacheBesideDriver(device)) {
+         return no_pipeline_cache;
+     }
+-    if (AmdAppCache(device) &&
++    if (AppCacheBesideDriver(device) &&
+         last_cache_size.load(std::memory_order_relaxed) >= AmdAppCacheCap) {
+         return no_pipeline_cache;
+     }
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 7d973646f..222e8826f 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -3888,7 +3888,19 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
+     }
+     const auto topology = maxwell3d->draw_manager.draw_state.topology;
+     const bool topology_changed = !emulated_mesh && state_tracker.ChangePrimitiveTopology(topology);
+-    if (topology_changed) {
++    // The dynamic topology follows the bound pipeline the way its static one does (FillStates):
++    // a patch list with tessellation stages, points for patches without them. Intel honours the
++    // dynamic topology as given (dynamicPrimitiveTopologyUnrestricted), so a tessellation
++    // pipeline drawn as a triangle list put stray, stretched triangles on screen.
++    dynamic_host_topology = MaxwellToVK::PrimitiveTopology(device, topology);
++    if (pipeline != nullptr && pipeline->HasTessellation()) {
++        dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_PATCH_LIST;
++    } else if (dynamic_host_topology == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
++        dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_POINT_LIST;
++    }
++    const bool host_topology_changed =
++        !emulated_mesh && state_tracker.ChangeHostPrimitiveTopology(dynamic_host_topology);
++    if (topology_changed || host_topology_changed) {
+         flags[Dirty::DepthBiasEnable] = true;
+         flags[Dirty::PrimitiveRestartEnable] = true;
+     }
+@@ -3912,9 +3924,8 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
+             UpdateDepthWriteEnable(regs);
+             UpdateStencilTestEnable(regs);
+         }
+-        if (topology_changed) {
+-            scheduler.Record([topology_vk = MaxwellToVK::PrimitiveTopology(device, topology)](
+-                                 vk::CommandBuffer cmdbuf) {
++        if (host_topology_changed) {
++            scheduler.Record([topology_vk = dynamic_host_topology](vk::CommandBuffer cmdbuf) {
+                 cmdbuf.SetPrimitiveTopologyEXT(topology_vk);
+             });
+         }
+@@ -4352,8 +4363,7 @@ void RasterizerVulkan::UpdatePrimitiveRestartEnable(Tegra::Engines::Maxwell3D::R
+     if (device.IsMoltenVK()) {
+         enable = true;
+     } else if (enable) {
+-        const auto topology = MaxwellToVK::PrimitiveTopology(device, maxwell3d->draw_manager.draw_state.topology);
+-        enable = IsPrimitiveRestartSupported(device, topology);
++        enable = IsPrimitiveRestartSupported(device, dynamic_host_topology);
+     }
+ 
+     scheduler.Record([enable](vk::CommandBuffer cmdbuf) {
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.h b/src/video_core/renderer_vulkan/vk_rasterizer.h
+index 63018f511..92cf6a63e 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.h
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.h
+@@ -345,6 +345,8 @@ private:
+     } oot_actor, oot_previous_actor;
+     u64 render_trace_frame = 0;
+     u32 render_trace_draws = 0;
++    /// The topology UpdateDynamicStates gives the draw (see there).
++    VkPrimitiveTopology dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+     u32 render_trace_clears = 0;
+     bool pending_native_work{};
+     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline
+diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.cpp b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+index 0b132c97d..28351a7bc 100644
+--- a/src/video_core/renderer_vulkan/vk_state_tracker.cpp
++++ b/src/video_core/renderer_vulkan/vk_state_tracker.cpp
+@@ -264,6 +264,7 @@ void StateTracker::ChangeChannel(Tegra::Control::ChannelState& channel_state) {
+ void StateTracker::InvalidateState() {
+     flags->set();
+     current_topology = INVALID_TOPOLOGY;
++    current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+     stencil_reset = true;
+ }
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_state_tracker.h b/src/video_core/renderer_vulkan/vk_state_tracker.h
+index 50cc337d9..fada035eb 100644
+--- a/src/video_core/renderer_vulkan/vk_state_tracker.h
++++ b/src/video_core/renderer_vulkan/vk_state_tracker.h
+@@ -12,6 +12,7 @@
+ #include "common/common_types.h"
+ #include "video_core/dirty_flags.h"
+ #include "video_core/engines/maxwell_3d.h"
++#include "video_core/vulkan_common/vulkan.h"
+ 
+ namespace Tegra {
+ namespace Control {
+@@ -86,6 +87,7 @@ public:
+     void InvalidateCommandBufferState() {
+         (*flags) |= invalidation_flags;
+         current_topology = INVALID_TOPOLOGY;
++        current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+         stencil_reset = true;
+     }
+ 
+@@ -97,6 +99,7 @@ public:
+             (*flags)[index] = true;
+         }
+         current_topology = INVALID_TOPOLOGY;
++        current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+     }
+ 
+     void InvalidateViewports() {
+@@ -296,6 +299,14 @@ public:
+         return has_changed;
+     }
+ 
++    /// The topology last given to vkCmdSetPrimitiveTopologyEXT, which also follows the bound
++    /// pipeline's tessellation stages.
++    bool ChangeHostPrimitiveTopology(VkPrimitiveTopology new_topology) {
++        const bool has_changed = current_host_topology != new_topology;
++        current_host_topology = new_topology;
++        return has_changed;
++    }
++
+     void SetupTables(Tegra::Control::ChannelState& channel_state);
+ 
+     void ChangeChannel(Tegra::Control::ChannelState& channel_state);
+@@ -321,6 +332,7 @@ private:
+     Tegra::Engines::Maxwell3D::DirtyState::Flags default_flags;
+     Tegra::Engines::Maxwell3D::DirtyState::Flags invalidation_flags;
+     Maxwell::PrimitiveTopology current_topology = INVALID_TOPOLOGY;
++    VkPrimitiveTopology current_host_topology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+     bool two_sided_stencil = false;
+     StencilProperties front{};
+     StencilProperties back{};
+diff --git a/src/video_core/texture_cache/texture_cache.h b/src/video_core/texture_cache/texture_cache.h
+index d88f13b41..951fce04c 100644
+--- a/src/video_core/texture_cache/texture_cache.h
++++ b/src/video_core/texture_cache/texture_cache.h
+@@ -1956,6 +1956,37 @@ void TextureCache<P>::DownloadMemory(DAddr cpu_addr, size_t size) {
+     if (images.empty()) {
+         return;
+     }
++    // EDEN_NX2_FLUSH_AREA_LOG=1: image downloads that wait for the GPU (first ones, then a count
++    // every 10 s).
++    static const bool image_flush_log = std::getenv("EDEN_NX2_FLUSH_AREA_LOG") != nullptr;
++    if (image_flush_log) {
++        static int logged = 0;
++        static u64 count = 0, bytes = 0;
++        static auto last = std::chrono::steady_clock::now();
++        for (const ImageId id : images) {
++            const ImageBase& image = slot_images[id];
++            ++count;
++            bytes += image.unswizzled_size_bytes;
++            if (logged < 32) {
++                ++logged;
++                LOG_INFO(HW_GPU,
++                         "Image flush: read [{:#x} +{:#x}) downloads image cpu={:#x} gpu={:#x} "
++                         "format={} {}x{}x{} levels={} layers={}",
++                         cpu_addr, size, image.cpu_addr, image.gpu_addr,
++                         static_cast<u32>(image.info.format), image.info.size.width,
++                         image.info.size.height, image.info.size.depth,
++                         image.info.resources.levels, image.info.resources.layers);
++            }
++        }
++        const auto now = std::chrono::steady_clock::now();
++        if (now - last > std::chrono::seconds(10)) {
++            LOG_INFO(HW_GPU, "Image flush: {} image downloads, {} KiB in 10 s", count,
++                     bytes / 1024);
++            count = 0;
++            bytes = 0;
++            last = now;
++        }
++    }
+     std::ranges::sort(images, [this](ImageId lhs, ImageId rhs) {
+         return slot_images[lhs].modification_tick < slot_images[rhs].modification_tick;
+     });
+@@ -2024,6 +2055,19 @@ std::optional<VideoCore::RasterizerDownloadArea> TextureCache<P>::GetFlushArea(D
+             image_view.flags |= ImageViewFlagBits::PreemtiveDownload;
+         }
+         area->preemtive &= image.info.forced_flushed;
++        // EDEN_NX2_FLUSH_AREA_LOG=1: which CPU reads turn an image into a per-bind download.
++        static const bool flush_area_log = std::getenv("EDEN_NX2_FLUSH_AREA_LOG") != nullptr;
++        static int flush_area_logged = 0;
++        if (flush_area_log && !image.info.forced_flushed && flush_area_logged < 64) {
++            ++flush_area_logged;
++            LOG_INFO(HW_GPU,
++                     "Flush area: CPU read [{:#x} +{:#x}) marks image cpu={:#x}..{:#x} gpu={:#x} "
++                     "format={} {}x{}x{} levels={} layers={} pitch_linear={}",
++                     cpu_addr, size, image.cpu_addr, image.cpu_addr_end, image.gpu_addr,
++                     static_cast<u32>(image.info.format), image.info.size.width,
++                     image.info.size.height, image.info.size.depth, image.info.resources.levels,
++                     image.info.resources.layers, image.info.type == ImageType::Linear);
++        }
+         image.info.forced_flushed = true;
+         if ((image.relocation_guard_noted & GuardCpuRead) == 0 && RelocationShaped(image.info)) {
+             NoteRelocationGuard(image, GuardCpuRead);
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index b7289d95a..d812e98ed 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -1520,8 +1520,14 @@ bool Device::GetSuitability(bool requires_swapchain) {
+     // Same for NVIDIA Proprietary < 580.119.02, unknown when VIDS was first NOT broken
+     // Disable VertexInputDynamicState on old Intel Windows drivers
+     if (extensions.vertex_input_dynamic_state) {
+-        const u32 version = (properties.properties.driverVersion << 3) >> 3;
+-        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && version < VK_MAKE_API_VERSION(27, 20, 100, 0))
++        // Intel's Windows driver reports its build as (major << 14) | minor ("101.9150" is
++        // 1663934), not as a Vulkan API version: compared with VK_MAKE_API_VERSION(27, 20, 100, 0)
++        // every Intel driver was "older" and lost the extension. That left the precompiled
++        // pipelines (all recorded with dynamic vertex input) unusable there and keyed every
++        // vertex layout into its own pipeline. The broken drivers are the 100.x branch (Gen9-era
++        // 27.20.100.x); Arc and Xe drivers are 101.x.
++        const u32 intel_build_major = properties.properties.driverVersion >> 14;
++        if ((driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && intel_build_major < 101)
+         || (driver_id == VK_DRIVER_ID_NVIDIA_PROPRIETARY && properties.properties.driverVersion < NvidiaDriverVersion(580, 119, 2))) {
+             LOG_WARNING(Render_Vulkan, "Disabling broken VK_EXT_vertex_input_dynamic_state");
+             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+@@ -1689,6 +1695,23 @@ void Device::RemoveUnsuitableExtensions() {
+     RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_int64, features.shader_atomic_int64,
+                                        VK_KHR_SHADER_ATOMIC_INT64_EXTENSION_NAME);
+ 
++    // VK_EXT_shader_atomic_float: storage buffer float32 atomic add in hardware instead of a
++    // compare-exchange loop. Intel only for now (the GPU it was measured on): on an Arc B580 a
++    // contended loop of Ocarina of Time (1e1964184a291f00, 96 groups) took 2 ms of each frame.
++    // EDEN_NX2_NO_FLOAT_ATOMICS=1 keeps the loop.
++    {
++        constexpr u32 intel_vendor_id = 0x8086;
++        const char* const no_float_atomics = std::getenv("EDEN_NX2_NO_FLOAT_ATOMICS");
++        extensions.shader_atomic_float =
++            extensions.shader_atomic_float &&
++            properties.properties.vendorID == intel_vendor_id &&
++            features.shader_atomic_float.shaderBufferFloat32AtomicAdd &&
++            !(no_float_atomics != nullptr && no_float_atomics[0] == '1');
++        RemoveExtensionFeatureIfUnsuitable(extensions.shader_atomic_float,
++                                           features.shader_atomic_float,
++                                           VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME);
++    }
++
+     // VK_EXT_shader_demote_to_helper_invocation
+     extensions.shader_demote_to_helper_invocation =
+         features.shader_demote_to_helper_invocation.shaderDemoteToHelperInvocation;
+@@ -1880,13 +1903,16 @@ void Device::RemoveUnsuitableExtensions() {
+         cooperative_hmma_16x16x16 =
+             usable && has_shape(16, 16) && IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+         // Intel Xe2 (ANV) only has 8x16x16: each HMMA is two products of 8 rows. Intel only, so
+-        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779). Not Intel's Windows
+-        // driver: the constructor turns its shaderFloat16 off after this check ("Intel has broken
+-        // float16 math"), and the matrices need it; #779 was measured on Mesa ANV.
++        // NVIDIA and AMD keep exactly the paths above (zortos293/Lichii#779, measured on Mesa
++        // ANV). Intel's Windows driver too: its "broken float16 math" workaround only turns off
++        // float16 arithmetic in translated shaders (float16_math); the device keeps shaderFloat16
++        // for the matrices (see where float16_math is set). Arc B580, driver 101.9150: the
++        // software HMMA of OoT's 64x36 tile pass spilled 12 KB of scratch per lane at SIMD32 and
++        // took 13.5-15 ms a frame; on 8x16x16 matrices the same dispatch took 1.3 ms.
++        // EDEN_NX2_NO_COOP_MATRIX=1 goes back to the software path.
+         constexpr u32 intel_vendor_id = 0x8086;
+         cooperative_hmma_8x16x16 =
+-            usable && properties.properties.vendorID == intel_vendor_id &&
+-            driver_id != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && has_shape(8, 16) &&
++            usable && properties.properties.vendorID == intel_vendor_id && has_shape(8, 16) &&
+             IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT);
+         extensions.cooperative_matrix =
+             cooperative_hmma_16x8x16 || cooperative_hmma_16x16x16 || cooperative_hmma_8x16x16;
+@@ -1895,8 +1921,12 @@ void Device::RemoveUnsuitableExtensions() {
+                                            features.cooperative_matrix,
+                                            VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+     }
+-    VideoCommon::Nx2Perf::g_native_tensor_ops.store(extensions.cooperative_matrix,
+-                                                    std::memory_order_relaxed);
++    // Picks the movie upscaler (Automatic: the game's own network where tensor operations are
++    // native). Not on Intel's 8x16x16 path: OoT's movie network (its 32-lane compute programs,
++    // f9ea14a22394f5b1 and others) drew a pink line and speckled columns over the title movie on
++    // an Arc B580, the bilinear copy does not. The gameplay HMMA programs keep the matrices.
++    VideoCommon::Nx2Perf::g_native_tensor_ops.store(
++        extensions.cooperative_matrix && !cooperative_hmma_8x16x16, std::memory_order_relaxed);
+ 
+     // VK_KHR_workgroup_memory_explicit_layout
+     extensions.workgroup_memory_explicit_layout =
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 80a503753..8551e7802 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -74,6 +74,7 @@ VK_DEFINE_HANDLE(VmaPool)
+             primitive_topology_list_restart)                                                       \
+     FEATURE(EXT, ProvokingVertex, PROVOKING_VERTEX, provoking_vertex)                              \
+     FEATURE(EXT, Robustness2, ROBUSTNESS_2, robustness2)                                           \
++    FEATURE(EXT, ShaderAtomicFloat, SHADER_ATOMIC_FLOAT, shader_atomic_float)                      \
+     FEATURE(EXT, ShaderFloat8, SHADER_FLOAT8, shader_float8)                                       \
+     FEATURE(EXT, TransformFeedback, TRANSFORM_FEEDBACK, transform_feedback)                        \
+     FEATURE(EXT, VertexInputDynamicState, VERTEX_INPUT_DYNAMIC_STATE, vertex_input_dynamic_state)  \
+@@ -558,6 +559,45 @@ FN_MAX_LIMIT_LIST
+         return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+     }
+ 
++    /// Returns true if a pipeline stage can be built with requiredSubgroupSize = GuestWarpSize.
++    bool CanRequireGuestWarpSize(VkShaderStageFlagBits stage) const {
++        const auto& control = properties.subgroup_size_control;
++        return extensions.subgroup_size_control && IsGuestWarpSizeSupported(stage) &&
++               control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
++    }
++
++    /// The subgroup size to require for compute shaders without warp-width operations, 0 for the
++    /// driver's choice. Intel (Xe2) compiles large compute shaders SIMD32 with register spills
++    /// (5.7 KB of scratch for Ocarina of Time's global memory shaders) after also compiling them
++    /// SIMD16: 16 lanes build ~2.6x faster without spills, but run slower (Hyrule Field on a
++    /// B580: ~35 instead of ~39.5 fps; f84d5909908cc5ea 0.14 instead of 0.07 ms a dispatch), so
++    /// it is off unless asked for. EDEN_NX2_INTEL_COMPUTE_SIMD16: 0 (default) off, 1 shaders with
++    /// global memory accesses, 2 every shader without warp operations.
++    u32 NarrowComputeSubgroupSize(bool uses_global_memory) const {
++        constexpr u32 narrow = 16;
++        static const int mode = [] {
++            const char* value = std::getenv("EDEN_NX2_INTEL_COMPUTE_SIMD16");
++            return value != nullptr && value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : 0;
++        }();
++        const auto& control = properties.subgroup_size_control;
++        const bool applies = mode == 2 || (mode == 1 && uses_global_memory);
++        return applies && properties.properties.vendorID == 0x8086 &&
++                       extensions.subgroup_size_control &&
++                       IsGuestWarpSizeSupported(VK_SHADER_STAGE_COMPUTE_BIT) &&
++                       control.minSubgroupSize <= narrow && narrow <= control.maxSubgroupSize
++                   ? narrow
++                   : 0;
++    }
++
++    /// Returns true if a stage may run in subgroups narrower than the guest's warp (Intel runs
++    /// fragment and vertex shaders SIMD8 or SIMD16, and those cannot be given a size).
++    bool IsWarpSizePotentiallySmallerThanGuest() const {
++        const u32 min_size = extensions.subgroup_size_control
++                                 ? properties.subgroup_size_control.minSubgroupSize
++                                 : properties.subgroup_properties.subgroupSize;
++        return min_size != 0 && min_size < GuestWarpSize;
++    }
++
+     /// Returns true if the device supports the provided subgroup feature.
+     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
+         return properties.subgroup_properties.supportedOperations & feature;
+@@ -1030,6 +1070,12 @@ FN_MAX_LIMIT_LIST
+                features.shader_atomic_int64.shaderSharedInt64Atomics;
+     }
+ 
++    /// Returns true if storage buffer float32 atomic add runs in hardware (VK_EXT_shader_atomic_float).
++    bool IsFloat32AtomicAddSupported() const {
++        return extensions.shader_atomic_float &&
++               features.shader_atomic_float.shaderBufferFloat32AtomicAdd;
++    }
++
+     bool IsExtConditionalRendering() const {
+         return extensions.conditional_rendering;
+     }
+diff --git a/tools/shader-sweep/main.cpp b/tools/shader-sweep/main.cpp
+index 1a8846265..ea3d4fb8a 100644
+--- a/tools/shader-sweep/main.cpp
++++ b/tools/shader-sweep/main.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <cstdlib>
+ #include <array>
+ #include <bit>
+ #include <cstring>
+@@ -730,6 +731,14 @@ int main(int argc, char** argv) {
+         host.support_conditional_barrier = true;
+         host.support_viewport_index_layer = true;
+         host.support_geometry_shader_passthrough = true;
++        // SWEEP_INTEL=1: Intel's Windows profile (no float16 arithmetic, SPIR-V 1.6, subgroups
++        // that may be narrower than the guest's); SWEEP_COOP8=1 adds the 8x16x16 HMMA path.
++        const bool sweep_intel = std::getenv("SWEEP_INTEL") != nullptr;
++        const bool sweep_coop8 = std::getenv("SWEEP_COOP8") != nullptr;
++        if (sweep_intel) {
++            host.support_float16 = false;
++            host.min_ssbo_alignment = 64; // Arc B580 minStorageBufferOffsetAlignment
++        }
+         host.ApplyDescriptorLimitPolicy();
+         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
+@@ -750,6 +759,13 @@ int main(int argc, char** argv) {
+         profile.max_user_clip_distances = 8;
+         profile.max_subgroup_size = 32;
+         profile.support_typeless_image_loads = true;
++        if (sweep_intel) {
++            profile.supported_spirv = 0x00010600;
++            profile.warp_size_potentially_smaller_than_guest = true;
++            profile.support_descriptor_aliasing = true;
++            profile.support_float32_atomic_add = std::getenv("SWEEP_NO_FADD") == nullptr;
++        }
++        profile.support_cooperative_hmma_8x16x16 = sweep_coop8;
+         Shader::Backend::Bindings bindings{};
+         const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+         diagnostic["spirv_words"] = spirv.size();

@@ -1,0 +1,61 @@
+From 40b6cd2c76100428227904f3b7bafb7dbf029db9 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:52 +0100
+Subject: [PATCH 06/14] vk_pipeline_cache: on Intel the preparation does not
+ build beside the game
+
+After Play now the preparation kept 3 threads compiling; on Intel (1-2 s per new shader, 6-core
+CPU) that took the CPU from the game. Owner, B580 + Ryzen 5 5600G: lag spikes with it, "basically
+zero" with EDEN_NX2_PRECOMPILE=0.
+
+On Intel it now follows the warm-up's rule: full speed on the Preparing shaders screen, otherwise
+only while emulation is paused or from Prepare Shaders Now (ShaderNotify::WarmMayBuild).
+Progress is kept. EDEN_NX2_PRECOMPILE_WHILE_PLAYING=1 builds beside the game as before.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_pipeline_cache.cpp     | 21 +++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 2d221175a..25da01b29 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -4330,6 +4330,22 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+     // preparation) one per host thread, at normal priority.
+     const size_t full_threads =
+         std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency()));
++    // On Intel it does not build beside the game: there its compiles took the CPU from the game
++    // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
++    // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
++    // from Prepare Shaders Now (ShaderNotify::WarmMayBuild); the Preparing shaders screen runs it
++    // at full speed as before. EDEN_NX2_PRECOMPILE_WHILE_PLAYING=1 builds beside the game anyway.
++    static const bool while_playing = [] {
++        const char* value = std::getenv("EDEN_NX2_PRECOMPILE_WHILE_PLAYING");
++        return value != nullptr && value[0] == '1';
++    }();
++    const bool hold_beside_game = IntelDriverCache(device) && !while_playing;
++    const auto allowed_threads = [&](bool full) -> size_t {
++        if (full) {
++            return full_threads;
++        }
++        return hold_beside_game && !shader_notify.WarmMayBuild() ? 0 : threads;
++    };
+     const auto complete = [&](size_t index) {
+         const size_t finished = state.finished.fetch_add(1) + 1;
+         {
+@@ -4373,8 +4389,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
+         in.exceptions(std::ifstream::failbit);
+         while (!stop.stop_requested() && !stop_loading.stop_requested() && !warm_cancel) {
+             const bool full = shader_notify.PrecompileFullSpeed();
+-            if (worker >= (full ? full_threads : threads)) {
+-                // Parked until full speed; done once every record is taken.
++            if (worker >= allowed_threads(full)) {
++                // Parked until full speed (or, on Intel, a pause); done once every record is
++                // taken.
+                 if (state.next.load() >= total) {
+                     break;
+                 }
+-- 
+2.56.1.windows.1
+

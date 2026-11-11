@@ -1,0 +1,58 @@
+From 5208599e08c4f3d53409e2f6838d14f38380208c Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:57 +0100
+Subject: [PATCH 13/14] shader-sweep: Intel profile switches (SWEEP_INTEL,
+ SWEEP_COOP8)
+
+Analysis aid used for the Intel fixes: SWEEP_INTEL=1 translates with Intel's Windows profile (no
+float16 arithmetic, SPIR-V 1.6, narrower subgroups, descriptor aliasing, float atomic add unless
+SWEEP_NO_FADD), SWEEP_COOP8=1 adds the 8x16x16 HMMA path. Tools only, optional to merge.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tools/shader-sweep/main.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/tools/shader-sweep/main.cpp b/tools/shader-sweep/main.cpp
+index 1a8846265..ea3d4fb8a 100644
+--- a/tools/shader-sweep/main.cpp
++++ b/tools/shader-sweep/main.cpp
+@@ -1,5 +1,6 @@
+ // SPDX-License-Identifier: GPL-3.0-or-later
+ 
++#include <cstdlib>
+ #include <array>
+ #include <bit>
+ #include <cstring>
+@@ -730,6 +731,14 @@ int main(int argc, char** argv) {
+         host.support_conditional_barrier = true;
+         host.support_viewport_index_layer = true;
+         host.support_geometry_shader_passthrough = true;
++        // SWEEP_INTEL=1: Intel's Windows profile (no float16 arithmetic, SPIR-V 1.6, subgroups
++        // that may be narrower than the guest's); SWEEP_COOP8=1 adds the 8x16x16 HMMA path.
++        const bool sweep_intel = std::getenv("SWEEP_INTEL") != nullptr;
++        const bool sweep_coop8 = std::getenv("SWEEP_COOP8") != nullptr;
++        if (sweep_intel) {
++            host.support_float16 = false;
++            host.min_ssbo_alignment = 64; // Arc B580 minStorageBufferOffsetAlignment
++        }
+         host.ApplyDescriptorLimitPolicy();
+         auto program = Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host);
+         Shader::Maxwell::ConvertLegacyToGeneric(program, runtime);
+@@ -750,6 +759,13 @@ int main(int argc, char** argv) {
+         profile.max_user_clip_distances = 8;
+         profile.max_subgroup_size = 32;
+         profile.support_typeless_image_loads = true;
++        if (sweep_intel) {
++            profile.supported_spirv = 0x00010600;
++            profile.warp_size_potentially_smaller_than_guest = true;
++            profile.support_descriptor_aliasing = true;
++            profile.support_float32_atomic_add = std::getenv("SWEEP_NO_FADD") == nullptr;
++        }
++        profile.support_cooperative_hmma_8x16x16 = sweep_coop8;
+         Shader::Backend::Bindings bindings{};
+         const auto spirv = Shader::Backend::SPIRV::EmitSPIRV(profile, runtime, program, bindings);
+         diagnostic["spirv_words"] = spirv.size();
+-- 
+2.56.1.windows.1
+

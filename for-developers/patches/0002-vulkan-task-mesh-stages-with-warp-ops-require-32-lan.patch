@@ -1,0 +1,147 @@
+From fbfbbc7973387f86d79d9e1c04594c63363ba681 Mon Sep 17 00:00:00 2001
+From: Fritchii Intel fixes <intel-fixes@users.noreply.invalid>
+Date: Wed, 11 Nov 2026 23:11:50 +0100
+Subject: [PATCH 02/14] vulkan: task/mesh stages with warp ops require 32-lane
+ subgroups
+
+Guest votes, ballots, lane ids, lane masks and shuffles assume a 32-lane warp. Intel picks SIMD16
+or SIMD32 per shader; at SIMD16 a task shader's ballot + popc meshlet compaction saw half the
+warp and dropped or repeated meshlets: flickering and missing foliage in OoT on Arc. The graphics
+pipeline already built requiredSubgroupSize = 32 but never chained it ([[maybe_unused]]).
+
+Device::CanRequireGuestWarpSize(stage) checks the stage is in requiredSubgroupSizeStages and 32
+is within [min, max]; MakePipeline and MakeShaderLibrary (GPL) chain the struct for stages that
+use warp-width ops. Quad-only shaders are left alone (forcing SIMD32 can spill on Intel).
+
+Tested: Arc B580 + Arc 140V, foliage flicker gone. NVIDIA always runs 32 lanes; AMD Windows can
+only pin compute: no change there.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  | 60 +++++++++++++------
+ src/video_core/vulkan_common/vulkan_device.h  |  7 +++
+ 2 files changed, 49 insertions(+), 18 deletions(-)
+
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index efd983003..39df2f868 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -237,6 +237,22 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits
+     return slot_stage;
+ }
+ 
++// Votes, ballots, lane ids and shuffles span the guest's 32-thread warp. NVIDIA always runs 32
++// lanes, but Intel picks SIMD16 or SIMD32 per shader: a task shader's ballot then saw half the
++// warp and its meshlet compaction dropped or repeated meshlets (flickering and missing foliage on
++// Arc). Only stages with these ops are pinned, as in compute pipelines; quad ops need no more
++// than 4 lanes.
++bool UsesWarpWidthOps(const Shader::Info& info) {
++    return info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
++           info.uses_subgroup_shuffles || info.uses_subgroup_mask;
++}
++
++const void* GuestWarpSizeChain(const Device& device, const Shader::Info& info,
++                               VkShaderStageFlagBits stage,
++                               const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT& ci) {
++    return UsesWarpWidthOps(info) && device.CanRequireGuestWarpSize(stage) ? &ci : nullptr;
++}
++
+ // The stage of a pipeline stage slot (vertex, tessellation control and evaluation, geometry,
+ // fragment).
+ VkShaderStageFlagBits SlotStage(size_t index) {
+@@ -2303,7 +2319,7 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+     PipelineStates states;
+     FillStates(states);
+     const bool is_mesh{states.is_mesh};
+-    [[maybe_unused]] const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
+         .pNext = nullptr,
+         .requiredSubgroupSize = GuestWarpSize,
+@@ -2318,19 +2334,21 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         }
+         // Mesh emulation: stage 0 is the vertex shader reading the compute pass's output.
+         const bool emulated_vertex{mesh_emulation && stage == 0};
+-        [[maybe_unused]] auto& stage_ci =
+-            shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
+-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-                .pNext = nullptr,
+-                .flags = 0,
+-                .stage = emulated_vertex
+-                             ? VK_SHADER_STAGE_VERTEX_BIT
+-                             : StageFlag(stage_infos[stage],
+-                                         MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
+-                .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
+-                .pName = "main",
+-                .pSpecializationInfo = nullptr,
+-            });
++        const VkShaderStageFlagBits stage_flag{
++            emulated_vertex ? VK_SHADER_STAGE_VERTEX_BIT
++                            : StageFlag(stage_infos[stage],
++                                        MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
++        shader_stages.emplace_back(VkPipelineShaderStageCreateInfo{
++            .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
++            .pNext = emulated_vertex ? nullptr
++                                     : GuestWarpSizeChain(device, stage_infos[stage], stage_flag,
++                                                          subgroup_size_ci),
++            .flags = 0,
++            .stage = stage_flag,
++            .module = emulated_vertex ? *mesh_vertex_module : *spv_modules[stage],
++            .pName = "main",
++            .pSpecializationInfo = nullptr,
++        });
+     }
+     // Mesh emulation draws a plain triangle list without vertex attributes.
+     const VkPipelineVertexInputStateCreateInfo emulation_vertex_input{
+@@ -2522,6 +2540,11 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
+     // The library's own set layouts, identically defined to the linked pipeline's (same
+     // signature in the key), so the library outlives the pipeline that built it.
+     std::array<VkDescriptorSetLayout, NUM_STAGES> set_layouts{};
++    const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT subgroup_size_ci{
++        .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT,
++        .pNext = nullptr,
++        .requiredSubgroupSize = GuestWarpSize,
++    };
+     static_vector<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+     for (size_t stage = 0; stage < NUM_STAGES; ++stage) {
+         if (!InPart(part, stage)) {
+@@ -2536,13 +2559,14 @@ GplLibrary GraphicsPipeline::MakeShaderLibrary(GplPart part, const PipelineState
+         if (!spv_modules[stage]) {
+             continue;
+         }
+-        // Same stage info as the monolithic pipeline (MakePipeline), which sets no subgroup size.
++        // Same stage info as the monolithic pipeline (MakePipeline).
++        const VkShaderStageFlagBits stage_flag{
++            StageFlag(stage_infos[stage], MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage)))};
+         shader_stages.push_back({
+             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+-            .pNext = nullptr,
++            .pNext = GuestWarpSizeChain(device, stage_infos[stage], stage_flag, subgroup_size_ci),
+             .flags = 0,
+-            .stage = StageFlag(stage_infos[stage],
+-                               MaxwellToVK::ShaderStage(Shader::StageFromIndex(stage))),
++            .stage = stage_flag,
+             .module = *spv_modules[stage],
+             .pName = "main",
+             .pSpecializationInfo = nullptr,
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index 80a503753..3d80b9212 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -558,6 +558,13 @@ FN_MAX_LIMIT_LIST
+         return properties.subgroup_size_control.requiredSubgroupSizeStages & stage;
+     }
+ 
++    /// Returns true if a pipeline stage can be built with requiredSubgroupSize = GuestWarpSize.
++    bool CanRequireGuestWarpSize(VkShaderStageFlagBits stage) const {
++        const auto& control = properties.subgroup_size_control;
++        return extensions.subgroup_size_control && IsGuestWarpSizeSupported(stage) &&
++               control.minSubgroupSize <= GuestWarpSize && GuestWarpSize <= control.maxSubgroupSize;
++    }
++
+     /// Returns true if the device supports the provided subgroup feature.
+     bool IsSubgroupFeatureSupported(VkSubgroupFeatureFlagBits feature) const {
+         return properties.subgroup_properties.supportedOperations & feature;
+-- 
+2.56.1.windows.1
+
