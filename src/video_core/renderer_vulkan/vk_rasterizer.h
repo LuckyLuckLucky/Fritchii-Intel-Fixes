@@ -431,6 +431,9 @@ private:
 
     void UpdateViewportsState(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs);
+    /// Intel: a draw testing EQUAL without writing depth tests with a margin towards the camera
+    /// (adapted from Longshot vk_draw.cpp; INTEL_FORK_NO_EQUAL_DEPTH_BIAS=1: off).
+    void UpdateEqualDepthBias(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateBlendConstants(Tegra::Engines::Maxwell3D::Regs& regs);
     void UpdateDepthBounds(Tegra::Engines::Maxwell3D::Regs& regs);
@@ -662,6 +665,11 @@ private:
     u32 render_trace_draws = 0;
     /// The topology UpdateDynamicStates gives the draw (see there).
     VkPrimitiveTopology dynamic_host_topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    /// UpdateEqualDepthBias: 0 the draw's own depth state, 1 LESS_OR_EQUAL with a negative
+    /// constant bias, 2 GREATER_OR_EQUAL with a positive one (the last depth-writing draw
+    /// tested GREATER: reversed depth).
+    u8 equal_depth_bias_mode = 0;
+    bool equal_depth_bias_reversed = false;
     u32 render_trace_clears = 0;
     bool pending_native_work{};
     bool mesh_draw{}; ///< the draw being prepared uses a task/mesh pipeline

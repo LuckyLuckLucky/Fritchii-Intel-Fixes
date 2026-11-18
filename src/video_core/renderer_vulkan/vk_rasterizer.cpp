@@ -139,6 +139,10 @@ using VideoCommon::ImageViewType;
 
 namespace {
 
+/// The constant depth bias (host units) of RasterizerVulkan::UpdateEqualDepthBias: Longshot's
+/// 64 (device_policy.h equal_depth_bias on Intel).
+constexpr float EQUAL_DEPTH_BIAS_UNITS = 64.0f;
+
 // EXPERIMENT EDEN_NX2_INVALIDATE_BEFORE_DISPATCH=1: apply collected guest CPU writes before every
 // dispatch and draw (=list does it once per command list, in DmaPusher).
 bool InvalidateBeforeUse() {
@@ -10435,6 +10439,7 @@ void RasterizerVulkan::UpdateDynamicStates(const GraphicsPipeline* pipeline) {
 
     UpdateViewportsState(regs);
     UpdateScissorsState(regs);
+    UpdateEqualDepthBias(regs);
     UpdateDepthBias(regs);
     UpdateBlendConstants(regs);
     UpdateDepthBounds(regs);
@@ -10658,6 +10663,58 @@ void RasterizerVulkan::UpdateScissorsState(Tegra::Engines::Maxwell3D::Regs& regs
     });
 }
 
+void RasterizerVulkan::UpdateEqualDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
+    // Adapted from Longshot (gpu/vk/vk_draw.cpp dynamic_state, device_policy.h
+    // equal_depth_bias): a colour pass tests EQUAL against the depth another program wrote, and
+    // Intel's compiler does not give the two the same position to the last bit (holes, walls
+    // flashing). Such a draw (depth test on, depth write off, EQUAL) tests LESS_OR_EQUAL with a
+    // constant bias of 64 units towards the camera instead. Longshot assumes OoT's conventional
+    // depth; here the direction follows the last depth-writing draw's test (GREATER: reversed
+    // depth, so GREATER_OR_EQUAL and +64). Intel only, and only where the compare op and the
+    // bias enable are dynamic state. INTEL_FORK_NO_EQUAL_DEPTH_BIAS=1: the game's state.
+    static const bool disabled = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_EQUAL_DEPTH_BIAS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    if (disabled || device.GetVendorID() != 0x8086 || !device.IsExtExtendedDynamicStateSupported() ||
+        !device.IsExtExtendedDynamicState2Supported()) {
+        return;
+    }
+    using Op = Maxwell::ComparisonOp;
+    const Op func = regs.depth_test_func;
+    const bool depth_test = regs.depth_test_enable != 0;
+    const bool depth_write = regs.depth_write_enabled != 0;
+    if (depth_test && depth_write) {
+        switch (func) {
+        case Op::Less_D3D:
+        case Op::LessEqual_D3D:
+        case Op::Less_GL:
+        case Op::LessEqual_GL:
+            equal_depth_bias_reversed = false;
+            break;
+        case Op::Greater_D3D:
+        case Op::GreaterEqual_D3D:
+        case Op::Greater_GL:
+        case Op::GreaterEqual_GL:
+            equal_depth_bias_reversed = true;
+            break;
+        default:
+            break;
+        }
+    }
+    const bool equal = func == Op::Equal_D3D || func == Op::Equal_GL;
+    const u8 mode = depth_test && !depth_write && equal
+                        ? static_cast<u8>(equal_depth_bias_reversed ? 2 : 1)
+                        : u8{0};
+    if (mode != equal_depth_bias_mode) {
+        equal_depth_bias_mode = mode;
+        auto& flags = maxwell3d->dirty.flags;
+        flags[Dirty::DepthCompareOp] = true;
+        flags[Dirty::DepthBias] = true;
+        flags[Dirty::DepthBiasEnable] = true;
+    }
+}
+
 void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
     if (!state_tracker.TouchDepthBias()) {
         return;
@@ -10685,8 +10742,16 @@ void RasterizerVulkan::UpdateDepthBias(Tegra::Engines::Maxwell3D::Regs& regs) {
         }
     }
 
-    scheduler.Record([constant = units, clamp = regs.depth_bias_clamp,
-                      factor = regs.slope_scale_depth_bias, this](vk::CommandBuffer cmdbuf) {
+    float bias_clamp = regs.depth_bias_clamp;
+    float bias_factor = regs.slope_scale_depth_bias;
+    if (equal_depth_bias_mode != 0) {
+        // UpdateEqualDepthBias: Longshot's margin replaces the draw's own bias.
+        units = equal_depth_bias_mode == 2 ? EQUAL_DEPTH_BIAS_UNITS : -EQUAL_DEPTH_BIAS_UNITS;
+        bias_clamp = 0.0f;
+        bias_factor = 0.0f;
+    }
+    scheduler.Record([constant = units, clamp = bias_clamp, factor = bias_factor,
+                      this](vk::CommandBuffer cmdbuf) {
         if (device.IsExtDepthBiasControlSupported()) {
             static VkDepthBiasRepresentationInfoEXT bias_info{
                 .sType = VK_STRUCTURE_TYPE_DEPTH_BIAS_REPRESENTATION_INFO_EXT,
@@ -11008,7 +11073,9 @@ void RasterizerVulkan::UpdateDepthBiasEnable(Tegra::Engines::Maxwell3D::Regs& re
         regs.polygon_offset_fill_enable,
     };
     const u32 topology_index = u32(maxwell3d->draw_manager.draw_state.topology);
-    const u32 enable = enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
+    // UpdateEqualDepthBias turns the bias on for its draws (INTEL_FORK_NO_EQUAL_DEPTH_BIAS=1: off).
+    const u32 enable =
+        equal_depth_bias_mode != 0 ? 1U : enabled_lut[POLYGON_OFFSET_ENABLE_LUT[topology_index]];
     scheduler.Record([enable](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthBiasEnableEXT(enable != 0); });
 }
 
@@ -11084,9 +11151,13 @@ void RasterizerVulkan::UpdateDepthCompareOp(Tegra::Engines::Maxwell3D::Regs& reg
     if (!state_tracker.TouchDepthCompareOp()) {
         return;
     }
-    scheduler.Record([func = regs.depth_test_func](vk::CommandBuffer cmdbuf) {
-        cmdbuf.SetDepthCompareOpEXT(MaxwellToVK::ComparisonOp(func));
-    });
+    VkCompareOp op = MaxwellToVK::ComparisonOp(regs.depth_test_func);
+    if (equal_depth_bias_mode != 0) {
+        // UpdateEqualDepthBias (INTEL_FORK_NO_EQUAL_DEPTH_BIAS=1: off).
+        op = equal_depth_bias_mode == 2 ? VK_COMPARE_OP_GREATER_OR_EQUAL
+                                        : VK_COMPARE_OP_LESS_OR_EQUAL;
+    }
+    scheduler.Record([op](vk::CommandBuffer cmdbuf) { cmdbuf.SetDepthCompareOpEXT(op); });
 }
 
 void RasterizerVulkan::UpdateFrontFace(Tegra::Engines::Maxwell3D::Regs& regs) {
