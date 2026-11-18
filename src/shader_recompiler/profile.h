@@ -128,6 +128,11 @@ struct Profile {
     u64 min_ssbo_alignment{};
     u32 max_user_clip_distances{};
 
+    /// Decorate the Position output Invariant in the vertex, tessellation evaluation, geometry and
+    /// mesh stages (adapted from Longshot: every host but NVIDIA, so a depth pre-pass and the colour
+    /// pass testing EQUAL against it get the same position). INTEL_FORK_NO_INVARIANT_POSITION=1: off.
+    bool position_invariant{};
+
     bool SupportsSubgroupStage(Stage stage) const {
         return (supported_subgroup_stages & (1u << static_cast<u32>(stage))) != 0;
     }

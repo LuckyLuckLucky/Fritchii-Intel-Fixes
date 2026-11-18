@@ -584,6 +584,10 @@ std::vector<u32> EmitMeshEmulationVertex(const Profile& profile, const MeshInfo&
     const Id output_f32{module.TypePointer(spv::StorageClass::Output, f32_type)};
     const Id position{module.AddGlobalVariable(output_vec4, spv::StorageClass::Output)};
     module.Decorate(position, spv::Decoration::BuiltIn, spv::BuiltIn::Position);
+    if (profile.position_invariant) {
+        // The mesh emulation's vertex stage (INTEL_FORK_NO_INVARIANT_POSITION).
+        module.Decorate(position, spv::Decoration::Invariant);
+    }
     interfaces.push_back(position);
     // A point list needs a size from its last pre-rasterization stage.
     const u32 primitive_vertices{mesh.PrimitiveVertices()};

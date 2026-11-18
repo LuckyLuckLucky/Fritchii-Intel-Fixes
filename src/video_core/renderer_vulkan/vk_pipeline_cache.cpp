@@ -939,6 +939,16 @@ bool CanReadPipelineCacheDuringBuilds(const Device& device) {
     return unguarded || device.GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
 }
 
+/// INTEL_FORK_NO_INVARIANT_POSITION=1: positions are not decorated Invariant (Profile::
+/// position_invariant; the kept stamp names the setting).
+bool InvariantPositionDisabled() {
+    static const bool disabled = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_INVARIANT_POSITION");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return disabled;
+}
+
 /// Whether fragment programs keep their float colour outputs finite (GuardFragmentOutputs,
 /// adapted from Longshot; all GPUs, as there). INTEL_FORK_NO_NAN_GUARD=1 emits them as before
 /// (A/B; the kept stamp names the guard, so kept modules of the other setting are not used).
@@ -1111,6 +1121,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .min_ssbo_alignment = device.GetStorageBufferAlignment(),
         .max_user_clip_distances = device.GetMaxUserClipDistances()
     };
+    // Adapted from Longshot (device_policy.h position_invariant): every vendor but NVIDIA (NVK
+    // too, by the vendor), as AMD's and Intel's compilers do not give a depth pass and its colour
+    // pass the same position. INTEL_FORK_NO_INVARIANT_POSITION=1: off (A/B).
+    profile.position_invariant = device.GetVendorID() != 0x10DE && !InvariantPositionDisabled();
     profile.support_cooperative_hmma =
         device.IsCooperativeHmmaSupported() && TestCooperativeHmma(device);
     profile.support_cooperative_hmma_16x16x16 =
@@ -6041,13 +6055,14 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // The NaN guard (INTEL_FORK_NO_NAN_GUARD) changes every fragment module with a float colour
     // output: kept modules of the other setting are not used.
     return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{}{}{}\n",
+                       "{}{}{}{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(device),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
                        CanonicalKeys() ? 1 : 0,
                        host_info.support_handle_table_arrays ? " light-tables 1" : "",
-                       NanGuardEnabled() ? " nan-guard 1" : "");
+                       NanGuardEnabled() ? " nan-guard 1" : "",
+                       profile.position_invariant ? " invariant 1" : "");
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
