@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -313,7 +314,44 @@ void SetObjectName(const DeviceDispatch* dld, VkDevice device, T handle, VkObjec
     }
 }
 
+std::atomic_bool pipeline_cache_read_guard{false};
+
+std::shared_mutex& PipelineCacheGuardMutex() {
+    static std::shared_mutex mutex;
+    return mutex;
+}
+
 } // Anonymous namespace
+
+void SetPipelineCacheReadGuard(bool enabled) noexcept {
+    pipeline_cache_read_guard.store(enabled, std::memory_order_release);
+}
+
+PipelineBuildLock::PipelineBuildLock()
+    : locked{pipeline_cache_read_guard.load(std::memory_order_acquire)} {
+    if (locked) {
+        PipelineCacheGuardMutex().lock_shared();
+    }
+}
+
+PipelineBuildLock::~PipelineBuildLock() {
+    if (locked) {
+        PipelineCacheGuardMutex().unlock_shared();
+    }
+}
+
+PipelineCacheReadLock::PipelineCacheReadLock()
+    : locked{pipeline_cache_read_guard.load(std::memory_order_acquire)} {
+    if (locked) {
+        PipelineCacheGuardMutex().lock();
+    }
+}
+
+PipelineCacheReadLock::~PipelineCacheReadLock() {
+    if (locked) {
+        PipelineCacheGuardMutex().unlock();
+    }
+}
 
 void NoteNullTarget(const char* command, const std::source_location& site) noexcept {
     static std::atomic<u64> skipped{};
@@ -1068,7 +1106,10 @@ PipelineLayout Device::CreatePipelineLayout(const VkPipelineLayoutCreateInfo& ci
 
 Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, VkPipelineCache cache) const {
     VkPipeline object = VK_NULL_HANDLE;
-    auto const result = dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    const auto result = [&] {
+        const PipelineBuildLock build_lock;
+        return dld->vkCreateGraphicsPipelines(handle, cache, 1, &ci, nullptr, &object);
+    }();
     // Adreno 5xx drivers do not properly return when a graphics pipeline fails to be created
     // Some (unkown) Mali drivers also do not properly return
     // This result code is out of spec, but should be handled as "kinda working"
@@ -1081,7 +1122,12 @@ Pipeline Device::CreateGraphicsPipeline(const VkGraphicsPipelineCreateInfo& ci, 
 Pipeline Device::CreateComputePipeline(const VkComputePipelineCreateInfo& ci,
                                        VkPipelineCache cache) const {
     VkPipeline object;
-    Check(dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object));
+    VkResult result;
+    {
+        const PipelineBuildLock build_lock;
+        result = dld->vkCreateComputePipelines(handle, cache, 1, &ci, nullptr, &object);
+    }
+    Check(result);
     return Pipeline(object, handle, *dld);
 }
 

@@ -922,6 +922,21 @@ bool DriverCachesPipelines(const Device& device) {
         return false;
     }
 }
+
+/// Whether the driver pipeline cache can be read while pipelines build, as Vulkan allows. Intel's
+/// Windows driver crashes in vkGetPipelineCacheData then (igvk64.dll access violation on the
+/// VkPipelineSerialization thread during a scene load, Arc B580 101.9175; Lichii #1685/#1838).
+/// There, every read waits for the builds in flight (vk::PipelineCacheReadLock), and the reads
+/// that would stall play (timed flushes, the size query) are not made: the cache is written at
+/// the end of a load, when the background pipelines are done, and at exit.
+/// INTEL_FORK_NO_CACHE_READ_GUARD=1 reads during builds as before (A/B).
+bool CanReadPipelineCacheDuringBuilds(const Device& device) {
+    static const bool unguarded = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_CACHE_READ_GUARD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return unguarded || device.GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+}
 } // Anonymous namespace
 
 PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
@@ -1116,6 +1131,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         .trim_lowered_geometry_passthrough = device.IsAmdDriver(),
     };
     host_info.ApplyDescriptorLimitPolicy();
+    if (!CanReadPipelineCacheDuringBuilds(device)) {
+        vk::SetPipelineCacheReadGuard(true);
+        LOG_INFO(Render_Vulkan, "Driver pipeline cache reads wait for the pipeline builds in "
+                                "flight (INTEL_FORK_NO_CACHE_READ_GUARD=1 turns this off)");
+    }
 
     if (VideoCore::Nx2Debug::LightTableArrays()) {
         LOG_INFO(Render_Vulkan,
@@ -6856,7 +6876,10 @@ vk::PipelineCache& PipelineCache::WarmPipelineCache() {
 }
 
 void PipelineCache::QueueVulkanPipelineCacheFlush() {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    // Not where reading the cache races builds: each read would hold play's builds back (see
+    // CanReadPipelineCacheDuringBuilds). The end-of-load, background and exit saves cover it.
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        !CanReadPipelineCacheDuringBuilds(device)) {
         return;
     }
     if (++pipelines_since_flush < VULKAN_CACHE_FLUSH_PIPELINES) {
@@ -6907,7 +6930,10 @@ void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                          CACHE_VERSION);
             size_t size = 0;
-            vulkan_pipeline_cache.Read(&size, nullptr);
+            {
+                const vk::PipelineCacheReadLock read_lock;
+                vulkan_pipeline_cache.Read(&size, nullptr);
+            }
             last_cache_size.store(size, std::memory_order_relaxed);
         } while (save_again.exchange(false, std::memory_order_acq_rel));
         flush_in_flight.store(false, std::memory_order_release);
@@ -7334,7 +7360,10 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     // The VkPipelineCache object keeps every binary built this session in memory. Its size comes
     // from the saves, and between them from a query once a minute on the serialization thread
     // (some drivers serialize the whole cache to answer it), never while a save is under way.
-    if (use_vulkan_pipeline_cache && vulkan_pipeline_cache) {
+    // Not where reading the cache races builds (see CanReadPipelineCacheDuringBuilds): the size
+    // then comes from the saves only.
+    if (use_vulkan_pipeline_cache && vulkan_pipeline_cache &&
+        CanReadPipelineCacheDuringBuilds(device)) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_cache_size_query >= std::chrono::minutes{1} &&
             !flush_in_flight.load(std::memory_order_acquire)) {
@@ -9443,6 +9472,9 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     size_t cache_size = 0;
     std::vector<char> cache_data;
     if (pipeline_cache) {
+        // Size and data under one lock: no build (whose read would crash Intel's Windows driver,
+        // see CanReadPipelineCacheDuringBuilds) grows the cache between them.
+        const vk::PipelineCacheReadLock read_lock;
         pipeline_cache.Read(&cache_size, nullptr);
         cache_data.resize(cache_size);
         pipeline_cache.Read(&cache_size, cache_data.data());

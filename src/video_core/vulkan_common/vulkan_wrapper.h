@@ -1055,6 +1055,38 @@ public:
     void SetObjectNameEXT(const char* name) const;
 };
 
+/// Intel's Windows driver crashes (igvk64.dll) in vkGetPipelineCacheData while a pipeline builds,
+/// which Vulkan allows. With the guard on, every pipeline build holds it shared
+/// (PipelineBuildLock: Device::CreateGraphicsPipeline/CreateComputePipeline and the pipeline
+/// binary path) and every read of a pipeline cache's data holds it exclusively
+/// (PipelineCacheReadLock), so the two never overlap. Off unless turned on (other drivers).
+void SetPipelineCacheReadGuard(bool enabled) noexcept;
+
+/// Held around one pipeline build; builds share it. Does nothing while the guard is off.
+class PipelineBuildLock {
+public:
+    PipelineBuildLock();
+    ~PipelineBuildLock();
+    PipelineBuildLock(const PipelineBuildLock&) = delete;
+    PipelineBuildLock& operator=(const PipelineBuildLock&) = delete;
+
+private:
+    bool locked{};
+};
+
+/// Held around reads of a pipeline cache's data (PipelineCache::Read): waits for the builds in
+/// flight and holds new ones back. Does nothing while the guard is off.
+class PipelineCacheReadLock {
+public:
+    PipelineCacheReadLock();
+    ~PipelineCacheReadLock();
+    PipelineCacheReadLock(const PipelineCacheReadLock&) = delete;
+    PipelineCacheReadLock& operator=(const PipelineCacheReadLock&) = delete;
+
+private:
+    bool locked{};
+};
+
 class PipelineCache : public Handle<VkPipelineCache, VkDevice, DeviceDispatch> {
     using Handle<VkPipelineCache, VkDevice, DeviceDispatch>::Handle;
 

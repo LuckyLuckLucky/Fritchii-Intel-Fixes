@@ -1158,11 +1158,13 @@ bool TakesBinaries(const CreateInfo& ci) {
 
 VkResult CreateRaw(const vk::DeviceDispatch& dld, VkDevice device,
                    const VkGraphicsPipelineCreateInfo& ci, VkPipeline* pipeline) {
+    const vk::PipelineBuildLock build_lock;
     return dld.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, pipeline);
 }
 
 VkResult CreateRaw(const vk::DeviceDispatch& dld, VkDevice device,
                    const VkComputePipelineCreateInfo& ci, VkPipeline* pipeline) {
+    const vk::PipelineBuildLock build_lock;
     return dld.vkCreateComputePipelines(device, VK_NULL_HANDLE, 1, &ci, nullptr, pipeline);
 }
 
