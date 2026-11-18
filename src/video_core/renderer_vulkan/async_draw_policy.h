@@ -18,10 +18,13 @@ namespace Vulkan {
 /// @param recurring_target Every render target of the draw is cleared and redrawn every frame
 ///                         (EDEN_NX2_ASYNC_DISCARD=2 asks; the other modes pass true). Native
 ///                         draws into any other target wait.
+/// @param keep_native_without_depth Native draws without depth always wait (Lichii #1296); false
+///                         (INTEL_FORK_NO_FONT_ATLAS_KEEP=1) lets them follow the heuristic.
 /// @return True when the draw may be skipped.
 constexpr bool CanDiscardPendingDraw(bool native, bool depth_enabled, u32 index_count,
                                     u32 vertex_count, bool discard_native = false,
-                                    bool recurring_target = true) {
+                                    bool recurring_target = true,
+                                    bool keep_native_without_depth = true) {
     // Native draws can produce persistent resources, even with depth enabled. They are skipped
     // unless EDEN_NX2_ASYNC_DISCARD=0, trading a possible missing effect for no stall while a
     // new pipeline builds. With EDEN_NX2_ASYNC_DISCARD=2 only those into targets the frame
@@ -29,6 +32,12 @@ constexpr bool CanDiscardPendingDraw(bool native, bool depth_enabled, u32 index_
     // (title screen text, chat bubbles), one into a per-frame target for a frame.
     if (native && (!discard_native || !recurring_target)) {
         return false;
+    }
+    // Lichii #1296 (Eglantine #785): native draws without depth may build persistent textures
+    // (font atlases, 30-672 vertices): skipping one loses its glyphs for the session, or the
+    // text for a frame. They always wait.
+    if (native && keep_native_without_depth) {
+        return depth_enabled;
     }
     // Preserve the legacy async-shader heuristic.
     return depth_enabled || (index_count > 6 && vertex_count > 6);

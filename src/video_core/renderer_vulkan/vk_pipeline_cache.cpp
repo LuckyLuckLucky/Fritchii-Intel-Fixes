@@ -7986,9 +7986,16 @@ bool PipelineCache::DrawMayBeSkipped() const {
             redrawn_depth = true;
         }
     }
+    // INTEL_FORK_NO_FONT_ATLAS_KEEP=1: native draws without depth follow the heuristic again
+    // (before the port of Lichii #1296 they could be skipped).
+    static const bool font_atlas_keep = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_FONT_ATLAS_KEEP");
+        return value == nullptr || value[0] == ' ' || value[0] == '0';
+    }();
     const bool skip = CanDiscardPendingDraw(native, maxwell3d->regs.zeta_enable != 0,
                                             draw_state.draw_element_count,
-                                            draw_state.draw_element_count, mode != 0, recurring);
+                                            draw_state.draw_element_count, mode != 0, recurring,
+                                            font_atlas_keep);
     discard_decision = DiscardDecision{.serial = lookup_serial, .skip = skip, .targets = targets};
     if (skip && redrawn) {
         ++discard_stats.skipped_redrawn;

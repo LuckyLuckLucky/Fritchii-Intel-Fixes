@@ -22,13 +22,29 @@ TEST_CASE("Native pending draws are never discarded", "[video_core][async_draw]"
 TEST_CASE("Native pending draws follow the async heuristic when opted in",
           "[video_core][async_draw]") {
     REQUIRE(Vulkan::CanDiscardPendingDraw(true, true, 0, 0, true));
-    REQUIRE(Vulkan::CanDiscardPendingDraw(true, false, 7, 7, true));
+    REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 7, 7, true));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 6, 100, true));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, 0, 0, true));
     // The opt-in never changes non-native draws.
     REQUIRE(Vulkan::CanDiscardPendingDraw(false, true, 0, 0, true) ==
             Vulkan::CanDiscardPendingDraw(false, true, 0, 0));
     REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(false, false, 0, 0, true));
+}
+
+/// Lichii #1296: native draws without depth (font atlases, 30-672 vertices) always wait;
+/// INTEL_FORK_NO_FONT_ATLAS_KEEP=1 (keep_native_without_depth false) restores the heuristic.
+TEST_CASE("Native font atlas draws without depth wait", "[video_core][async_draw]") {
+    constexpr std::array<u32, 4> glyph_counts{30, 96, 384, 672};
+    for (const u32 count : glyph_counts) {
+        for (const bool recurring : {false, true}) {
+            REQUIRE_FALSE(Vulkan::CanDiscardPendingDraw(true, false, count, count, true, recurring));
+        }
+        REQUIRE(Vulkan::CanDiscardPendingDraw(true, false, count, count, true, true, false));
+    }
+    // Depth-tested native draws keep the opt-in.
+    REQUIRE(Vulkan::CanDiscardPendingDraw(true, true, 0, 0, true, true));
+    // Non-native draws are unchanged.
+    REQUIRE(Vulkan::CanDiscardPendingDraw(false, false, 7, 7, true, true));
 }
 
 /// EDEN_NX2_ASYNC_DISCARD=2: native draws into a target that is not recurring always wait, and
