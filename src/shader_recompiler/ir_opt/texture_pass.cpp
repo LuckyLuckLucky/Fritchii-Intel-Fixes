@@ -2223,11 +2223,13 @@ void RemapTextureDescriptors(IR::Program& program, const JoinedDescriptors& desc
 }
 
 bool TextureArrayIndexBoundEnabled() {
-    static const bool disabled = [] {
-        const char* const value = std::getenv("INTEL_FORK_NO_TEXARRAY_BOUND");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    // Intel fork (2026-11-19): off by default (geometry better without it, user-verified on the
+    // B580); INTEL_FORK_TEXARRAY_BOUND=1 turns the Lichii #1914 port on.
+    static const bool enabled = [] {
+        const char* const value = std::getenv("INTEL_FORK_TEXARRAY_BOUND");
+        return value != nullptr && value[0] == '1';
     }();
-    return !disabled;
+    return enabled;
 }
 
 } // namespace Shader::Optimization

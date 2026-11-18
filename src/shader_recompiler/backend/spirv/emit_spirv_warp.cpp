@@ -102,7 +102,7 @@ Id InHostSubgroup(EmitContext& ctx, Id in_range, Id src_thread_id) {
     return ctx.OpLogicalAnd(ctx.U1, in_range, ctx.OpULessThan(ctx.U1, src_thread_id, size));
 }
 
-// Intel fork (INTEL_FORK_SAFE_SHUFFLE=1): on a host subgroup that may be narrower than the guest
+// Intel fork (default on; INTEL_FORK_SAFE_SHUFFLE=0 turns it off): on a host subgroup that may be narrower than the guest
 // warp (Arc fragment programs run 16-wide), every shuffle source id is clamped into the host
 // subgroup (id & (SubgroupSize - 1)) and absolute shuffles are used, so no shuffle ever names an
 // invocation >= SubgroupSize (undefined behaviour in SPIR-V that Intel's compiler may exploit).
@@ -110,7 +110,7 @@ Id InHostSubgroup(EmitContext& ctx, Id in_range, Id src_thread_id) {
 bool SafeNarrowShuffle(EmitContext& ctx) {
     static const bool on = [] {
         const char* v = std::getenv("INTEL_FORK_SAFE_SHUFFLE");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on && Sirit::ValidId(ctx.subgroup_size);
 }

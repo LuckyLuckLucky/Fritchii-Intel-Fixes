@@ -982,6 +982,32 @@ int NanGuardMode() {
     return mode;
 }
 
+/// Intel fork (2026-11-19, user-verified on the B580): asynchronous shaders off on Intel's Windows
+/// driver (draw skips while building showed as flashing smoke/objects; the game "runs and feels
+/// better"). INTEL_FORK_ASYNC_SHADERS=1 keeps the user's setting.
+bool IntelForkSyncShaders(const Device& device) {
+    if (device.GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
+        return false;
+    }
+    const char* const v = std::getenv("INTEL_FORK_ASYNC_SHADERS");
+    const bool sync = v == nullptr || v[0] != '1';
+    const auto env_is = [](const char* name, char c) {
+        const char* const e = std::getenv(name);
+        return e != nullptr && e[0] == c;
+    };
+    // One line per boot naming the Intel fork's effective defaults (proof for A/B runs).
+    LOG_INFO(Render_Vulkan,
+             "Intel fork defaults: safe-shuffle {} | vertex-input-dynamic {} | async shaders {} | "
+             "equal-depth-bias {} | texarray-bound {} | nan-guard {} mode {}",
+             env_is("INTEL_FORK_SAFE_SHUFFLE", '0') ? "OFF" : "on",
+             device.IsExtVertexInputDynamicStateSupported() ? "on" : "OFF",
+             sync ? "OFF (forced on Intel)" : "user setting",
+             env_is("INTEL_FORK_EQUAL_DEPTH_BIAS", '1') ? "on" : "OFF",
+             env_is("INTEL_FORK_TEXARRAY_BOUND", '1') ? "on" : "OFF",
+             NanGuardEnabled() ? "on" : "OFF", NanGuardMode());
+    return sync;
+}
+
 /// Intel fork shader switches that change SPIR-V, for the kept stamp.
 std::string IntelForkSpirvStamp() {
     const auto on = [](const char* name) {
@@ -989,7 +1015,7 @@ std::string IntelForkSpirvStamp() {
         return v != nullptr && v[0] == '1';
     };
     std::string stamp;
-    if (on("INTEL_FORK_SAFE_SHUFFLE")) {
+    if (const char* const v = std::getenv("INTEL_FORK_SAFE_SHUFFLE"); v == nullptr || v[0] != '0') {
         stamp += " safe-shuffle 1";
     }
     if (on("INTEL_FORK_FRAG_SHUFFLE_FALLBACK")) {
@@ -1031,7 +1057,8 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
       descriptor_buffer_ring{descriptor_buffer_ring_},
       render_pass_cache{render_pass_cache_}, buffer_cache{buffer_cache_},
       texture_cache{texture_cache_}, shader_notify{shader_notify_},
-      use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue()},
+      use_asynchronous_shaders{Settings::values.use_asynchronous_shaders.GetValue() &&
+                               !IntelForkSyncShaders(device_)},
       use_vulkan_pipeline_cache{Settings::values.use_vulkan_driver_pipeline_cache.GetValue() &&
                                 (!DriverCachesPipelines(device_) || AppCacheBesideDriver(device_))},
       oot_visual_workaround{[] {

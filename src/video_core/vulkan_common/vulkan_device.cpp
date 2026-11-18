@@ -2238,6 +2238,18 @@ bool Device::GetSuitability(bool requires_swapchain) {
             RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
         }
     }
+    // Intel fork (2026-11-19, user-verified on the B580): with dynamic vertex input OoT's menus and
+    // walls flash for single frames on Intel (Lichii's path is fine; Fritchii's VI path has an
+    // unfound bug). Off by default on Intel's Windows driver; INTEL_FORK_VI_DYNAMIC=1 keeps it.
+    // Cost: precompiled pipelines recorded with dynamic vertex input do not match (phase D).
+    if (extensions.vertex_input_dynamic_state && driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
+        const char* const keep = std::getenv("INTEL_FORK_VI_DYNAMIC");
+        if (keep == nullptr || keep[0] != '1') {
+            LOG_INFO(Render_Vulkan, "Intel fork: VK_EXT_vertex_input_dynamic_state off on Intel "
+                                    "(INTEL_FORK_VI_DYNAMIC=1 keeps it)");
+            RemoveExtensionFeature(extensions.vertex_input_dynamic_state, features.vertex_input_dynamic_state, VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+        }
+    }
 
     if (u32(Settings::values.dyna_state.GetValue()) == 0) {
         LOG_INFO(Render_Vulkan, "Extended Dynamic State disabled by user setting, clearing all EDS features");

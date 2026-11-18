@@ -10684,9 +10684,11 @@ void RasterizerVulkan::UpdateEqualDepthBias(Tegra::Engines::Maxwell3D::Regs& reg
     // depth; here the direction follows the last depth-writing draw's test (GREATER: reversed
     // depth, so GREATER_OR_EQUAL and +64). Intel only, and only where the compare op and the
     // bias enable are dynamic state. INTEL_FORK_NO_EQUAL_DEPTH_BIAS=1: the game's state.
+    // Intel fork (2026-11-19): this port CAUSED geometry glitches (floor through the sky) on the
+    // B580 → off by default; INTEL_FORK_EQUAL_DEPTH_BIAS=1 turns it on.
     static const bool disabled = [] {
-        const char* const value = std::getenv("INTEL_FORK_NO_EQUAL_DEPTH_BIAS");
-        return value != nullptr && value[0] != '\0' && value[0] != '0';
+        const char* const value = std::getenv("INTEL_FORK_EQUAL_DEPTH_BIAS");
+        return value == nullptr || value[0] != '1';
     }();
     if (disabled || device.GetVendorID() != 0x8086 || !device.IsExtExtendedDynamicStateSupported() ||
         !device.IsExtExtendedDynamicState2Supported()) {
