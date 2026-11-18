@@ -80,4 +80,8 @@ void RemapTextureDescriptors(IR::Program& program, const JoinedDescriptors& desc
 /// added to another at the bindings they have there
 void RemapStorageBindings(IR::Program& program, std::span<const u32> bindings);
 
+/// Whether the texture pass bounds a texture array indexed by a found bit (FLO) to 32 elements
+/// (ported from Lichii #1914). INTEL_FORK_NO_TEXARRAY_BOUND=1: off, as before.
+bool TextureArrayIndexBoundEnabled();
+
 } // namespace Shader::Optimization

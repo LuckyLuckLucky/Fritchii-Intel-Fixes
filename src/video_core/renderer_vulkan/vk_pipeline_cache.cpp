@@ -6112,17 +6112,21 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // EDEN_NX2_LIGHT_TABLE_ARRAYS translates the light tables to descriptor arrays: kept pipelines
     // of the other setting are not this translation (the boot sample only sees that when it hits
     // a light table shader). Named only when on, so the stamp with it off stays what it was.
+    // INTEL_FORK_NO_TEXARRAY_BOUND changes the size of texture arrays indexed by a found bit.
     // The NaN guard (INTEL_FORK_NO_NAN_GUARD) changes every fragment module with a float colour
     // output: kept modules of the other setting are not used.
     return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{}{}{}{}\n",
+                       "{}{}{}{}{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(device),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
                        CanonicalKeys() ? 1 : 0,
                        host_info.support_handle_table_arrays ? " light-tables 1" : "",
                        NanGuardEnabled() ? " nan-guard 1" : "",
-                       profile.position_invariant ? " invariant 1" : "");
+                       profile.position_invariant ? " invariant 1" : "",
+                       Shader::Optimization::TextureArrayIndexBoundEnabled()
+                           ? " texarray-bound 1"
+                           : "");
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
