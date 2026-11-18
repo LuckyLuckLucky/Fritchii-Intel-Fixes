@@ -49,6 +49,7 @@
 #include "shader_recompiler/info_serialize.h"
 #include "shader_recompiler/translate_profile.h"
 #include "shader_recompiler/ir_opt/passes.h"
+#include "shader_recompiler/ir_opt/fragment_output_guard.h"
 #include "shader_recompiler/ir_opt/oot_visual_workaround.h"
 #include "shader_recompiler/program_header.h"
 #include "video_core/async_translate.h"
@@ -936,6 +937,34 @@ bool CanReadPipelineCacheDuringBuilds(const Device& device) {
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return unguarded || device.GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+}
+
+/// Whether fragment programs keep their float colour outputs finite (GuardFragmentOutputs,
+/// adapted from Longshot; all GPUs, as there). INTEL_FORK_NO_NAN_GUARD=1 emits them as before
+/// (A/B; the kept stamp names the guard, so kept modules of the other setting are not used).
+bool NanGuardEnabled() {
+    static const bool disabled = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_NAN_GUARD");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return !disabled;
+}
+
+/// The colour targets of `key` that take float values (bit i: target i), for the NaN guard.
+/// Integer targets are left out: their outputs carry the guest's integer bits.
+u32 FloatColorTargets(const GraphicsPipelineCacheKey& key) {
+    u32 mask = 0;
+    for (size_t i = 0; i < 8; ++i) {
+        const auto format = static_cast<Tegra::RenderTargetFormat>(key.state.color_formats[i]);
+        if (format == Tegra::RenderTargetFormat::NONE) {
+            continue;
+        }
+        const auto pixel_format = VideoCore::Surface::PixelFormatFromRenderTargetFormat(format);
+        if (!VideoCore::Surface::IsPixelFormatInteger(pixel_format)) {
+            mask |= 1u << i;
+        }
+    }
+    return mask;
 }
 } // Anonymous namespace
 
@@ -6009,13 +6038,16 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
     // EDEN_NX2_LIGHT_TABLE_ARRAYS translates the light tables to descriptor arrays: kept pipelines
     // of the other setting are not this translation (the boot sample only sees that when it hits
     // a light table shader). Named only when on, so the stamp with it off stays what it was.
+    // The NaN guard (INTEL_FORK_NO_NAN_GUARD) changes every fragment module with a float colour
+    // output: kept modules of the other setting are not used.
     return fmt::format("{}kept NX2KEPT5 cache {} settings {:#x} gpl {} oot {} {:016x} canonical "
-                       "{}{}\n",
+                       "{}{}{}\n",
                        prepared_stamp, CACHE_VERSION, SpirvSettingsStamp(device),
                        device.IsExtGraphicsPipelineLibrarySupported() ? 1 : 0,
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
                        CanonicalKeys() ? 1 : 0,
-                       host_info.support_handle_table_arrays ? " light-tables 1" : "");
+                       host_info.support_handle_table_arrays ? " light-tables 1" : "",
+                       NanGuardEnabled() ? " nan-guard 1" : "");
 }
 
 std::shared_ptr<const PrecompiledKept::Index> PipelineCache::KeptIndex() const {
@@ -8519,6 +8551,12 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             runtime_info.primitive_id_location = mesh_emulation->primitive_id_location;
         }
         ConvertLegacyToGeneric(program, runtime_info);
+        if (program.stage == Shader::Stage::Fragment && NanGuardEnabled()) {
+            // Adapted from Longshot: no NaN or infinity into a float colour target (one NaN
+            // spreads through OoT's bloom to a white frame). Before every emission of this
+            // program (record, pipeline, workers). INTEL_FORK_NO_NAN_GUARD=1: off.
+            Shader::Optimization::GuardFragmentOutputs(program, FloatColorTargets(key));
+        }
         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) && device.IsAmdDriver()) {
             // Ported fix, AMD only: other vendors keep every geometry output.
             PruneUnreadGeometryOutputs(

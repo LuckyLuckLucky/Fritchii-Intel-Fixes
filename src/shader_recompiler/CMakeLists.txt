@@ -183,6 +183,7 @@ add_library(shader_recompiler STATIC
     ir_opt/dead_code_elimination_pass.cpp
     ir_opt/dominance.h
     ir_opt/dual_vertex_pass.cpp
+    ir_opt/fragment_output_guard.h
     ir_opt/geometry_compaction_pass.cpp
     ir_opt/global_memory_to_storage_buffer_pass.cpp
     ir_opt/identity_removal_pass.cpp
