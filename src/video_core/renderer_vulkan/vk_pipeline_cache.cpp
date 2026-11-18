@@ -971,6 +971,36 @@ bool NanGuardEnabled() {
     return !disabled;
 }
 
+/// INTEL_FORK_NAN_GUARD_MODE (read once): 0 = as adapted (NaN -> 0 and +-Inf clamped, every float
+/// target), 1 = NaN only (infinities kept: OoT may mark the sky with them), 2 = colour target 0
+/// only (NaN and clamp), 3 = target 0, NaN only. Named in the kept stamp.
+int NanGuardMode() {
+    static const int mode = [] {
+        const char* const value = std::getenv("INTEL_FORK_NAN_GUARD_MODE");
+        return value != nullptr ? std::atoi(value) : 0;
+    }();
+    return mode;
+}
+
+/// Intel fork shader switches that change SPIR-V, for the kept stamp.
+std::string IntelForkSpirvStamp() {
+    const auto on = [](const char* name) {
+        const char* const v = std::getenv(name);
+        return v != nullptr && v[0] == '1';
+    };
+    std::string stamp;
+    if (on("INTEL_FORK_SAFE_SHUFFLE")) {
+        stamp += " safe-shuffle 1";
+    }
+    if (on("INTEL_FORK_FRAG_SHUFFLE_FALLBACK")) {
+        stamp += " frag-shuffle-fallback 1";
+    }
+    if (NanGuardMode() != 0) {
+        stamp += fmt::format(" nan-mode {}", NanGuardMode());
+    }
+    return stamp;
+}
+
 /// The colour targets of `key` that take float values (bit i: target i), for the NaN guard.
 /// Integer targets are left out: their outputs carry the guest's integer bits.
 u32 FloatColorTargets(const GraphicsPipelineCacheKey& key) {
@@ -6130,7 +6160,8 @@ std::string PipelineCache::KeptStamp(const std::string& prepared_stamp) const {
                        oot_visual_workaround ? 1 : 0, visual_workaround_title,
                        CanonicalKeys() ? 1 : 0,
                        host_info.support_handle_table_arrays ? " light-tables 1" : "",
-                       NanGuardEnabled() ? " nan-guard 1" : "",
+                       NanGuardEnabled() ? " nan-guard 1" + IntelForkSpirvStamp()
+                                         : IntelForkSpirvStamp(),
                        profile.position_invariant ? " invariant 1" : "",
                        Shader::Optimization::TextureArrayIndexBoundEnabled()
                            ? " texarray-bound 1"
@@ -8649,7 +8680,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // Adapted from Longshot: no NaN or infinity into a float colour target (one NaN
             // spreads through OoT's bloom to a white frame). Before every emission of this
             // program (record, pipeline, workers). INTEL_FORK_NO_NAN_GUARD=1: off.
-            Shader::Optimization::GuardFragmentOutputs(program, FloatColorTargets(key));
+            const int nan_mode = NanGuardMode();
+            const u32 targets = FloatColorTargets(key) & ((nan_mode >= 2) ? 1u : ~0u);
+            Shader::Optimization::GuardFragmentOutputs(program, targets,
+                                                       /*clamp_inf=*/nan_mode == 0 ||
+                                                           nan_mode == 2);
         }
         if (index == static_cast<size_t>(Maxwell::ShaderType::Geometry) && device.IsAmdDriver()) {
             // Ported fix, AMD only: other vendors keep every geometry output.

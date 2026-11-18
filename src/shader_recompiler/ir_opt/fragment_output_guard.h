@@ -20,7 +20,8 @@ namespace Shader::Optimization {
 /// outputs carry integer bits).
 /// float_targets: bit i set when colour target i is a float (or unorm/snorm) one.
 /// Returns the number of guarded writes. INTEL_FORK_NO_NAN_GUARD=1 skips it (vk_pipeline_cache).
-inline size_t GuardFragmentOutputs(IR::Program& program, u32 float_targets) {
+inline size_t GuardFragmentOutputs(IR::Program& program, u32 float_targets,
+                                   bool clamp_inf = true) {
     if (program.stage != Stage::Fragment) {
         return 0;
     }
@@ -36,7 +37,9 @@ inline size_t GuardFragmentOutputs(IR::Program& program, u32 float_targets) {
     for (const auto& [block, inst] : writes) {
         IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(*inst)};
         const IR::F32 value{inst->Arg(2)};
-        const IR::F32 limited{ir.FPClamp(value, ir.Imm32(-1e30f), ir.Imm32(1e30f))};
+        const IR::F32 limited{clamp_inf ? IR::F32{ir.FPClamp(value, ir.Imm32(-1e30f),
+                                                             ir.Imm32(1e30f))}
+                                        : value};
         const IR::F32 safe{ir.Select(ir.FPIsNan(value), ir.Imm32(0.0f), limited)};
         inst->SetArg(2, safe);
     }
