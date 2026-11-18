@@ -29,7 +29,8 @@ namespace {
 // magic: kept files written before are then prepared again. 2: the precompiled record offsets
 // (the boot check reads each sampled record's key from them). 4: Shader::Info's
 // storage_read_extents. 5: Shader::Info's demoted_conditional_barrier (ConditionalBarrierPass).
-constexpr std::string_view Magic{"NX2KEPT5"};
+// 6: Shader::Info's uses_barrier_vote.
+constexpr std::string_view Magic{"NX2KEPT6"};
 constexpr std::string_view EndMagic{"NX2KEPTE"};
 constexpr u8 EntryInfo = 1;
 constexpr u8 EntrySpirv = 2;

@@ -518,7 +518,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     pass(Step::ConstantPropagation, [&] { Optimization::ConstantPropagationPass(env, program); });
     // The divergence analysis follows values through the SSA form, with constants folded.
     if (!normalized_host_info.support_conditional_barrier && !RemoveAllConditionalBarriers()) {
-        Optimization::ConditionalBarrierPass(program);
+        Optimization::ConditionalBarrierPass(program,
+                                             normalized_host_info.max_compute_shared_memory_size);
     }
 
     pass(Step::Position, [&] { Optimization::PositionPass(env, program); });

@@ -342,6 +342,7 @@ void VisitInfo(Io& io, I& info) {
     io(info.uses_demote_to_helper_invocation);
     io(info.uses_subgroup_vote);
     io(info.demoted_conditional_barrier);
+    io(info.uses_barrier_vote);
     io(info.uses_subgroup_mask);
     io(info.uses_fswzadd);
     io(info.uses_derivatives);
