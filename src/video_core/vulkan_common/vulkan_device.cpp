@@ -780,7 +780,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         IsFormatSupported(VK_FORMAT_D24_UNORM_S8_UINT,
                           VK_FORMAT_FEATURE_DEPTH_STENCIL_ATTACHMENT_BIT, FormatType::Optimal);
 
-    supports_conditional_barriers = !is_intel_windows;
+    // Without them ConditionalBarrierPass demotes the barriers under divergent control flow: ANV
+    // hangs when only part of a workgroup reaches one (Mario Kart World, Lichii #1377).
+    supports_conditional_barriers =
+        !is_intel_windows && driver_id != VK_DRIVER_ID_INTEL_OPEN_SOURCE_MESA;
 
     CollectPhysicalMemoryInfo();
     // FRITCHII_SMALL_CARD (part RefuseScale): the presenting device only (not Force maximum

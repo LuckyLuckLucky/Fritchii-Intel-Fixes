@@ -19,6 +19,7 @@ namespace Shader::Optimization {
 
 void CollectShaderInfoPass(Environment& env, IR::Program& program);
 void ConditionalBarrierPass(IR::Program& program);
+void RemoveConditionalBarriersPass(IR::Program& program);
 void ConstantPropagationPass(Environment& env, IR::Program& program);
 void DeadCodeEliminationPass(IR::Program& program);
 void GeometryCompactionPass(IR::Program& program, const HostTranslateInfo& host_info);

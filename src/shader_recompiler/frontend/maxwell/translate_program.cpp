@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <bitset>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -386,6 +387,17 @@ void TightenOutputVertices(IR::Program& program) {
         program.output_vertices = (std::min)(program.output_vertices, num_emits);
     }
 }
+
+/// INTEL_FORK_NO_DIVERGENT_BARRIERS=1 (read once): on hosts without conditional barrier support,
+/// drop every barrier under an if or loop as before (RemoveConditionalBarriersPass) instead of
+/// demoting only the ones under divergent control flow (ConditionalBarrierPass). For A/B tests.
+bool RemoveAllConditionalBarriers() {
+    static const bool enabled = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_DIVERGENT_BARRIERS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return enabled;
+}
 } // Anonymous namespace
 
 IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
@@ -492,8 +504,8 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     if (!normalized_host_info.support_int64) {
         Optimization::LowerInt64ToInt32(program);
     }
-    if (!normalized_host_info.support_conditional_barrier) {
-        Optimization::ConditionalBarrierPass(program);
+    if (!normalized_host_info.support_conditional_barrier && RemoveAllConditionalBarriers()) {
+        Optimization::RemoveConditionalBarriersPass(program);
     }
     lower_scope.reset();
     // Each pass, timed when the translation profile is on.
@@ -504,6 +516,10 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     pass(Step::SsaRewrite, [&] { Optimization::SsaRewritePass(program); });
 
     pass(Step::ConstantPropagation, [&] { Optimization::ConstantPropagationPass(env, program); });
+    // The divergence analysis follows values through the SSA form, with constants folded.
+    if (!normalized_host_info.support_conditional_barrier && !RemoveAllConditionalBarriers()) {
+        Optimization::ConditionalBarrierPass(program);
+    }
 
     pass(Step::Position, [&] { Optimization::PositionPass(env, program); });
     pass(Step::BlitConstants, [&] { Optimization::BlitConstantsPass(env, program); });

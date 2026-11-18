@@ -300,10 +300,12 @@ VkShaderStageFlagBits StageFlag(const Shader::Info& info, VkShaderStageFlagBits 
 // lanes, but Intel picks SIMD16 or SIMD32 per shader: a task shader's ballot then saw half the
 // warp and its meshlet compaction dropped or repeated meshlets (flickering and missing foliage on
 // Arc). Only stages with these ops are pinned, as in compute pipelines; quad ops need no more
-// than 4 lanes.
+// than 4 lanes. A program whose divergent barrier lost its execution barrier
+// (ConditionalBarrierPass) relies on a whole warp running in step, so it is pinned too.
 bool UsesWarpWidthOps(const Shader::Info& info) {
-    return info.uses_subgroup_vote || info.uses_subgroup_invocation_id ||
-           info.uses_subgroup_shuffles || info.uses_subgroup_mask;
+    return info.demoted_conditional_barrier || info.uses_subgroup_vote ||
+           info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||
+           info.uses_subgroup_mask;
 }
 
 const void* GuestWarpSizeChain(const Device& device, const Shader::Info& info,
@@ -3534,7 +3536,8 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
         };
         const auto make_compute = [&](VkShaderModule module, VkPipelineLayout layout,
                                       const Shader::Info* info) {
-            const bool uses_warp_ops{info && (info->uses_subgroup_vote ||
+            const bool uses_warp_ops{info && (info->demoted_conditional_barrier ||
+                                              info->uses_subgroup_vote ||
                                               info->uses_subgroup_invocation_id ||
                                               info->uses_subgroup_shuffles ||
                                               info->uses_subgroup_mask ||
