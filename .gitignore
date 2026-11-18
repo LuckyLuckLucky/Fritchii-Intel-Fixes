@@ -66,3 +66,22 @@ vulkansdk*.exe
 
 # Build-time generated external sources
 externals/generated
+
+# --- intel fork: never commit keys, firmware, game files, saves, caches or licensed recipes ---
+*.keys
+prod.keys
+title.keys
+*.nca
+*.nsp
+*.xci
+*.nx
+*.nro
+*.nso
+*.dmp
+nand/
+sdmc/
+user/
+saves_snapshot/
+*.nx2prep
+*.nx2recipe
+recipes/
