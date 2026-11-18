@@ -32,6 +32,7 @@
 #include "common/scm_rev.h"
 #include "nx2_shader_stamp.h" // generated: NX2_SHADER_STAMP
 #include "common/scope_exit.h"
+#include "common/fs/file_lock.h"
 #include "common/fs/fs.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
@@ -937,6 +938,16 @@ bool CanReadPipelineCacheDuringBuilds(const Device& device) {
         return value != nullptr && value[0] != '\0' && value[0] != '0';
     }();
     return unguarded || device.GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+}
+
+/// The pipeline cache hardening ported from Lichii (#1505: no cached builds at boot after a boot
+/// load that never finished). INTEL_FORK_NO_CACHE_HARDENING=1: off, as before (A/B).
+bool CacheHardeningEnabled() {
+    static const bool disabled = [] {
+        const char* const value = std::getenv("INTEL_FORK_NO_CACHE_HARDENING");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return !disabled;
 }
 
 /// INTEL_FORK_NO_INVARIANT_POSITION=1: positions are not decorated Invariant (Profile::
@@ -4016,6 +4027,33 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     MergeCompatiblePipelineCaches(base_dir, pipeline_cache_filename, used_pipelines_filename);
     used_pipelines = LoadUsedPipelines(used_pipelines_filename, MaxUsedPipelineAge(device));
     used_pipelines_saved = std::chrono::steady_clock::now();
+    // Adapted from Lichii #1505: a marker beside the cache lives while the boot builds run. Found
+    // at boot, the last boot load never finished (a driver crash, abort or hang), so this one
+    // queues no cached pipeline (boot or background builds; they are built when first needed)
+    // and does not crash the same way again. The marker is only read and written under a lock
+    // beside it: while another emulator holds the lock its load is running, and this boot builds
+    // nothing either; a lock that cannot be opened builds, without the guard.
+    // INTEL_FORK_NO_CACHE_HARDENING=1: no marker, builds as before.
+    auto boot_marker = pipeline_cache_filename;
+    boot_marker += ".booting";
+    auto boot_lock_path = boot_marker;
+    boot_lock_path += ".lock";
+    std::optional<Common::FS::FileLock> boot_lock;
+    if (CacheHardeningEnabled()) {
+        boot_lock.emplace(boot_lock_path);
+    }
+    const bool boot_lock_held = boot_lock && boot_lock->Held();
+    const bool build_at_boot = !boot_lock ? true
+                               : boot_lock_held ? !Common::FS::Exists(boot_marker)
+                                                : !boot_lock->Busy();
+    if (boot_lock && boot_lock->Busy()) {
+        LOG_WARNING(Render_Vulkan, "Pipeline cache: another emulator is loading this title's "
+                                   "cache; building none at boot this time");
+    } else if (!build_at_boot) {
+        LOG_WARNING(Render_Vulkan, "Pipeline cache: the last boot ended while building cached "
+                                   "pipelines; building none at boot this time "
+                                   "(INTEL_FORK_NO_CACHE_HARDENING=1 builds them)");
+    }
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
     using GraphicsRecords = std::vector<std::vector<FileEnvironment>>;
@@ -4130,6 +4168,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     }};
     const auto queue_compute{[&](const ComputePipelineCacheKey& key,
                                  ComputeCandidates candidates) {
+        if (!build_at_boot) {
+            return; // the boot marker (above): built when first needed
+        }
         if (boot_stream) {
             std::vector<RecordRef> refs;
             refs.reserve(candidates.refs.size());
@@ -4305,6 +4346,10 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records) {
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
+        if (!build_at_boot) {
+            ++skipped_pipelines; // the boot marker (above): no boot or background build
+            return;
+        }
         if (!PreloadAllPipelines() &&
             (used_pipelines.empty() ? queued_graphics >= MaxPipelinesWithoutUsedList
                                     : !used_pipelines.contains(hash))) {
@@ -4334,6 +4379,21 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         }
         ++state.total;
     }};
+    // The boot marker lives from here until the boot builds are done (or the load stops).
+    bool boot_marker_made = false;
+    if (boot_lock_held && build_at_boot) {
+        boot_marker_made = Common::FS::NewFile(boot_marker);
+        if (!boot_marker_made) {
+            LOG_WARNING(Common_Filesystem, "Couldn't create {}",
+                        Common::FS::PathToUTF8String(boot_marker));
+        }
+    }
+    SCOPE_EXIT {
+        if (boot_marker_made) {
+            Common::FS::RemoveFile(boot_marker);
+            boot_marker_made = false;
+        }
+    };
     VideoCommon::LoadPipelines(stop_loading, pipeline_cache_filename, CACHE_VERSION, load_compute,
                                load_graphics);
     if (streaming) {
