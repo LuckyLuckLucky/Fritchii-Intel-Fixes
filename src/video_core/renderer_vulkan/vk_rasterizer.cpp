@@ -139,6 +139,17 @@ using VideoCommon::ImageViewType;
 
 namespace {
 
+/// INTEL_FORK_VI_ALWAYS=1 (diagnostic): send the vertex input state with every draw, as Lichii's
+/// UpdateVertexInput does whenever a stream register changed (Fritchii's fps fix 2 step 7
+/// clears Dirty::VertexBuffers so only format/divisor/repack changes send it).
+bool IntelViAlways() {
+    static const bool on = [] {
+        const char* v = std::getenv("INTEL_FORK_VI_ALWAYS");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
 /// The constant depth bias (host units) of RasterizerVulkan::UpdateEqualDepthBias: Longshot's
 /// 64 (device_policy.h equal_depth_bias on Intel).
 constexpr float EQUAL_DEPTH_BIAS_UNITS = 64.0f;
@@ -2723,8 +2734,9 @@ void RasterizerVulkan::PrepareDraw(bool is_indexed, Func&& draw_func, bool is_in
         // the formats, the divisors and the repack layout. A lend sets the back's cache flags
         // from GPUMem's copy again. One follower: E's fill ran that update on E's flags, so R
         // clears its view's copy here for the same reason.
-        if (onef_play != nullptr || (VideoCommon::MemoryStageLink::BackServed() &&
-                                     VideoCommon::MemoryStageLink::Ahead() != 0)) {
+        if (!IntelViAlways() &&
+            (onef_play != nullptr || (VideoCommon::MemoryStageLink::BackServed() &&
+                                      VideoCommon::MemoryStageLink::Ahead() != 0))) {
             maxwell3d->dirty.flags[VideoCommon::Dirty::VertexBuffers] = false;
         }
     } else {
@@ -11425,7 +11437,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     auto& dirty{maxwell3d->dirty.flags};
     const bool vertex_input_dirty = dirty[Dirty::VertexInput];
     const bool vertex_buffers_dirty = dirty[VideoCommon::Dirty::VertexBuffers];
-    if (!vertex_input_dirty && !vertex_buffers_dirty) {
+    if (!vertex_input_dirty && !vertex_buffers_dirty && !IntelViAlways()) {
         return;
     }
     dirty[Dirty::VertexInput] = false;
@@ -11435,7 +11447,7 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
     // (88,500 sends a second, 45,000 the same as the last). Here it only means "a stream register
     // changed, or a new command buffer, since the last send", so it is cleared with the send. A
     // lend sets the back's cache flags from GPUMem's copy again.
-    if (vertex_buffers_dirty && VideoCommon::MemoryStageLink::BackServed() &&
+    if (vertex_buffers_dirty && !IntelViAlways() && VideoCommon::MemoryStageLink::BackServed() &&
         VideoCommon::MemoryStageLink::Ahead() != 0) {
         dirty[VideoCommon::Dirty::VertexBuffers] = false;
     }
@@ -11572,6 +11584,19 @@ void RasterizerVulkan::UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs) 
         });
     }
     ++vertex_input_recorded;
+    // Intel fork (menu/geometry one-frame flashes on Arc, 2026-11-18): vkCmdSetVertexInputEXT
+    // also sets every binding's stride. MemPlayer::PlayVertices skips a vkCmdBindVertexBuffers2
+    // whose buffer/offset/size/stride equal its last bind in this command buffer, so after a draw
+    // with another layout the live stride stayed that layout's and the next draw read its
+    // vertices with a wrong stride. Lichii has no such skip. INTEL_FORK_NO_VI_REBIND=1 turns
+    // this off.
+    static const bool no_vi_rebind = [] {
+        const char* v = std::getenv("INTEL_FORK_NO_VI_REBIND");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (!no_vi_rebind) {
+        mem_stage.Player().ForgetVertexBindings();
+    }
     vertex_input_bindings_described += num_bindings;
     vertex_input_bindings_referenced += static_cast<u64>(std::popcount(referenced_bindings));
     vertex_input_attributes_described += num_attributes;

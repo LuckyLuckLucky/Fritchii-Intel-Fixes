@@ -1306,6 +1306,11 @@ public:
     /// The remembered index and vertex buffers are forgotten (SEAM changed).
     void ForgetBindings() noexcept;
 
+    /// Intel fork: only the remembered vertex buffers are forgotten. vkCmdSetVertexInputEXT
+    /// rewrites every binding's stride, so the next draw's "same buffer, same stride" bind must
+    /// not be skipped (the live stride may be another layout's).
+    void ForgetVertexBindings() noexcept;
+
     /// The player is the back's: counts a use on GPUMem (vk_mem_stage.cpp).
     static void CheckBack(const char* where) noexcept;
 

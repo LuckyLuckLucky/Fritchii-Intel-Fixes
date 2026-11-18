@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <array>
 #include <bit>
@@ -15,6 +16,7 @@
 
 #include "common/common_types.h"
 #include "common/div_ceil.h"
+#include "common/logging.h"
 #include "shader_recompiler/backend/nvn_storage_descriptor.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
@@ -1922,6 +1924,22 @@ void EmitContext::DefineInputs(const IR::Program& program) {
             Decorate(subgroup_mask_le, spv::Decoration::Flat);
             Decorate(subgroup_mask_gt, spv::Decoration::Flat);
             Decorate(subgroup_mask_ge, spv::Decoration::Flat);
+        }
+    }
+    // Intel fork diagnostic: Arc can't pin fragment shaders to 32 lanes (requiredSubgroupSizeStages
+    // lacks FRAGMENT; minSubgroupSize 16), so guest warp-32 votes/ballots/shuffles in a fragment
+    // program may run on a 16-lane subgroup. Count and name such programs.
+    if (stage == Stage::Fragment && profile.warp_size_potentially_smaller_than_guest &&
+        (info.uses_subgroup_vote || info.uses_subgroup_mask || info.uses_subgroup_shuffles ||
+         info.uses_subgroup_invocation_id)) {
+        static std::atomic<u32> narrow_warp_fragments{0};
+        const u32 n = ++narrow_warp_fragments;
+        if (n <= 200 || (n % 100) == 0) {
+            LOG_INFO(Shader,
+                     "Intel narrow-warp fragment program #{}: vote={} mask={} shuffles={} "
+                     "invocation_id={} (guest warp 32, host fragment subgroup may be 16)",
+                     n, info.uses_subgroup_vote, info.uses_subgroup_mask,
+                     info.uses_subgroup_shuffles, info.uses_subgroup_invocation_id);
         }
     }
     if ((info.uses_fswzadd || info.uses_subgroup_invocation_id || info.uses_subgroup_shuffles ||

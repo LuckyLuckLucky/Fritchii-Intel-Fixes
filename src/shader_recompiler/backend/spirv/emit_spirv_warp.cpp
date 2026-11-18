@@ -3,6 +3,8 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
+
 #include "shader_recompiler/backend/spirv/emit_spirv_instructions.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 
@@ -100,12 +102,34 @@ Id InHostSubgroup(EmitContext& ctx, Id in_range, Id src_thread_id) {
     return ctx.OpLogicalAnd(ctx.U1, in_range, ctx.OpULessThan(ctx.U1, src_thread_id, size));
 }
 
+// Intel fork (INTEL_FORK_SAFE_SHUFFLE=1): on a host subgroup that may be narrower than the guest
+// warp (Arc fragment programs run 16-wide), every shuffle source id is clamped into the host
+// subgroup (id & (SubgroupSize - 1)) and absolute shuffles are used, so no shuffle ever names an
+// invocation >= SubgroupSize (undefined behaviour in SPIR-V that Intel's compiler may exploit).
+// The in-bounds select (InHostSubgroup) still discards such lanes' results, as before.
+bool SafeNarrowShuffle(EmitContext& ctx) {
+    static const bool on = [] {
+        const char* v = std::getenv("INTEL_FORK_SAFE_SHUFFLE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on && Sirit::ValidId(ctx.subgroup_size);
+}
+
+Id ClampToHostSubgroup(EmitContext& ctx, Id id) {
+    const Id size{ctx.OpLoad(ctx.U32[1], ctx.subgroup_size)};
+    return ctx.OpBitwiseAnd(ctx.U32[1], id, ctx.OpISub(ctx.U32[1], size, ctx.Const(1u)));
+}
+
 bool UseShuffleFallback(EmitContext& ctx) {
     return ctx.profile.has_broken_spirv_subgroup_shuffle ||
            (ctx.profile.has_broken_spirv_fragment_shuffle && ctx.stage == Stage::Fragment);
 }
 
 Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
+    if (SafeNarrowShuffle(ctx) && !UseShuffleFallback(ctx)) {
+        return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value,
+                                            ClampToHostSubgroup(ctx, src_thread_id));
+    }
     if (!UseShuffleFallback(ctx)) {
         return ctx.OpGroupNonUniformShuffle(ctx.U32[1], SubgroupScope(ctx), value, src_thread_id);
     }
@@ -120,7 +144,8 @@ Id ShuffleAbsolute(EmitContext& ctx, Id value, Id src_thread_id) {
 }
 
 Id ShuffleRelative(EmitContext& ctx, Id value, Id delta, Id src_thread_id, spv::Op op) {
-    if (!ctx.profile.support_shuffle_relative || UseShuffleFallback(ctx)) {
+    if (!ctx.profile.support_shuffle_relative || UseShuffleFallback(ctx) ||
+        SafeNarrowShuffle(ctx)) {
         return ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id));
     }
     const Id result{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, delta)};
@@ -266,7 +291,8 @@ Id EmitShuffleIndex(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id cla
     }
     const IR::Value lane{inst->Arg(1).Resolve()};
     const IR::Value segment{inst->Arg(3).Resolve()};
-    if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0) {
+    if (lane.IsImmediate() && segment.IsImmediate() && segment.U32() == 0 &&
+        !SafeNarrowShuffle(ctx)) {
         return ctx.OpSelect(ctx.U32[1], in_range, BroadcastLane(ctx, value, lane.U32() & 31),
                             value);
     }
@@ -325,7 +351,10 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
         ctx, ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id), src_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
-    const Id shuffled{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask)};
+    const Id shuffled{SafeNarrowShuffle(ctx)
+                          ? ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))
+                          : ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx),
+                                                            value, mask)};
     return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
 }
 

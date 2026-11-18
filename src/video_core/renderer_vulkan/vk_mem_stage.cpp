@@ -5000,6 +5000,12 @@ void MemPlayer::ForgetBindings() noexcept {
     }
 }
 
+void MemPlayer::ForgetVertexBindings() noexcept {
+    for (BoundVertexBuffer& bound : bound_vertex_buffers) {
+        bound.epoch = ~u64{0};
+    }
+}
+
 // Spec 5.4: the player is the back's. Nothing reaches it on GPUMem: entries GPUMem must have run
 // now go to the back (OnBack), and the runtime's Player() and Seam() check too. Must be 0.
 void MemPlayer::CheckBack(const char* where) noexcept {

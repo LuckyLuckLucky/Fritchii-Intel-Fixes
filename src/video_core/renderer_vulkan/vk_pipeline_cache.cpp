@@ -1125,7 +1125,15 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY &&
             device.GetDriverVersion() < VK_MAKE_VERSION(512, 672, 0),
         .has_broken_spirv_subgroup_shuffle = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY,
-        .has_broken_spirv_fragment_shuffle = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY,
+        // Intel fork test: INTEL_FORK_FRAG_SHUFFLE_FALLBACK=1 also uses the broadcast fallback
+        // (as on AMD's driver) for fragment shuffles on Intel's Windows driver, where fragment
+        // programs may run 16-wide under the guest's 32-lane shuffles (400+ OoT programs).
+        .has_broken_spirv_fragment_shuffle =
+            driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+            (driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS && [] {
+                const char* v = std::getenv("INTEL_FORK_FRAG_SHUFFLE_FALLBACK");
+                return v != nullptr && v[0] == '1';
+            }()),
         .max_subgroup_size = device.GetMaxSubgroupSize(),
         .has_broken_robust =
             device.IsNvidia() && device.GetNvidiaArch() <= NvidiaArchitecture::Arch_Pascal,
