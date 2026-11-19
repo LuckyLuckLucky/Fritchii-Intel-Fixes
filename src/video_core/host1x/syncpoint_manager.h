@@ -2,6 +2,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <condition_variable>
@@ -9,7 +10,9 @@
 #include <chrono>
 #include <list>
 #include <mutex>
+#include <stop_token>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/common_types.h"
@@ -98,6 +101,101 @@ public:
     /// blocks for long: says so when the lock stays held for 200 ms.
     [[nodiscard]] std::string DescribeWaits();
 
+    // ---- INTEL_FORK_CPU_SYNC_DONE (env, read once, default 0 = off) ----------------------------
+    // Fences stay Default for the GPU side (the host value is raised at once, every fast path on),
+    // but the guest CPU's waits and reads of syncpoints (nvhost_ctrl events, nvcore's UpdateMin,
+    // nx2:syncpt waits, the nx2:gsv value page, present fences) see a third value, "done": a
+    // fenced increment (FenceManager::SignalSyncPoint) only counts once its fence was released
+    // by the fencing thread (where delayed fences run their callbacks). 1: the fence as made
+    // (stubbed when it carries no download, as with delayed fences); 2: the fence is made real
+    // (waits for the host GPU's submission). A guest wait held for "done" longer than 100 ms falls
+    // back to the raw value (counted), so "done" can never deadlock the guest against the GPU.
+    // Off: every Cpu* call below is the raw call it replaces.
+    static int CpuSyncDoneMode();
+    static bool CpuSyncDone() {
+        return CpuSyncDoneMode() != 0;
+    }
+
+    /// Fence side: before the guest increment of a fenced signal (CpuDoneBegin), and once its
+    /// fence was released (CpuDoneEnd). Each Begin is matched by exactly one End.
+    void CpuDoneBegin(u32 syncpoint_id);
+    void CpuDoneEnd(u32 syncpoint_id);
+
+    /// Guest CPU side: the guest value as the guest may see it.
+    u32 GetCpuGuestSyncpointValue(u32 id) const {
+        if (!CpuSyncDone()) {
+            return GetGuestSyncpointValue(id);
+        }
+        return cpu_done[id].load(std::memory_order_acquire);
+    }
+    /// Guest CPU side: the host value as the guest may see it.
+    u32 GetCpuHostSyncpointValue(u32 id) const {
+        if (!CpuSyncDone()) {
+            return GetHostSyncpointValue(id);
+        }
+        return (std::min)(GetHostSyncpointValue(id), cpu_done[id].load(std::memory_order_acquire));
+    }
+    bool IsReadyCpuGuest(u32 syncpoint_id, u32 expected_value) const {
+        return GetCpuGuestSyncpointValue(syncpoint_id) >= expected_value;
+    }
+
+    template <typename Func>
+    ActionHandle RegisterCpuGuestAction(u32 syncpoint_id, u32 expected_value, Func&& action) {
+        if (!CpuSyncDone()) {
+            return RegisterGuestAction(syncpoint_id, expected_value, std::move(action));
+        }
+        return RegisterCpuAction(syncpoint_id, expected_value, false, std::move(action));
+    }
+    template <typename Func>
+    ActionHandle RegisterCpuHostAction(u32 syncpoint_id, u32 expected_value, Func&& action) {
+        if (!CpuSyncDone()) {
+            return RegisterHostAction(syncpoint_id, expected_value, std::move(action));
+        }
+        return RegisterCpuAction(syncpoint_id, expected_value, true, std::move(action));
+    }
+    void DeregisterCpuGuestAction(u32 syncpoint_id, const ActionHandle& handle);
+    void DeregisterCpuHostAction(u32 syncpoint_id, const ActionHandle& handle);
+    /// Guest CPU side WaitHost: min(host, done), the raw host value after 100 ms held.
+    void WaitCpuHost(u32 syncpoint_id, u32 expected_value);
+
+    SyncpointManager();
+    ~SyncpointManager();
+
+private:
+    struct CpuAction {
+        u32 expected_value;
+        u64 id;
+        bool host; ///< Compared with min(host, done), else with done
+        bool held; ///< The raw value reached it, "done" not yet
+        std::chrono::steady_clock::time_point held_since;
+        std::function<void()> action;
+    };
+    ActionHandle RegisterCpuAction(u32 syncpoint_id, u32 expected_value, bool host,
+                                   std::function<void()>&& action);
+    void DeregisterCpuAction(u32 syncpoint_id, const ActionHandle& handle, bool host);
+    /// Under `guard`: raises done to (guest - outstanding), at least `floor_value`, mirrors it,
+    /// then runs the CPU actions it (or the host value) meets.
+    void CpuDoneUpdateLocked(u32 syncpoint_id, u32 floor_value);
+    void RunCpuActionsLocked(u32 syncpoint_id, std::chrono::steady_clock::time_point now);
+    void NoteCpuHeldLocked(std::chrono::steady_clock::duration held);
+    void CpuWatchdog(std::stop_token token);
+    static void KickGpuBack();
+
+    std::array<std::atomic<u32>, NUM_MAX_SYNCPOINTS> cpu_done{};
+    std::array<std::atomic<u32>, NUM_MAX_SYNCPOINTS> cpu_outstanding{};
+    std::array<std::list<CpuAction>, NUM_MAX_SYNCPOINTS> cpu_action_storage; ///< Under `guard`
+    std::array<u32, NUM_MAX_SYNCPOINTS> cpu_seen_done{};                      ///< Watchdog only
+    std::array<std::chrono::steady_clock::time_point, NUM_MAX_SYNCPOINTS> cpu_seen_since{};
+    std::condition_variable cpu_cv;
+    struct CpuStats {
+        u64 waits{};
+        u64 held{};
+        u64 held_ns{};
+        u64 max_held_ns{};
+        u64 fallbacks{};
+        u64 stuck_fallbacks{};
+    } cpu_stats; ///< Under `guard`
+
 private:
     /// `timeline_name`: the Nx2Timeline marker of the increment (a literal), with the id.
     /// `guest`: a guest increment, mirrored first (SetGuestMirror) while a mirror is set.
@@ -139,6 +237,8 @@ private:
     std::atomic<void*> guest_increment_context{};
     std::condition_variable wait_guest_cv;
     std::condition_variable wait_host_cv;
+    /// INTEL_FORK_CPU_SYNC_DONE: fallbacks for held waits, the 10 s line. Last: stops first.
+    std::jthread cpu_watchdog;
 };
 
 } // namespace Host1x

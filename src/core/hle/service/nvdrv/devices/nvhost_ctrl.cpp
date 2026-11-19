@@ -154,7 +154,7 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
             {
                 auto lk = system.StallApplication();
                 const auto stall_begin = std::chrono::steady_clock::now();
-                host1x_syncpoint_manager.WaitHost(fence_id, target_value);
+                host1x_syncpoint_manager.WaitCpuHost(fence_id, target_value);
                 system.UnstallApplication();
                 // The whole game holds here: a long one is a freeze to players.
                 const double stall_ms = std::chrono::duration<double, std::milli>(
@@ -214,7 +214,7 @@ NvResult nvhost_ctrl::IocCtrlEventWait(IocCtrlEventWaitParams& params, bool is_a
     params.value.raw |= slot;
 
     event.wait_handle =
-        host1x_syncpoint_manager.RegisterHostAction(fence_id, target_value, [this, slot]() {
+        host1x_syncpoint_manager.RegisterCpuHostAction(fence_id, target_value, [this, slot]() {
             auto& event_ = events[slot];
             if (event_.status.exchange(EventState::Signalling, std::memory_order_acq_rel) ==
                 EventState::Waiting) {
@@ -307,7 +307,7 @@ NvResult nvhost_ctrl::IocCtrlClearEventWait(IocCtrlEventClearParams& params) {
     if (event.status.exchange(EventState::Cancelling, std::memory_order_acq_rel) ==
         EventState::Waiting) {
         auto& host1x_syncpoint_manager = system.Host1x().GetSyncpointManager();
-        host1x_syncpoint_manager.DeregisterHostAction(event.assigned_syncpt, event.wait_handle);
+        host1x_syncpoint_manager.DeregisterCpuHostAction(event.assigned_syncpt, event.wait_handle);
         syncpoint_manager.UpdateMin(event.assigned_syncpt);
         event.wait_handle = {};
     }

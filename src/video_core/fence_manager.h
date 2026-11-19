@@ -124,8 +124,20 @@ public:
             Tegra::Nx2NoteSyncpointSignal(
                 value, static_cast<u32>(syncpoint_manager.GetGuestSyncpointValue(value)) + 1);
         }
+        // INTEL_FORK_CPU_SYNC_DONE: R's fence for this place carries the matching CpuDoneEnd
+        // (CpuDoneOp, vk_rasterizer.cpp's posted fence kind 3).
+        syncpoint_manager.CpuDoneBegin(value);
         syncpoint_manager.IncrementGuest(value);
         return true;
+    }
+
+    /// INTEL_FORK_CPU_SYNC_DONE: the operation a fence carries for a CpuDoneBegin (empty when
+    /// off). It runs where delayed fences run their callbacks: at the fence's release.
+    std::function<void()> CpuDoneOp(u32 value) {
+        if (!Tegra::Host1x::SyncpointManager::CpuSyncDone()) {
+            return {};
+        }
+        return [this, value] { syncpoint_manager.CpuDoneEnd(value); };
     }
     void OneFollowerSyncPointHost(u32 value) {
         syncpoint_manager.IncrementHost(value);
@@ -179,8 +191,15 @@ public:
         work_epoch.fetch_add(1, std::memory_order_release);
     }
 
-    void SignalFence(std::function<void()>&& func) {
+    /// `done_op` (INTEL_FORK_CPU_SYNC_DONE, CpuDoneOp): runs at this fence's release whatever
+    /// the fence mode (an empty fence hands it to the newest queued fence, or runs it at once
+    /// when none is queued or being released). Empty: as before.
+    void SignalFence(std::function<void()>&& func, std::function<void()>&& done_op = {}) {
         Nx2Profile::Scope profile_scope{Nx2Profile::Zone::Fence};
+        const bool has_done = static_cast<bool>(done_op);
+        // INTEL_FORK_CPU_SYNC_DONE=2: the fence is made real (never skipped, never stubbed).
+        const bool done_real =
+            has_done && Tegra::Host1x::SyncpointManager::CpuSyncDoneMode() == 2;
         // The accuracy can change while the game runs (settings dialog, Settings::UpdateGPUAccuracy
         // at each command list end): read once, every decision of this fence uses one value.
         // EXP33: a fence that writes a fence-flagged query report is never
@@ -204,10 +223,13 @@ public:
         if (Nx2Profile::Enabled()) [[unlikely]] {
             NoteFenceDecision(delay_fence, committed_flushes, trim);
         }
-        if (!delay_fence && committed_flushes == 0 && SkipEmptyFence(trim)) {
+        if (!delay_fence && !done_real && committed_flushes == 0 && SkipEmptyFence(trim)) {
             Nx2Profile::Scope skipped_scope{Nx2Profile::Zone::FenceSkipped};
             stats_timer.Skip();
             func();
+            if (has_done) {
+                PlaceDoneOp(std::move(done_op));
+            }
             stats_timer.Mark(BackFence::Operation);
             rasterizer.InvalidateGPUCache();
             stats_timer.Mark(BackFence::Invalidate);
@@ -219,6 +241,7 @@ public:
         // after the skip test, on the back thread. Off: one relaxed load and a branch.
         VideoCommon::GpuSplit::DelayBackIf(VideoCommon::GpuSplit::BackDelayKind::Fences);
         should_flush |= query_cache.HasUncommittedFlushes();
+        should_flush |= done_real;
         query_cache.CommitAsyncFlushes();
         if constexpr (can_async_check) {
             // EXP28 & 2: a fence with nothing to wait for on the host GPU carries only queued
@@ -230,7 +253,7 @@ public:
                     func();
                     stats_timer.Mark(BackFence::Operation);
                 }
-                FoldStubbedFence(delay_fence, func);
+                FoldStubbedFence(delay_fence, func, done_op);
                 if (delay_fence) {
                     stats_timer.Skip();
                     SubmitDeferredWork();
@@ -253,6 +276,9 @@ public:
             std::scoped_lock lock{uncommitted_guard};
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
+            }
+            if (has_done) {
+                uncommitted_operations.emplace_back(std::move(done_op));
             }
             pending_operations.emplace_back(TakeUncommittedOperations());
         }
@@ -307,9 +333,12 @@ public:
             Tegra::Nx2NoteSyncpointSignal(
                 value, static_cast<u32>(syncpoint_manager.GetGuestSyncpointValue(value)) + 1);
         }
+        // INTEL_FORK_CPU_SYNC_DONE: counted as not done for the guest CPU until this fence's
+        // release (CpuDoneOp). The host value is still raised as before.
+        syncpoint_manager.CpuDoneBegin(value);
         syncpoint_manager.IncrementGuest(value);
         std::function<void()> func([this, value] { syncpoint_manager.IncrementHost(value); });
-        SignalFence(std::move(func));
+        SignalFence(std::move(func), CpuDoneOp(value));
     }
 
     void WaitPendingFences([[maybe_unused]] bool force) {
@@ -738,7 +767,10 @@ private:
     /// - with fences queued, the work joins the newest one, released with it in order;
     /// - with nothing queued or being released, the split's back runs it at once (same order);
     /// - otherwise (the fencing thread is releasing fences it took) it gets a fence as before.
-    void FoldStubbedFence(bool delay_fence, std::function<void()>& func) {
+    /// `done_op` (INTEL_FORK_CPU_SYNC_DONE): placed after `func`, wherever the work goes.
+    void FoldStubbedFence(bool delay_fence, std::function<void()>& func,
+                          std::function<void()>& done_op) {
+        const bool has_done = static_cast<bool>(done_op);
         std::unique_lock lock{guard};
         if (!fences.empty()) {
             {
@@ -751,6 +783,9 @@ private:
                 ++operation_stamp; // EXP119: handed to a fence
                 if (delay_fence) {
                     operations.emplace_back(std::move(func));
+                }
+                if (has_done) {
+                    operations.emplace_back(std::move(done_op));
                 }
             }
             // This fence's query cache entry (no queries: CommitAsyncFlushes found none).
@@ -774,6 +809,9 @@ private:
             if (delay_fence) {
                 func();
             }
+            if (has_done) {
+                done_op();
+            }
             operations.clear();
             {
                 std::scoped_lock ops_lock{uncommitted_guard};
@@ -796,6 +834,9 @@ private:
             if (delay_fence) {
                 uncommitted_operations.emplace_back(std::move(func));
             }
+            if (has_done) {
+                uncommitted_operations.emplace_back(std::move(done_op));
+            }
             pending_operations.emplace_back(TakeUncommittedOperations());
         }
         pending_flushes.push_back(0);
@@ -807,6 +848,49 @@ private:
         lock.unlock();
         cv.notify_all();
         fold_counts[2].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    /// INTEL_FORK_CPU_SYNC_DONE: a skipped (empty) fence's done operation runs where a stubbed
+    /// fence's operations would: after every fence queued or being released before it.
+    void PlaceDoneOp(std::function<void()>&& done_op) {
+        if constexpr (can_async_check) {
+            std::unique_lock lock{guard};
+            if (!fences.empty()) {
+                {
+                    std::scoped_lock ops_lock{uncommitted_guard};
+                    pending_operations.back().emplace_back(std::move(done_op));
+                }
+                work_epoch.fetch_add(1, std::memory_order_release);
+                return;
+            }
+            if (!fence_thread_busy && !inline_running) {
+                lock.unlock();
+                done_op();
+                return;
+            }
+            // The fencing thread releases fences it took: a stubbed fence of its own, after them.
+            TFence new_fence = CreateFence(true);
+            {
+                std::scoped_lock ops_lock{uncommitted_guard};
+                OperationList operations;
+                operations.emplace_back(std::move(done_op));
+                pending_operations.emplace_back(std::move(operations));
+            }
+            pending_flushes.push_back(0);
+            pending_query_pops.push_back(0);
+            QueueFence(new_fence);
+            fences.push(std::move(new_fence));
+            fences_in_flight.fetch_add(1, std::memory_order_relaxed);
+            work_epoch.fetch_add(1, std::memory_order_release);
+            lock.unlock();
+            cv.notify_all();
+        } else {
+            if (!fences.empty()) {
+                pending_operations.back().emplace_back(std::move(done_op));
+                return;
+            }
+            done_op();
+        }
     }
 
     /// Caller holds uncommitted_guard. Hands the uncommitted list over and puts a spare list in

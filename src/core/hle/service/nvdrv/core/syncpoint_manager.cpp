@@ -113,7 +113,7 @@ u32 SyncpointManager::UpdateMin(u32 id) {
         return 0;
     }
 
-    syncpoint.counter_min = host1x.GetSyncpointManager().GetHostSyncpointValue(id);
+    syncpoint.counter_min = host1x.GetSyncpointManager().GetCpuHostSyncpointValue(id);
     return syncpoint.counter_min;
 }
 

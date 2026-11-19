@@ -4425,7 +4425,15 @@ void RasterizerVulkan::OneFollowerPostFence(u8 kind, u32 value,
                     const u32 syncpoint = a.value;
                     std::function<void()> increment(
                         [fences, syncpoint] { fences->OneFollowerSyncPointHost(syncpoint); });
-                    self.fence_manager.SignalFence(std::move(increment));
+                    // INTEL_FORK_CPU_SYNC_DONE: E's CpuDoneBegin ends at this fence's release.
+                    self.fence_manager.SignalFence(std::move(increment),
+                                                   self.fence_manager.CpuDoneOp(syncpoint));
+                    break;
+                }
+                if (std::function<void()> done = self.fence_manager.CpuDoneOp(a.value)) {
+                    // INTEL_FORK_CPU_SYNC_DONE: SignalReference's empty fence, carrying the
+                    // CpuDoneEnd for E's CpuDoneBegin (OneFollowerSyncPointGuest).
+                    self.fence_manager.SignalFence([] {}, std::move(done));
                     break;
                 }
                 self.fence_manager.SignalReference();

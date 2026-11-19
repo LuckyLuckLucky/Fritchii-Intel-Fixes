@@ -227,7 +227,7 @@ private:
     void QueryCounter(HLERequestContext& ctx) {
         const u32 syncpoint = ~ctx.CommandBuffer()[2];
         const u64 value = syncpoint < HostSyncpoints
-                              ? system.Host1x().GetSyncpointManager().GetGuestSyncpointValue(syncpoint)
+                              ? system.Host1x().GetSyncpointManager().GetCpuGuestSyncpointValue(syncpoint)
                               : 0;
         LOG_DEBUG(Service, "nx2:syncpt 103 syncpoint={} value={:#x}", syncpoint, value);
         TipcReplyWords(ctx, {static_cast<u32>(value), static_cast<u32>(value >> 32), 0});
@@ -297,7 +297,7 @@ private:
         }
         // The action runs on the GPU thread under the manager's lock, or inline if the value is
         // already reached.
-        request.handle = manager.RegisterGuestAction(
+        request.handle = manager.RegisterCpuGuestAction(
             syncpoint, static_cast<u32>(value),
             [shared = m_shared, &kernel = system.Kernel(), &request, event] {
                 std::scoped_lock lk{shared->mutex};
@@ -333,7 +333,7 @@ private:
     /// Returns true if the request was still pending.
     bool Cancel(SlotRequest& request) {
         if (request.pending.exchange(false)) {
-            system.Host1x().GetSyncpointManager().DeregisterGuestAction(request.syncpoint,
+            system.Host1x().GetSyncpointManager().DeregisterCpuGuestAction(request.syncpoint,
                                                                         request.handle);
             return true;
         }
@@ -2074,7 +2074,7 @@ private:
             // suspended channel brought us here: this frame can't finish before the present
             // returns.
             const bool gpu_behind = frames_ahead == 1 && m_previous_fence_id < 192 &&
-                                    !system.Host1x().GetSyncpointManager().IsReadyGuest(
+                                    !system.Host1x().GetSyncpointManager().IsReadyCpuGuest(
                                         m_previous_fence_id, m_previous_fence_value);
             WaitForFrame(m_previous_fence_id, m_previous_fence_value);
             if (gpu_behind) {
@@ -2533,7 +2533,7 @@ private:
         // Long enough to cover shader/pipeline compile stalls: a game that gets more than a few
         // command buffers ahead misses the equal-value gates its other channels acquire.
         const auto deadline = start + std::chrono::milliseconds{4000};
-        if (!syncpoints.IsReadyGuest(fence_id, fence_value)) {
+        if (!syncpoints.IsReadyCpuGuest(fence_id, fence_value)) {
             // Woken by the GPU thread as it reaches the fence. Polling with 200 us sleeps slept
             // about 1 ms per check on Windows, added to every frame. An action left registered
             // after a timeout fires later on a state nobody waits on.
@@ -2543,7 +2543,7 @@ private:
                 bool done{};
             };
             auto wake = std::make_shared<Wake>();
-            syncpoints.RegisterGuestAction(fence_id, fence_value, [wake] {
+            syncpoints.RegisterCpuGuestAction(fence_id, fence_value, [wake] {
                 {
                     std::scoped_lock lk{wake->mutex};
                     wake->done = true;
@@ -2566,10 +2566,10 @@ private:
                 wake->cv.wait_for(lk, std::chrono::milliseconds{unless_gpu_waits ? 1 : 50});
             }
         }
-        if (unless_gpu_waits && !syncpoints.IsReadyGuest(fence_id, fence_value)) {
+        if (unless_gpu_waits && !syncpoints.IsReadyCpuGuest(fence_id, fence_value)) {
             return false;
         }
-        if (!syncpoints.IsReadyGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
+        if (!syncpoints.IsReadyCpuGuest(fence_id, fence_value) && m_wait_timeouts++ < 64) {
             LOG_WARNING(Service, "nx2:vi2 present #{} fence ({}, {}) not reached in 4 s (now {})",
                         m_presents, fence_id, fence_value, syncpoints.GetGuestSyncpointValue(fence_id));
         }
@@ -2580,7 +2580,7 @@ private:
                          std::chrono::steady_clock::now() - start)
                          .count());
         }
-        return syncpoints.IsReadyGuest(fence_id, fence_value);
+        return syncpoints.IsReadyCpuGuest(fence_id, fence_value);
     }
 
     // Shows a presented native image: word 5 is the image id, ~word 22 / word 24 the GPU fence
@@ -3930,7 +3930,7 @@ private:
         }
         auto& syncpoints = system.Host1x().GetSyncpointManager();
         const auto limit = Nx2VideoReleaseWaitLimit();
-        if (limit.count() > 0 && !syncpoints.IsReadyGuest(fence.syncpoint, fence.value)) {
+        if (limit.count() > 0 && !syncpoints.IsReadyCpuGuest(fence.syncpoint, fence.value)) {
             // Woken by the increment itself: polling every 1 ms added up to a millisecond or two
             // to every frame (Windows sleeps).
             struct Waiter {
@@ -3940,7 +3940,7 @@ private:
             };
             auto waiter = std::make_shared<Waiter>();
             const auto handle =
-                syncpoints.RegisterGuestAction(fence.syncpoint, fence.value, [waiter] {
+                syncpoints.RegisterCpuGuestAction(fence.syncpoint, fence.value, [waiter] {
                     {
                         std::scoped_lock lk{waiter->mutex};
                         waiter->done = true;
@@ -3953,13 +3953,13 @@ private:
                 done = waiter->cv.wait_for(lk, limit, [&] { return waiter->done; });
             }
             if (!done) {
-                syncpoints.DeregisterGuestAction(fence.syncpoint, handle);
+                syncpoints.DeregisterCpuGuestAction(fence.syncpoint, handle);
             }
         }
         if (Nx2VideoTraceEnabled()) {
             LOG_INFO(Service, "nx2:vdec trace release wait syncpoint={} value={} reached={}",
                      fence.syncpoint, fence.value,
-                     syncpoints.IsReadyGuest(fence.syncpoint, fence.value));
+                     syncpoints.IsReadyCpuGuest(fence.syncpoint, fence.value));
         }
     }
 
@@ -4639,7 +4639,7 @@ private:
         auto& manager = system.Host1x().GetSyncpointManager();
         bool changed = false;
         for (u32 id = 0; id < std::min(m_syncpt_count, HostSyncpoints); ++id) {
-            const u64 value = manager.GetGuestSyncpointValue(id);
+            const u64 value = manager.GetCpuGuestSyncpointValue(id);
             if (changed_ids != nullptr) {
                 const u32 value32 = static_cast<u32>(value);
                 if (m_syncpt_polled_values[id] != value32) {

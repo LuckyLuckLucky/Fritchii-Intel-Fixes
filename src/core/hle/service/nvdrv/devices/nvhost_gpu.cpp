@@ -669,14 +669,14 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
     if (g_nx2_driver && sync_submit && increment > 0) {
         lock.unlock();
         auto& syncpoints = system.Host1x().GetSyncpointManager();
-        if (!syncpoints.IsReadyGuest(params.fence.id, params.fence.value)) {
+        if (!syncpoints.IsReadyCpuGuest(params.fence.id, params.fence.value)) {
             struct Wake {
                 std::mutex mutex;
                 std::condition_variable cv;
                 bool done{};
             };
             auto wake = std::make_shared<Wake>();
-            syncpoints.RegisterGuestAction(params.fence.id, params.fence.value, [wake] {
+            syncpoints.RegisterCpuGuestAction(params.fence.id, params.fence.value, [wake] {
                 {
                     std::scoped_lock lk{wake->mutex};
                     wake->done = true;
@@ -697,7 +697,7 @@ NvResult nvhost_gpu::SubmitGPFIFOImpl(IoctlSubmitGpfifo& params, Tegra::CommandL
             }
         }
         static std::atomic<u32> timeouts{};
-        if (!syncpoints.IsReadyGuest(params.fence.id, params.fence.value) &&
+        if (!syncpoints.IsReadyCpuGuest(params.fence.id, params.fence.value) &&
             (timeouts.fetch_add(1, std::memory_order_relaxed) % 64) == 0) {
             LOG_WARNING(Service_NVDRV,
                         "nx2 sync submit timed out waiting for fence ({}, {}), current value={}",

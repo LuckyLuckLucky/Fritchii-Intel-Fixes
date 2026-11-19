@@ -42,6 +42,11 @@ namespace VideoCore::IntelReportGuard {
 inline constexpr u64 PageBits = 12;
 inline constexpr u64 PageSize = u64{1} << PageBits;
 inline constexpr u64 Slots = u64{1} << 16;
+/// Per report slot (16 bytes: a 64-bit count and its timestamp), hashed: a read waits only for
+/// the slots it reads (a page holds 256), not for every report the page owes (2026-11-19 first
+/// run: ~0.5 s a second of guest waits at page granularity).
+inline constexpr u64 CellBits = 4;
+inline constexpr u64 Cells = u64{1} << 18;
 
 [[nodiscard]] inline bool Enabled() {
     static const bool on = [] {
@@ -58,6 +63,8 @@ inline constexpr u64 Slots = u64{1} << 16;
 struct State {
     std::array<std::atomic<u32>, Slots> expected{};
     std::array<std::atomic<u32>, Slots> landed{};
+    std::array<std::atomic<u32>, Cells> cell_expected{};
+    std::array<std::atomic<u32>, Cells> cell_landed{};
     std::array<std::atomic<u64>, Slots> armed{};   ///< page + 1 whose trap is armed, 0 none
     std::array<std::atomic<u64>, Slots> watched{}; ///< page + 1 known watched (fast check)
     std::mutex watch_mutex;
@@ -90,6 +97,26 @@ struct State {
     const s32 diff = static_cast<s32>(s.expected[slot].load(std::memory_order_seq_cst) -
                                       s.landed[slot].load(std::memory_order_seq_cst));
     return diff > 0 ? static_cast<u32>(diff) : 0;
+}
+
+[[nodiscard]] inline u64 CellOf(u64 device_address) {
+    return (device_address >> CellBits) & (Cells - 1);
+}
+
+[[nodiscard]] inline u32 CellPending(State& s, u64 cell) {
+    const s32 diff = static_cast<s32>(s.cell_expected[cell].load(std::memory_order_seq_cst) -
+                                      s.cell_landed[cell].load(std::memory_order_seq_cst));
+    return diff > 0 ? static_cast<u32>(diff) : 0;
+}
+
+/// The reports the cells of [begin, end) still owe (at most 256 cells looked at).
+[[nodiscard]] inline u32 RangePending(State& s, u64 begin, u64 end) {
+    u32 owed = 0;
+    for (u64 a = (begin >> CellBits) << CellBits, n = 0; a < end && n < 256;
+         a += u64{1} << CellBits, ++n) {
+        owed += CellPending(s, CellOf(a));
+    }
+    return owed;
 }
 
 [[nodiscard]] inline s64 NowNs() {
@@ -139,6 +166,7 @@ inline void NoteExpected(u64 device_address, Watch&& watch, Arm&& arm) {
     const u64 page = device_address >> PageBits;
     const u64 slot = SlotOf(page);
     s.expected[slot].fetch_add(1, std::memory_order_seq_cst);
+    s.cell_expected[CellOf(device_address)].fetch_add(1, std::memory_order_seq_cst);
     if (s.watched[slot].load(std::memory_order_relaxed) != page + 1) {
         bool fresh = false;
         {
@@ -164,6 +192,7 @@ inline void NoteLanded(u64 device_address) {
         return;
     }
     State& s = Get();
+    s.cell_landed[CellOf(device_address)].fetch_add(1, std::memory_order_seq_cst);
     s.landed[SlotOf(device_address >> PageBits)].fetch_add(1, std::memory_order_seq_cst);
     if (s.waiters.load(std::memory_order_seq_cst) != 0) {
         std::scoped_lock lock{s.wait_mutex};
@@ -201,12 +230,14 @@ inline void UnwatchRange(u64 address, u64 size, Unwatch&& unwatch) {
     }
 }
 
-[[nodiscard]] inline bool WaitSettled(State& s, u64 slot, std::chrono::nanoseconds limit) {
+[[nodiscard]] inline bool WaitSettled(State& s, u64 begin, u64 end,
+                                      std::chrono::nanoseconds limit) {
     s.waiters.fetch_add(1, std::memory_order_seq_cst);
     bool settled;
     {
         std::unique_lock lock{s.wait_mutex};
-        settled = s.wait_cv.wait_for(lock, limit, [&] { return Pending(s, slot) == 0; });
+        settled =
+            s.wait_cv.wait_for(lock, limit, [&] { return RangePending(s, begin, end) == 0; });
     }
     s.waiters.fetch_sub(1, std::memory_order_seq_cst);
     return settled;
@@ -230,20 +261,26 @@ inline void BeforeRead(u64 address, u64 size, Force&& force) {
         if (s.armed[slot].compare_exchange_strong(armed_page, 0, std::memory_order_acq_rel)) {
             s.trapped_reads.fetch_add(1, std::memory_order_relaxed);
         }
-        if (Pending(s, slot) == 0) {
+        // Only the slots this read covers (the part of it in this page).
+        const u64 begin = (std::max)(address, page << PageBits);
+        const u64 end = (std::min)(address + size, (page + 1) << PageBits);
+        if (Pending(s, slot) == 0 || RangePending(s, begin, end) == 0) {
             continue;
         }
         const s64 start = NowNs();
         s.waited.fetch_add(1, std::memory_order_relaxed);
-        if (!WaitSettled(s, slot, std::chrono::milliseconds{2})) {
+        if (!WaitSettled(s, begin, end, std::chrono::milliseconds{2})) {
             s.forced.fetch_add(1, std::memory_order_relaxed);
             force(page << PageBits);
-            if (!WaitSettled(s, slot, std::chrono::milliseconds{50})) {
-                // Never hang: count it and re-balance the slot (a report counted but lost, e.g.
+            if (!WaitSettled(s, begin, end, std::chrono::milliseconds{50})) {
+                // Never hang: count it and re-balance the cells (a report counted but lost, e.g.
                 // its page remapped between Query and the report, would stall every read).
                 s.timeouts.fetch_add(1, std::memory_order_relaxed);
-                const u32 owed = Pending(s, slot);
-                s.landed[slot].fetch_add(owed, std::memory_order_seq_cst);
+                for (u64 a = (begin >> CellBits) << CellBits, n = 0; a < end && n < 256;
+                     a += u64{1} << CellBits, ++n) {
+                    const u64 cell = CellOf(a);
+                    s.cell_landed[cell].fetch_add(CellPending(s, cell), std::memory_order_seq_cst);
+                }
             }
         }
         const u64 waited_ns = static_cast<u64>(NowNs() - start);
