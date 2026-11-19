@@ -6674,6 +6674,13 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                 return "its precompiled record (unreadable)";
             }
             RecordedKeyForThisDevice(record_key);
+            // INTEL_FORK_STATIC_PREP: kept under the static key the preparation built it as.
+            if (IntelForkStaticPrep() && record_key.state.dynamic_vertex_input != 0 &&
+                !dynamic_features.has_dynamic_vertex_input) {
+                if (const auto converted = IntelStaticKeys(record_key); !converted.empty()) {
+                    record_key = converted.front();
+                }
+            }
             if (record_key.Hash() != record.key_hash) {
                 return "the key (as this device and EDEN_NX2_CANONICAL_KEYS key it)";
             }
