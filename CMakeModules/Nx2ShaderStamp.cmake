@@ -24,7 +24,8 @@
 
 set(SkipBlocksIn "vk_graphics_pipeline.h;vk_compute_pipeline.h")
 # v6.1, kept by 6.2: Windows (CRLF checkout), Linux (LF checkout).
-set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
+# Intel fork: 1f51cf4a5778b528 = the Intel fork's own shaders on 6.1 (safe shuffles, NaN guard, barrier ports).
+set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392;1f51cf4a5778b528")
 # 6.2, the occlusion flag extensions (FRITCHII_OCCL_FLAG=9, "Full"): emit_spirv.*,
 # emit_spirv_special.cpp, spirv_emit_context.*, runtime_info.h and vk_graphics_pipeline.cpp
 # changed. Every new SPIR-V path runs only for a module translated with
@@ -35,7 +36,9 @@ set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392")
 # and "force_early_z || UsesOcclFlagStore()"). vk_graphics_pipeline.cpp gained a draw-time copy
 # of the push constants (ConfigureImpl) and ConfigureAfterOcclPrepass: no create info changed.
 # So the prepared pipelines are 6.1's, with Full on or off.
-set(SameAsReleased "096d887be421a8e2=143b6220486fb09b;6f72127d45416a88=3dc8b3ea00f9b392")
+# Intel fork: 602f24ca9813f84f = the Intel fork merged with 6.2, whose own shader changes 6.2 maps to 6.1's stamp
+# (above); the boot check of the kept pipelines (CheckKeptSample) prepares again if a sample translates otherwise.
+set(SameAsReleased "096d887be421a8e2=143b6220486fb09b;6f72127d45416a88=3dc8b3ea00f9b392;602f24ca9813f84f=1f51cf4a5778b528")
 
 # The SHA-256 of a file as if its FRITCHII_STAMP_SKIP blocks weren't there, line endings as in the
 # file. file(READ) gives LF line endings on every platform, so CRLF goes back on before hashing.
