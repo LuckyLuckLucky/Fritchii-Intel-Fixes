@@ -30,6 +30,7 @@
 #include "video_core/nx2_report_census.h"
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/gpu.h"
+#include "video_core/intel_report_guard.h"
 #include "video_core/host1x/gpu_device_memory_manager.h"
 #include "video_core/memory_manager.h"
 #include "video_core/nx2.h"
@@ -400,6 +401,8 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
         for (const RunEntry& entry : run->entries) {
             if (entry.kind == EntryKind::Report) {
                 Tegra::Nx2CompleteAsyncReport(entry.cpu_addr);
+                // Intel fork (2026-11-19): report read guard (intel_report_guard.h): dropped.
+                VideoCore::IntelReportGuard::NoteLanded(entry.cpu_addr);
             }
         }
         FritchiiReportRuns::g_run_counters.dropped_runs.fetch_add(1, std::memory_order_relaxed);
@@ -418,6 +421,8 @@ struct QueryCacheBase<Traits>::QueryCacheBaseImpl {
                 WriteReport(entry.query, entry.cpu_addr, entry.addr, entry.location,
                             QueryType::ZPassPixelCount64, false, entry.asid);
                 Tegra::Nx2CompleteAsyncReport(entry.cpu_addr);
+                // Intel fork (2026-11-19): report read guard (intel_report_guard.h): written.
+                VideoCore::IntelReportGuard::NoteLanded(entry.cpu_addr);
                 break;
             case EntryKind::Reset:
                 streamers[entry.location.stream_id.Value()]->ResetAmend();
@@ -914,7 +919,9 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
     // running (fences discarded when emulation stops), or the slot stays unequal and a later wait
     // on it never ends. A copy or move takes the debt from its source: exactly one completes it.
     struct ReportOperation {
-        enum : u8 { Synced = 1, Owed = 2 };
+        /// Guard: a sample-count report the Intel fork's report read guard counted
+        /// (intel_report_guard.h); settling it counts it landed.
+        enum : u8 { Synced = 1, Owed = 2, Guard = 4 };
 
         QueryCacheBase* cache;
         QueryBase* query_base;
@@ -922,16 +929,16 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
         GPUVAddr addr;
         QueryLocation query_location;
         u8 type;         ///< QueryType
-        mutable u8 bits; ///< Synced, Owed
+        mutable u8 bits; ///< Synced, Owed, Guard
         u16 asid;        ///< For traces only
         u32 verify_seq;  ///< EXP119=2: its run's record, 0 = none
 
         ReportOperation(QueryCacheBase* cache_, QueryBase* query_base_, DAddr cpu_addr_,
                         GPUVAddr addr_, QueryLocation query_location_, QueryType type_,
-                        bool synced_, size_t asid_, u32 verify_seq_) noexcept
+                        bool synced_, size_t asid_, u32 verify_seq_, bool guard_) noexcept
             : cache{cache_}, query_base{query_base_}, cpu_addr{cpu_addr_}, addr{addr_},
               query_location{query_location_}, type{static_cast<u8>(type_)},
-              bits{static_cast<u8>((synced_ ? Synced : 0) | Owed)},
+              bits{static_cast<u8>((synced_ ? Synced : 0) | Owed | (guard_ ? Guard : 0))},
               asid{static_cast<u16>(asid_)}, verify_seq{verify_seq_} {}
         ReportOperation(const ReportOperation& other) noexcept
             : cache{other.cache}, query_base{other.query_base}, cpu_addr{other.cpu_addr},
@@ -951,6 +958,10 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
             if ((bits & Owed) != 0) {
                 bits &= static_cast<u8>(~Owed);
                 Tegra::Nx2CompleteAsyncReport(cpu_addr);
+                if ((bits & Guard) != 0) [[unlikely]] {
+                    // Intel fork (2026-11-19): written or discarded, after the write.
+                    VideoCore::IntelReportGuard::NoteLanded(cpu_addr);
+                }
             }
         }
 
@@ -973,11 +984,16 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
     static_assert(std::is_nothrow_move_constructible_v<ReportOperation>,
                   "MSVC's std::function allocates a callable without a nothrow move");
     // Issues the report, then builds its operation (which completes it).
+    // Intel fork (2026-11-19): a sample-count report RasterizerVulkan::Query counted for the
+    // report read guard (intel_report_guard.h) owes it a landing on every way out below.
+    const bool guard_report =
+        requested_type == QueryType::ZPassPixelCount64 && VideoCore::IntelReportGuard::Enabled();
     const auto issue_operation = [&] {
         Tegra::Nx2IssueAsyncReport(cpu_addr);
         return std::function<void()>(ReportOperation{this, query, cpu_addr, addr, query_location,
                                                      counter_type, is_synced,
-                                                     gpu_memory->GetID(), verify_seq});
+                                                     gpu_memory->GetID(), verify_seq,
+                                                     guard_report});
     };
     if (is_fence) {
         std::function<void()> operation = issue_operation();
@@ -1019,6 +1035,9 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
                          static_cast<u32>(query->flags));
             }
             streamer->Free(new_query_id);
+            if (guard_report) [[unlikely]] {
+                VideoCore::IntelReportGuard::NoteLanded(cpu_addr); // written at once
+            }
             return;
         }
         if (verify_seq != 0) [[unlikely]] {

@@ -49,6 +49,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/control/channel_state.h"
 #include "video_core/gpu_split.h"
+#include "video_core/intel_report_guard.h"
 #include "video_core/gpu_wait_site.h"
 #include "video_core/native_query_trace.h"
 #include "video_core/native_indirect_reset.h"
@@ -6361,10 +6362,41 @@ struct QueryLendDry {
 };
 QueryLendDry g_query_lend_timer;    ///< E only
 thread_local u8 t_query_lend_why{}; ///< E: why this Query is lent (set where its kind is)
+/// Intel fork (2026-11-19), report read guard: E counted the Query it is lending; R's lent call
+/// of it (E parked, so the next Query R takes) must not count it again.
+std::atomic<bool> g_report_guard_lent_counted{};
 } // Anonymous namespace
 
 void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
                              VideoCommon::QueryPropertiesFlags flags, u32 payload, u32 subreport) {
+    // Intel fork (2026-11-19): INTEL_FORK_REPORT_READ_GUARD=1 (intel_report_guard.h). A
+    // sample-count report is counted as owed to its page here, in stream order and before any
+    // lend or post (E may raise the syncpoint the guest waits on before R issues the report), the
+    // page is kept rasterizer-cached and its read trap armed. No cache lock is held here.
+    bool report_guard_counted = false;
+    if (type == VideoCommon::QueryType::ZPassPixelCount64 &&
+        VideoCore::IntelReportGuard::Enabled()) [[unlikely]] {
+        const bool lent_call = !VideoCommon::OneFollower::ShouldLend() &&
+                               g_report_guard_lent_counted.load(std::memory_order_acquire) &&
+                               g_report_guard_lent_counted.exchange(false,
+                                                                    std::memory_order_acq_rel);
+        if (!lent_call) {
+            if (const std::optional<DAddr> device = gpu_memory->GpuToCpuAddress(gpu_addr)) {
+                report_guard_counted = true;
+                VideoCore::IntelReportGuard::NoteExpected(
+                    *device,
+                    [this](u64 page_address) {
+                        device_memory.UpdatePagesCachedCount(page_address,
+                                                             VideoCore::IntelReportGuard::PageSize,
+                                                             1);
+                    },
+                    [this](u64 page_address) {
+                        device_memory.ArmReadTraps(page_address,
+                                                   VideoCore::IntelReportGuard::PageSize);
+                    });
+            }
+        }
+    }
     if (VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
         namespace OneF = VideoCommon::OneFollower;
         t_query_lend_why = QueryLendDry::Other;
@@ -6635,6 +6667,10 @@ void RasterizerVulkan::Query(GPUVAddr gpu_addr, VideoCommon::QueryType type,
         type == VideoCommon::QueryType::ZPassPixelCount64) [[unlikely]] {
         onef_mirror_lent_valid = true; // read by R in the lent call (E parked)
         onef_mirror_lent_bit = onef_samples_started;
+    }
+    if (report_guard_counted && VideoCommon::OneFollower::ShouldLend()) [[unlikely]] {
+        // Intel fork (2026-11-19): both ways below lend this call; R's Query must not count it.
+        g_report_guard_lent_counted.store(true, std::memory_order_release);
     }
     if (VideoCommon::OneFollower::ShouldLend() && QueryLendDry::On()) [[unlikely]] {
         // FRITCHII_QUERY_LEND_DRY: the same lend as ONEF_LEND below, timed and classified.
@@ -8164,6 +8200,11 @@ void RasterizerVulkan::UnmapMemory(DAddr addr, u64 size) {
     // that come without a GPU unmap.
     Common::UniformKeepPages::Unwatch(addr, size, [this](DAddr page_address, s32 delta) {
         device_memory.UpdatePagesCachedCount(page_address, Core::DEVICE_PAGESIZE, delta);
+    });
+    // Intel fork (2026-11-19): the report read guard's page watches, as the uniform keeps' above.
+    VideoCore::IntelReportGuard::UnwatchRange(addr, size, [this](u64 page_address) {
+        device_memory.UpdatePagesCachedCount(page_address, VideoCore::IntelReportGuard::PageSize,
+                                             -1);
     });
     {
         std::scoped_lock lock{texture_cache.mutex};

@@ -35,6 +35,7 @@
 #include "video_core/engines/maxwell_3d.h"
 #include "video_core/engines/maxwell_dma.h"
 #include "video_core/gpu.h"
+#include "video_core/intel_report_guard.h"
 #include "video_core/pending_maps.h"
 #include "video_core/gpu_thread.h"
 #include "video_core/gpu_timestamp.h"
@@ -438,6 +439,21 @@ struct GPU::Impl {
     }
 
     VideoCore::RasterizerDownloadArea OnCPURead(DAddr addr, u64 size) {
+        // Intel fork (2026-11-19): INTEL_FORK_REPORT_READ_GUARD=1 (intel_report_guard.h): a read
+        // of a page that still owes sample-count reports waits for them to land first. Forced
+        // progress after 2 ms: FlushQueryResults on the GPU thread (signals a fence carrying the
+        // page's reports, submits, waits for them), as a read flush's sync operation. Not waited
+        // for here (the GPU thread may itself wait for this guest thread): the guard waits for
+        // the landings with its own 50 ms limit; the operation runs later if it must.
+        if (VideoCore::IntelReportGuard::Enabled()) [[unlikely]] {
+            VideoCore::IntelReportGuard::BeforeRead(addr, size, [this](u64 page_address) {
+                (void)RequestSyncOperation([this, page_address] {
+                    renderer->ReadRasterizer()->FlushQueryResults(
+                        page_address, VideoCore::IntelReportGuard::PageSize);
+                });
+                gpu_thread.TickGPU(is_async);
+            });
+        }
         namespace ReadRunStats = VideoCommon::ReadRunStats;
         if (ReadRunStats::g_enabled) [[unlikely]] {
             ReadRunStats::t_run_pages = 0;
@@ -932,6 +948,12 @@ void GPU::PushGPUEntries(s32 channel, Tegra::CommandList&& entries) {
 }
 
 VideoCore::RasterizerDownloadArea GPU::OnCPURead(PAddr addr, u64 size) {
+    if (VideoCore::IntelReportGuard::Enabled()) [[unlikely]] {
+        // Intel fork (2026-11-19): the reading core keeps this area; never over a watched page.
+        VideoCore::RasterizerDownloadArea area = impl->OnCPURead(addr, size);
+        VideoCore::IntelReportGuard::ClampArea(area, addr, size);
+        return area;
+    }
     return impl->OnCPURead(addr, size);
 }
 
