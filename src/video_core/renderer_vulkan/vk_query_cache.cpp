@@ -484,8 +484,13 @@ public:
         // flickering water and windows; 16,384 hung AMD with the split GPU thread). Resets are
         // logged every 5 s while they happen.
         const int limit_setting = VideoCore::Nx2Debug::Experiment(16);
+        // Intel fork (2026-11-19, user-verified on the B580): 8192 slots by default on Intel's
+        // Windows driver (counts dropped past 256 slots read as "not visible": sky through rocks).
         const size_t limit =
-            limit_setting > 0 ? static_cast<size_t>(limit_setting) : SamplesQueryBank::BANK_SIZE;
+            limit_setting > 0 ? static_cast<size_t>(limit_setting)
+            : device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
+                ? size_t{8192}
+                : SamplesQueryBank::BANK_SIZE;
         if (current_query && current_query->size_slots > limit) {
             static u64 resets{};
             static auto since = std::chrono::steady_clock::now();

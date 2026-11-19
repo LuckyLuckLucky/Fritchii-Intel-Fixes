@@ -953,9 +953,11 @@ bool AppCacheBesideDriver(const Device& device) {
 /// raised to INTEL_FORK_APP_CACHE_CAP_MIB (default 12288), saved every 5 minutes of the
 /// preparation and once more before its stamp is written.
 bool IntelPrepAppCache(const Device& device) {
+    // On by default on Intel since 2026-11-19 (verified: relaunch "already prepared", play builds
+    // hit); INTEL_FORK_PREP_APP_CACHE=0 = the driver's cache only, as before.
     static const bool on = [] {
         const char* const v = std::getenv("INTEL_FORK_PREP_APP_CACHE");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on && IntelDriverCache(device);
 }
@@ -967,7 +969,13 @@ size_t AppCacheCapBytes(const Device& device) {
     static const size_t cap = [] {
         const char* const v = std::getenv("INTEL_FORK_APP_CACHE_CAP_MIB");
         const size_t mib = v != nullptr ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : 0;
-        return (mib != 0 ? mib : size_t{12288}) << 20;
+        if (mib != 0) {
+            return mib << 20;
+        }
+        // The file is read into RAM at boot (and the driver holds it too): a quarter of the
+        // RAM, 2-12 GiB (32 GB: 8 GiB; 16 GB: 4 GiB; a full preparation is ~2.2 GiB).
+        const u64 ram_mib = Common::GetMemInfo().TotalPhysicalMemory >> 20;
+        return std::clamp<size_t>(static_cast<size_t>(ram_mib / 4), 2048, 12288) << 20;
     }();
     return cap;
 }
@@ -1083,13 +1091,17 @@ bool IntelForkSyncShaders(const Device& device) {
     // One line per boot naming the Intel fork's effective defaults (proof for A/B runs).
     LOG_INFO(Render_Vulkan,
              "Intel fork defaults: safe-shuffle {} | vertex-input-dynamic {} | async shaders {} | "
-             "equal-depth-bias {} | texarray-bound {} | nan-guard {} mode {}",
+             "equal-depth-bias {} | texarray-bound {} | nan-guard {} mode {} | static-prep {} | "
+             "own pipeline cache file {} (cap {} MiB) | occlusion slots {}",
              env_is("INTEL_FORK_SAFE_SHUFFLE", '0') ? "OFF" : "on",
              device.IsExtVertexInputDynamicStateSupported() ? "on" : "OFF",
              sync ? "OFF (forced on Intel)" : "user setting",
              env_is("INTEL_FORK_EQUAL_DEPTH_BIAS", '1') ? "on" : "OFF",
              env_is("INTEL_FORK_TEXARRAY_BOUND", '1') ? "on" : "OFF",
-             NanGuardEnabled() ? "on" : "OFF", NanGuardMode());
+             NanGuardEnabled() ? "on" : "OFF", NanGuardMode(),
+             IntelForkStaticPrep() ? "on" : "OFF", IntelPrepAppCache(device) ? "on" : "OFF",
+             AppCacheCapBytes(device) >> 20,
+             std::getenv("EDEN_NX2_EXP16") != nullptr ? std::getenv("EDEN_NX2_EXP16") : "8192");
     return sync;
 }
 
@@ -7179,9 +7191,11 @@ namespace {
 /// Intel fork (phase D2): INTEL_FORK_STATIC_PREP=1 prepares the recipe's dynamic-vertex-input
 /// records as static vertex input keys (layouts harvested from the disk cache).
 bool IntelForkStaticPrep() {
+    // On by default since 2026-11-19 (only acts where vertex input is static, i.e. on Intel);
+    // INTEL_FORK_STATIC_PREP=0 skips the dynamic-VI records as before.
     static const bool on = [] {
         const char* const v = std::getenv("INTEL_FORK_STATIC_PREP");
-        return v != nullptr && v[0] == '1';
+        return v == nullptr || v[0] != '0';
     }();
     return on;
 }
