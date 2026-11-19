@@ -5275,6 +5275,19 @@ void MemPlayer::PlayIndex(MemStage::Cmd kind, u8 flags, VkBuffer vk_buffer, VkDe
     });
 }
 
+namespace {
+/// Intel fork test switch (2026-11-19, phase D1: VI-on bug hunt): INTEL_FORK_NO_BIND_STRIDES=1 leaves
+/// the strides of vkCmdBindVertexBuffers2 out (null) while dynamic vertex input is on, so only
+/// vkCmdSetVertexInputEXT sets them. Off by default.
+bool NoBindStrides(const Device& device) {
+    static const bool env = [] {
+        const char* const v = std::getenv("INTEL_FORK_NO_BIND_STRIDES");
+        return v != nullptr && v[0] == '1';
+    }();
+    return env && device.IsExtVertexInputDynamicStateSupported();
+}
+} // namespace
+
 void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32 size,
                            u32 stride) {
     BeginPlay(flags);
@@ -5285,11 +5298,13 @@ void MemPlayer::PlayVertex(u8 flags, u32 index, VkBuffer buffer, u32 offset, u32
         return;
     }
     if ((flags & MemStage::DynamicState) != 0) {
-        scheduler.Record([index, buffer, offset, size, stride](vk::CommandBuffer cmdbuf) {
+        const bool no_strides = NoBindStrides(device);
+        scheduler.Record([index, buffer, offset, size, stride, no_strides](vk::CommandBuffer cmdbuf) {
             const VkDeviceSize vk_offset = buffer != VK_NULL_HANDLE ? offset : 0;
             const VkDeviceSize vk_size = buffer != VK_NULL_HANDLE ? size : VK_WHOLE_SIZE;
             const VkDeviceSize vk_stride = stride;
-            cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size, &vk_stride);
+            cmdbuf.BindVertexBuffers2EXT(index, 1, &buffer, &vk_offset, &vk_size,
+                                         no_strides ? nullptr : &vk_stride);
         });
     } else {
         scheduler.Record([index, buffer, offset](vk::CommandBuffer cmdbuf) {
@@ -5331,12 +5346,15 @@ void MemPlayer::PlayVertices(u8 flags, u32 first, u32 binding_count, const VkBuf
     if ((flags & MemStage::DynamicState) != 0) {
         Sizes buffer_sizes(sizes, sizes + binding_count);
         Sizes buffer_strides(strides, strides + binding_count);
+        const bool no_strides = NoBindStrides(device);
         scheduler.Record([first, binding_count, buffer_handles_ = std::move(buffer_handles),
                           offsets_ = std::move(buffer_offsets),
                           sizes_ = std::move(buffer_sizes),
-                          strides_ = std::move(buffer_strides)](vk::CommandBuffer cmdbuf) {
+                          strides_ = std::move(buffer_strides),
+                          no_strides](vk::CommandBuffer cmdbuf) {
             cmdbuf.BindVertexBuffers2EXT(first, binding_count, buffer_handles_.data(),
-                                         offsets_.data(), sizes_.data(), strides_.data());
+                                         offsets_.data(), sizes_.data(),
+                                         no_strides ? nullptr : strides_.data());
         });
     } else {
         scheduler.Record([first, binding_count, buffer_handles_ = std::move(buffer_handles),
