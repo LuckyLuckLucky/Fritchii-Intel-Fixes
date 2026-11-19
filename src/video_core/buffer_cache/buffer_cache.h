@@ -1631,7 +1631,16 @@ bool BufferCache<P>::DMACopy(GPUVAddr src_address, GPUVAddr dest_address, u64 am
     runtime.CopyBuffer(dest_buffer, src_buffer, copies, true);
     if (has_new_downloads) {
         memory_tracker.MarkRegionAsGpuModified(*cpu_dest_address, amount);
-        const bool should_sync = Settings::IsGPUFenceBehaviorBalanced() || Settings::IsGPUFenceBehaviorAccurate();
+        // Intel fork (2026-11-19): Balanced fixes the sky through objects on Intel (the guest no
+        // longer reads occlusion reports before they land: delayed fences), but this wait for an
+        // idle GPU after every new download costs a lot of fps and is not what fixes it.
+        // INTEL_FORK_BALANCED_NO_DL_FINISH=1 keeps the delayed fences and drops this wait.
+        static const bool no_dl_finish = [] {
+            const char* const v = std::getenv("INTEL_FORK_BALANCED_NO_DL_FINISH");
+            return v != nullptr && v[0] == '1';
+        }();
+        const bool should_sync = (Settings::IsGPUFenceBehaviorBalanced() && !no_dl_finish) ||
+                                 Settings::IsGPUFenceBehaviorAccurate();
         if (should_sync) {
             runtime.Finish();
         }
