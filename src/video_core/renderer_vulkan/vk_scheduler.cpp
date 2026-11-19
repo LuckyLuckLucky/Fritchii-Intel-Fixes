@@ -355,6 +355,7 @@ void Scheduler::Finish(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore,
 }
 
 void Scheduler::WaitWorker() {
+    const Common::LowEndSim::CpuWaitScope sim_wait;
     DispatchWork();
 
     // Waits for the Vulkan worker (tools/nx2/critical_path.py's table): the queue, then the
@@ -814,12 +815,15 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // FRITCHII_SLOW_GPU: the command buffer wrappers count this submission's commands
             // (null while off; the submission's SlowGpu::End clears it).
             vk::t_cmd_stats = slow_gpu.Counting();
+            // FRITCHII_SIM_CPU_SLOW: recording and submitting this chunk.
+            Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Worker);
             work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
             }
+            Common::LowEndSim::CpuWorkEnd();
             if (price_start != 0) [[unlikely]] {
                 const u64 executed = Price::Ticks();
                 const size_t kind = has_submit ? 1 : 0;
@@ -874,6 +878,10 @@ void Scheduler::AllocateWorkerCommandBuffer() {
     // FRITCHII_SLOW_GPU (live, default 1): reads finished submissions back, stamps this one's
     // start, counts its commands from the next chunk on. Last, so the stamps above go uncounted.
     slow_gpu.Begin(device, current_upload_cmdbuf, *master_semaphore);
+    // FRITCHII_SIM_GPU_SLOW (test): reads finished submissions back, stamps this one's start.
+    if (sim_gpu_slow.Wanted()) [[unlikely]] {
+        sim_gpu_slow.Begin(device, current_upload_cmdbuf, *master_semaphore);
+    }
 }
 
 void Scheduler::BudgetGpuSubmission() {
@@ -1230,6 +1238,9 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         upload_cmdbuf.End();
         // FRITCHII_SLOW_GPU: the diagnostic stamps below are not the submission's work.
         vk::t_cmd_stats = nullptr;
+        // FRITCHII_SIM_GPU_SLOW: the added load, before the stamps below, so the overlay's GPU
+        // time and the slow submission lines show the simulated card. Nothing when off.
+        sim_gpu_slow.End(cmdbuf, signal_value);
         if (trace_gpu_recording) {
             cmdbuf.WriteTimestamp(VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, *trace_query_pool,
                                  trace_gpu_count * 2 + 1);
@@ -1310,6 +1321,10 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
         case VK_SUCCESS:
             // FRITCHII_SLOW_GPU: the CPU side of the queue wait estimate; one compare when off.
             slow_gpu.Submitted(signal_value, slow_call_ns);
+            if (VideoCore::Nx2Debug::g_test_device_loss.load(std::memory_order_relaxed) != 0)
+                [[unlikely]] {
+                device.ReportLoss();
+            }
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
                 Settings::values.gpu_log_vulkan_calls.GetValue()) {

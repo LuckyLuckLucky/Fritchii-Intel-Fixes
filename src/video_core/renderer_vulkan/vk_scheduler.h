@@ -32,6 +32,7 @@
 #include "video_core/renderer_vulkan/fragment_barrier_state.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
+#include "video_core/renderer_vulkan/vk_sim_gpu_slow.h"
 #include "video_core/renderer_vulkan/vk_submit_times.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -566,6 +567,8 @@ private:
     SubmitTimes submit_times;
     /// FRITCHII_SLOW_GPU: slow submission lines and the hang breadcrumbs (worker side).
     SlowGpu slow_gpu;
+    /// FRITCHII_SIM_GPU_SLOW: the low-end PC simulation's added GPU load (worker side).
+    SimGpuSlow sim_gpu_slow;
     /// The Flush or Finish that calls SubmitExecution (recording thread), for SlowGpu::Origin.
     std::source_location submit_site{};
     bool submit_is_finish{};

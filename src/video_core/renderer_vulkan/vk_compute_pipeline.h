@@ -121,6 +121,24 @@ public:
     static constexpr u64 OcarinaFullSizeShader = 0xc033c3ddc9f0897bULL;
     [[nodiscard]] bool CanReplaceOcarinaUpscale() const;
 
+    // FRITCHII_STAMP_SKIP_BEGIN: left out of the Preparing shaders stamp (CMakeModules/Nx2ShaderStamp.cmake).
+    // Only what can't change a pipeline the driver compiles belongs here.
+    /// Render heights below 720p: the game upscales those scenes with a pass that isn't one of the
+    /// hashes above. A dispatch of this shape that writes the game's 2560x1440 target marks its
+    /// pipeline (RasterizerVulkan::NoteLowSceneUpscale), and from the next dispatch on the
+    /// pipeline counts as a scaled 1440p pass. TryOcarinaUpscale still checks every image.
+    /// True the first time.
+    bool LearnOcarinaUpscale() noexcept {
+        return !learned_ocarina_upscale.exchange(true, std::memory_order_relaxed);
+    }
+    [[nodiscard]] bool LearnedOcarinaUpscale() const noexcept {
+        return learned_ocarina_upscale.load(std::memory_order_relaxed);
+    }
+    /// One image, only written, and no other output: what an upscale pass looks like. Defined in
+    /// vk_rasterizer.cpp: this class's .cpp is one of the files the stamp hashes.
+    [[nodiscard]] bool HasOcarinaUpscaleShape() const;
+
+    // FRITCHII_STAMP_SKIP_END
     bool IsBound() const noexcept {
         return static_cast<bool>(pipeline);
     }
@@ -258,6 +276,9 @@ private:
     DescriptorBufferRing& descriptor_buffer_ring;
     Shader::Info info;
     u64 shader_hash{};
+    // FRITCHII_STAMP_SKIP_BEGIN: NoteLowSceneUpscale's mark, not part of any pipeline.
+    std::atomic<bool> learned_ocarina_upscale{};
+    // FRITCHII_STAMP_SKIP_END
     u32 num_descriptor_entries{};
     boost::container::small_vector<VideoCommon::ImageViewId, 8> written_images;
     std::vector<SampledImage> sampled_images;

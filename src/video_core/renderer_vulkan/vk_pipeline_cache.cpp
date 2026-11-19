@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -27,6 +28,9 @@
 #include <deque>
 #include <numeric>
 #include <streambuf>
+#include "video_core/host_shaders/vulkan_occl_flag_frag_spv.h"
+#include "video_core/fritchii_occl_flag.h"
+#include "common/lowend_sim.h"
 #include "common/cityhash.h"
 #include "common/polyfill_thread.h"
 #include "common/scm_rev.h"
@@ -657,6 +661,34 @@ vk::ShaderModule EmitShaderModule(const Device& device, const Shader::Profile& p
                                  u128* spirv_hash = nullptr) {
     const auto code =
         EmitPipelineShader(profile, runtime_info, program, binding, shader_hash, reference);
+    if (runtime_info.occl_flag_store || runtime_info.occl_flag_store_at_end) [[unlikely]] {
+        // FRITCHII_OCCL_FLAG_DUMP=<folder>: the first 64 colour flag pixel programs as .spv
+        // files (for spirv-val).
+        static std::atomic<int> dumped{};
+        if (const char* folder = std::getenv("FRITCHII_OCCL_FLAG_DUMP");
+            folder != nullptr && folder[0] != '\0' && dumped.fetch_add(1) < 64) {
+            const std::string path =
+                fmt::format("{}/occl_colour_{:016x}.spv", folder, shader_hash);
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(code.data(), sizeof(u32), code.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
+    if (program.info.uses_demote_to_helper_invocation) [[unlikely]] {
+        // FRITCHII_SPIRV_DUMP_DISCARD=<folder> (TEST): the first 200 programs emitted from now on
+        // that discard, as .spv files (for spirv-val).
+        static std::atomic<int> dumped{};
+        if (const char* folder = std::getenv("FRITCHII_SPIRV_DUMP_DISCARD");
+            folder != nullptr && folder[0] != 0 && dumped.fetch_add(1) < 200) {
+            const std::string path =
+                fmt::format("{}/discard_{:016x}_{}.spv", folder, shader_hash, stage_index);
+            if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                std::fwrite(code.data(), sizeof(u32), code.size(), file);
+                std::fclose(file);
+            }
+        }
+    }
     return BuildStageModule(device, code, shader_hash, stage_index, spirv_hash);
 }
 
@@ -714,7 +746,7 @@ size_t CapLegacyAmdBuildThreads(const Device& device, size_t threads) {
 
 size_t GetTotalPipelineWorkers(const Device& device) {
     const size_t max_core_threads =
-        std::max<size_t>(static_cast<size_t>(std::thread::hardware_concurrency()), 2ULL) - 1ULL;
+        std::max<size_t>(static_cast<size_t>(Common::LowEndSim::LogicalProcessors()), 2ULL) - 1ULL;
     // EDEN_NX2_PIPELINE_WORKERS=<n> sets the number of pipeline build threads (CheezyEmu
     // 132cc46c9e, Spikol02/Nyamu). Opt-in: unset, every GPU but legacy AMD keeps the old count.
     if (const size_t requested = RequestedPipelineWorkers(); requested != 0) {
@@ -938,6 +970,30 @@ size_t AppCacheCapBytes(const Device& device) {
         return (mib != 0 ? mib : size_t{12288}) << 20;
     }();
     return cap;
+}
+
+/// FRITCHII_INTEL_PCACHE_FETCH (boot, default 1; 0 = as on other drivers): Intel's Windows driver
+/// can fault in vkGetPipelineCacheData while other threads build with that cache, closing the game
+/// without a message. Pipeline builds cannot be paused from here, so on that driver the data is
+/// only fetched once none run: at exit and between titles. Its own disk cache keeps what a crash
+/// would lose from our file.
+bool IntelFetchesCacheWhenIdle(const Device& device) {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_INTEL_PCACHE_FETCH");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled && IntelDriverCache(device);
+}
+
+/// FRITCHII_PCACHE_SAVE (boot, default 1; 0 = every save as before): our VkPipelineCache file is
+/// written only when the driver's data changed size since it was read or written, and in play
+/// only with room in RAM for it.
+bool LeanPipelineCacheSaves() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("FRITCHII_PCACHE_SAVE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return enabled;
 }
 
 bool DriverCachesPipelines(const Device& device) {
@@ -1166,8 +1222,11 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
             device.IsExtShaderViewportIndexLayerSupported(),
         .support_viewport_mask = device.IsNvViewportArray2Supported(),
         .support_typeless_image_loads = device.IsFormatlessImageLoadSupported(),
+        // FRITCHII_TEST_KILL_FALLBACK=1 (TEST): shaders translated from now on take the backend's
+        // path for devices without demote to helper invocation (OpKill), to check its SPIR-V.
         .support_demote_to_helper_invocation =
-            device.IsExtShaderDemoteToHelperInvocationSupported(),
+            device.IsExtShaderDemoteToHelperInvocationSupported() &&
+            std::getenv("FRITCHII_TEST_KILL_FALLBACK") == nullptr,
         .support_int64_atomics = device.IsExtShaderAtomicInt64Supported(),
         .support_shared_int64_atomics = device.IsSharedInt64AtomicsSupported(),
         .support_float32_atomic_add = device.IsFloat32AtomicAddSupported(),
@@ -1797,7 +1856,7 @@ size_t BackgroundPipelineThreads() {
     if (const char* value = std::getenv("EDEN_NX2_BACKGROUND_PIPELINE_THREADS")) {
         return std::clamp<size_t>(static_cast<size_t>(std::strtoull(value, nullptr, 10)), 1, 16);
     }
-    return std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 1, 6);
+    return std::clamp<size_t>(Common::LowEndSim::LogicalProcessors() / 4, 1, 6);
 }
 
 /// Built graphics pipelines past which EvictUnusedPipelines destroys unused ones. By default a
@@ -1950,6 +2009,153 @@ bool ComputePrebuildFirst() {
         return env == nullptr || *env == '\0' || std::atoi(env) != 0;
     }();
     return value;
+}
+
+// FRITCHII_PREP_COMPUTE_FIRST (boot, default 1; 0 = the file's order, or FRITCHII_PREP_ORDER's):
+// the preparation takes every compute record first. They are the last 4,088 of OoT's 120,461
+// records, and a compute dispatch can't be skipped while its pipeline compiles: tester logs
+// (11-16..11-18) show 105 dispatch waits (115 s) on prepared compute pipelines the driver had not
+// kept, against 0 on prepared graphics ones in the same sessions. A driver cache at its size cap
+// (NVIDIA's default keeps about 1 GiB, the first ~33,000 prepared pipelines) drops what comes
+// last, and a player who presses Play now gets them only at the end. Same records, same builds:
+// only the order changes, so the preparation takes no longer.
+bool PrepComputeFirst() {
+    static const bool value = [] {
+        const char* const env = std::getenv("FRITCHII_PREP_COMPUTE_FIRST");
+        return env == nullptr || *env == '\0' || std::atoi(env) != 0;
+    }();
+    return value;
+}
+
+// FRITCHII_PREP_COMPUTE_CHECK (boot, default 1): when the stamp says the preparation is done, a
+// few of the biggest kept compute pipelines are built (as a dispatch would build them) and timed.
+// One over 40 ms was compiled by the driver (a hit takes 2-10 ms); when half or more were, its
+// cache no longer holds the prepared compute pipelines (a new exe name, a driver update the stamp
+// missed, a cleared or capped shader cache), and the compute records alone are prepared again
+// before play, behind the Preparing shaders screen. 0 = no check; 2 = test: the compute records
+// are prepared again at every boot.
+int PrepComputeCheckMode() {
+    static const int mode = [] {
+        const char* const env = std::getenv("FRITCHII_PREP_COMPUTE_CHECK");
+        return env == nullptr || *env == '\0' ? 1 : std::atoi(env);
+    }();
+    return mode;
+}
+
+// Compute pipelines built in play, and the ones the driver compiled (a build over
+// RuntimeCompileSlowMs; a cache hit takes 2-10 ms): a dispatch that needs one waits for it. The
+// modules of pipelines made for a dispatch are registered here with their program and origin
+// ([0] translated from the game's state now, [1] a prepared pipeline's kept SPIR-V);
+// PipelineBinary's observer times every compute pipeline create and counts the registered ones.
+// The boot, warm-up, preparation and check builds are not registered. Logged every 10 s by
+// ReportRuntimeComputeBuilds. Measured here and not in vk_compute_pipeline.cpp, which the
+// preparation stamp hashes (a change there prepares everything again for every player).
+constexpr double RuntimeCompileSlowMs = 20.0;
+constexpr u32 RuntimeCompileLineLimit = 64;
+
+struct RuntimeComputeBuilds {
+    struct Module {
+        u64 hash;
+        bool prepared;
+    };
+    std::mutex mutex;
+    std::unordered_map<u64, Module> modules;
+    std::array<u64, 2> builds{};
+    std::array<u64, 2> compiled{};
+    std::array<double, 2> compiled_ms{};
+    double longest_ms{};
+    std::array<u64, 2> session_compiled{};
+    std::array<double, 2> session_ms{};
+    u32 lines{};
+    bool any{};
+};
+
+/// Never destroyed: a worker may finish a build while static destruction runs.
+RuntimeComputeBuilds& GetRuntimeComputeBuilds() {
+    static RuntimeComputeBuilds* const builds = new RuntimeComputeBuilds;
+    return *builds;
+}
+
+void ObserveComputeBuild(VkShaderModule module, double ms, bool made) {
+    auto& builds = GetRuntimeComputeBuilds();
+    std::scoped_lock lock{builds.mutex};
+    const auto it = builds.modules.find(std::bit_cast<u64>(module));
+    if (it == builds.modules.end()) {
+        return;
+    }
+    // One optimized build per module (FRITCHII_COMPUTE_FAST_FIRST's unoptimized one does not
+    // come here): the entry is done with.
+    const RuntimeComputeBuilds::Module entry = it->second;
+    builds.modules.erase(it);
+    if (!made) {
+        return;
+    }
+    const size_t origin = entry.prepared ? 1 : 0;
+    ++builds.builds[origin];
+    builds.any = true;
+    if (ms <= RuntimeCompileSlowMs) {
+        return;
+    }
+    ++builds.compiled[origin];
+    builds.compiled_ms[origin] += ms;
+    builds.longest_ms = (std::max)(builds.longest_ms, ms);
+    ++builds.session_compiled[origin];
+    builds.session_ms[origin] += ms;
+    if (builds.lines < RuntimeCompileLineLimit) {
+        ++builds.lines;
+        LOG_INFO(Render_Vulkan,
+                 "Compute pipeline {:016x} compiled by the driver at run time in {:.0f} ms ({}){}",
+                 entry.hash, ms,
+                 entry.prepared ? "prepared, not in the driver's cache"
+                                : "translated now: a state the preparation lacks",
+                 builds.lines == RuntimeCompileLineLimit ? " (last such line this session)" : "");
+    }
+}
+
+/// A module made for a dispatch's compute pipeline, before its build is queued.
+void NoteRuntimeComputeModule(VkShaderModule module, u64 hash, bool prepared) {
+    auto& builds = GetRuntimeComputeBuilds();
+    {
+        std::scoped_lock lock{builds.mutex};
+        // Entries of builds that never ran (a pipeline dropped before its build) are few; a
+        // bound keeps a reused handle from piling them up.
+        if (builds.modules.size() >= 4096) {
+            builds.modules.clear();
+        }
+        builds.modules[std::bit_cast<u64>(module)] = {hash, prepared};
+    }
+    static std::once_flag observing;
+    std::call_once(observing,
+                   [] { PipelineBinary::SetComputeBuildObserver(&ObserveComputeBuild); });
+}
+
+/// GPU thread, each frame: the 10 s line while compute pipelines were built in play.
+void ReportRuntimeComputeBuilds() {
+    static std::chrono::steady_clock::time_point next_report{};
+    const auto now = std::chrono::steady_clock::now();
+    if (now < next_report) {
+        return;
+    }
+    next_report = now + std::chrono::seconds{10};
+    auto& builds = GetRuntimeComputeBuilds();
+    std::scoped_lock lock{builds.mutex};
+    if (!builds.any) {
+        return;
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute pipelines built at run time in the last 10 s: {} from prepared SPIR-V ({} "
+             "compiled by the driver, {:.0f} ms), {} translated now ({} compiled, {:.0f} ms), "
+             "longest compile {:.0f} ms; this session {} prepared ones compiled again (must be 0 "
+             "after a finished preparation) for {:.1f} s, {} translated ones compiled for {:.1f} s",
+             builds.builds[1], builds.compiled[1], builds.compiled_ms[1], builds.builds[0],
+             builds.compiled[0], builds.compiled_ms[0], builds.longest_ms,
+             builds.session_compiled[1], builds.session_ms[1] / 1000.0,
+             builds.session_compiled[0], builds.session_ms[0] / 1000.0);
+    builds.builds = {};
+    builds.compiled = {};
+    builds.compiled_ms = {};
+    builds.longest_ms = 0.0;
+    builds.any = false;
 }
 
 // FRITCHII_PREP_THROTTLE (boot, default 0): beside the game (not at full speed, not paused),
@@ -3713,6 +3919,478 @@ GraphicsPipeline* PipelineCache::OcclLeanPipeline(GraphicsPipeline* full, const 
     return sibling;
 }
 
+// FRITCHII_OCCL_FLAG: set on the thread making a flag variant, for its CreateGraphicsPipeline
+// (no libraries, the host flag module in place of the pixel program's). Thread local: other
+// threads translate pipelines at the same time.
+thread_local u8 t_occl_flag_build{};
+constexpr u8 OCCL_FLAG_BUILD_HOST = 1;   ///< the host flag pixel program (colour off)
+constexpr u8 OCCL_FLAG_BUILD_COLOUR = 2; ///< the guest pixel program with the flag store
+constexpr u8 OCCL_FLAG_BUILD_PREPASS = 3; ///< the guest pixel program, the store at its end
+constexpr u8 OCCL_FLAG_BUILD_NOCOLOUR = 4; ///< the host flag program, colour writes off (key)
+
+/// FRITCHII_OCCL_FLAG: why `pipeline`'s guest pixel program (Lean class: no discard, depth or
+/// sample mask writes, stores) cannot take the flag store with early fragment tests for a
+/// colour-writing draw, or Flag when it can: no subgroup or helper operations (early tests
+/// change which lanes are active), no quad operations (helper lanes in them are not
+/// guaranteed), no alpha to coverage in the key (coverage would change after the tests).
+/// FRITCHII_OCCL_FLAG census: a discarding pixel program that is otherwise Lean (no depth or
+/// sample mask writes, stores, subgroup/quad/helper operations, alpha to coverage), drawn with
+/// no depth or stencil writes: early fragment tests and a flag store after the discards would
+/// count exactly what the query counts.
+bool OcclFlagStageWrites(const Shader::Info& info) {
+    const bool writes_storage = std::ranges::any_of(
+        info.storage_buffers_descriptors, [](const auto& desc) { return desc.is_written; });
+    const bool writes_images =
+        std::ranges::any_of(info.image_descriptors,
+                            [](const auto& desc) { return desc.is_written; }) ||
+        std::ranges::any_of(info.image_buffer_descriptors,
+                            [](const auto& desc) { return desc.is_written; });
+    return writes_storage || writes_images || info.stores_global_memory ||
+           info.uses_typeless_image_writes || info.uses_global_increment ||
+           info.uses_global_decrement || info.uses_shared_increment ||
+           info.uses_shared_decrement || info.uses_atomic_f32_add || info.uses_atomic_f16x2_add ||
+           info.uses_atomic_f16x2_min || info.uses_atomic_f16x2_max ||
+           info.uses_atomic_f32x2_add || info.uses_atomic_f32x2_min ||
+           info.uses_atomic_f32x2_max || info.uses_atomic_s32_min || info.uses_atomic_s32_max ||
+           info.uses_int64_bit_atomics || info.uses_atomic_image_u32;
+}
+
+bool OcclFlagDiscardsNoWrites(const GraphicsPipeline& pipeline,
+                              const Tegra::Engines::Maxwell3D::Regs& regs) {
+    const auto& infos = pipeline.StageInfos();
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    const bool writes_storage = std::ranges::any_of(
+        pixel.storage_buffers_descriptors, [](const auto& desc) { return desc.is_written; });
+    const bool writes_images =
+        std::ranges::any_of(pixel.image_descriptors,
+                            [](const auto& desc) { return desc.is_written; }) ||
+        std::ranges::any_of(pixel.image_buffer_descriptors,
+                            [](const auto& desc) { return desc.is_written; });
+    if (pixel.stores_frag_depth || pixel.stores_sample_mask || writes_storage || writes_images ||
+        pixel.stores_global_memory || pixel.uses_typeless_image_writes ||
+        pixel.uses_global_increment || pixel.uses_global_decrement ||
+        pixel.uses_shared_increment || pixel.uses_shared_decrement || pixel.uses_atomic_f32_add ||
+        pixel.uses_int64_bit_atomics || pixel.uses_atomic_image_u32 || pixel.uses_atomic_s32_min ||
+        pixel.uses_atomic_s32_max) {
+        return false;
+    }
+    if (pixel.uses_subgroup_vote || pixel.uses_subgroup_mask || pixel.uses_subgroup_shuffles ||
+        pixel.uses_subgroup_invocation_id || pixel.uses_is_helper_invocation ||
+        pixel.uses_quad_shuffles || pixel.uses_fswzadd ||
+        pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return false;
+    }
+    const bool stencil_writes =
+        regs.stencil_enable != 0 &&
+        (regs.stencil_front_mask != 0 ||
+         (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0));
+    return regs.depth_write_enabled == 0 && !stencil_writes;
+}
+
+/// FRITCHII_OCCL_FLAG pre-pass: a counted colour-off draw whose pixel program discards (and is
+/// otherwise Lean, without subgroup, quad or helper operations, alpha to coverage) can be drawn
+/// twice: first with depth writes off, early fragment tests and the flag store after the
+/// discards, then as it is with no host query. The pre-pass tests the depth before the draw;
+/// the draw's own writes only make later fragments fail where an earlier one of it passed (and
+/// was not discarded) with a monotonic compare, so "some sample passed" is the same. Not with
+/// stencil writes (stencil tests depend on them), depth bounds (they test the written depth),
+/// transform feedback or stores in any stage (they would run twice), NOTEQUAL with depth writes,
+/// or a pipeline without dynamic depth writes (the pre-pass turns them off).
+/// Pre-passes (both kinds), the pipeline: dynamic depth writes (the pre-pass turns them off),
+/// not mesh, no transform feedback or alpha to coverage, no stores in any stage (the pre-pass
+/// would run them twice).
+bool OcclFlagPrepassPipelineOk(const GraphicsPipeline& pipeline) {
+    if (!pipeline.UsesExtendedDynamicState() || pipeline.IsMeshPipeline() ||
+        pipeline.Key().state.xfb_enabled != 0 ||
+        pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return false;
+    }
+    return std::ranges::none_of(pipeline.StageInfos(), [](const Shader::Info& info) {
+        return OcclFlagStageWrites(info);
+    });
+}
+
+/// Pre-passes (both kinds), the draw's registers: see OcclFlagPrepassEligible.
+bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs);
+
+/// FRITCHII_OCCL_FLAG colour pre-pass: a counted colour draw whose pixel program is Lean (no
+/// discard, depth or sample mask writes, stores) but uses subgroup or quad operations (the
+/// colour variant's early tests could change them) is drawn first with the host flag program,
+/// colour and depth writes off; then as it is. Without discards every fragment that passes the
+/// tests is counted, so the host program's flag is the draw's "some sample passed". Needs
+/// dynamic colour write masks (extended dynamic state 3 blending).
+bool OcclFlagColourPrepassEligible(const GraphicsPipeline& pipeline,
+                                  const Tegra::Engines::Maxwell3D::Regs& regs) {
+    return OcclFlagPrepassPipelineOk(pipeline) && OcclFlagPrepassRegsOk(regs);
+}
+
+bool OcclFlagPrepassEligible(const GraphicsPipeline& pipeline,
+                             const Tegra::Engines::Maxwell3D::Regs& regs) {
+    // Mandated early Z: the draw counts samples before its discards, the pre-pass after them.
+    if (!OcclFlagPrepassPipelineOk(pipeline) || pipeline.Key().state.early_z != 0) {
+        return false;
+    }
+    const auto& infos = pipeline.StageInfos();
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    if (pixel.stores_frag_depth || pixel.stores_sample_mask || pixel.uses_subgroup_vote ||
+        pixel.uses_subgroup_mask || pixel.uses_subgroup_shuffles ||
+        pixel.uses_subgroup_invocation_id || pixel.uses_is_helper_invocation ||
+        pixel.uses_quad_shuffles || pixel.uses_fswzadd) {
+        return false;
+    }
+    return OcclFlagPrepassRegsOk(regs);
+}
+
+bool OcclFlagPrepassRegsOk(const Tegra::Engines::Maxwell3D::Regs& regs) {
+    using Regs = Tegra::Engines::Maxwell3D::Regs;
+    const bool stencil_writes =
+        regs.stencil_enable != 0 &&
+        (regs.stencil_front_mask != 0 ||
+         (regs.stencil_two_side_enable != 0 && regs.stencil_back_mask != 0));
+    const bool not_equal = regs.depth_test_func == Regs::ComparisonOp::NotEqual_D3D ||
+                           regs.depth_test_func == Regs::ComparisonOp::NotEqual_GL;
+    // EQUAL: the pre-pass's positions come from a separate (whole pipeline) compile of the
+    // vertex programs; a last-bit difference would decide an equal test.
+    const bool equal = regs.depth_test_func == Regs::ComparisonOp::Equal_D3D ||
+                       regs.depth_test_func == Regs::ComparisonOp::Equal_GL;
+    return regs.rasterize_enable != 0 && regs.transform_feedback_enabled == 0 &&
+           regs.depth_bounds_enable == 0 && !stencil_writes &&
+           !(regs.depth_test_enable != 0 && equal) &&
+           !(regs.depth_test_enable != 0 && regs.depth_write_enabled != 0 && not_equal);
+}
+
+/// FRITCHII_OCCL_FLAG pre-pass: the variant was translated again from the draw's environments
+/// (storage buffers found from the live constant buffers); the parent binds the descriptors the
+/// variant's Configure acquired, so both must describe the same descriptors, stage by stage.
+bool OcclFlagSameDescriptors(const GraphicsPipeline& a, const GraphicsPipeline& b) {
+    const auto& x = a.StageInfos();
+    const auto& y = b.StageInfos();
+    if (x.size() != y.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < x.size(); ++i) {
+        if (x[i].constant_buffer_descriptors != y[i].constant_buffer_descriptors ||
+            x[i].storage_buffers_descriptors != y[i].storage_buffers_descriptors ||
+            x[i].texture_buffer_descriptors != y[i].texture_buffer_descriptors ||
+            x[i].image_buffer_descriptors != y[i].image_buffer_descriptors ||
+            x[i].texture_descriptors != y[i].texture_descriptors ||
+            x[i].image_descriptors != y[i].image_descriptors ||
+            x[i].uses_rescaling_uniform != y[i].uses_rescaling_uniform ||
+            x[i].uses_render_area != y[i].uses_render_area) {
+            return false;
+        }
+    }
+    return true;
+}
+
+VideoCommon::OcclFlag::Census OcclFlagColourVerdict(const GraphicsPipeline& pipeline) {
+    using VideoCommon::OcclFlag::Census;
+    const auto& infos = pipeline.StageInfos();
+    const Shader::Info& pixel = infos[infos.size() - 1];
+    if (pipeline.Key().state.alpha_to_coverage_enabled != 0) {
+        return Census::ColourA2C;
+    }
+    if (pixel.uses_subgroup_vote || pixel.uses_subgroup_mask || pixel.uses_subgroup_shuffles ||
+        pixel.uses_subgroup_invocation_id || pixel.uses_is_helper_invocation) {
+        return Census::ColourSubgroup;
+    }
+    if (pixel.uses_quad_shuffles || pixel.uses_fswzadd) {
+        return Census::ColourQuad;
+    }
+    return Census::Flag;
+}
+
+GraphicsPipeline* PipelineCache::OcclFlagPipeline(GraphicsPipeline* pipeline,
+                                                  const Maxwell& regs, bool allow_make) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    namespace OcclLean = VideoCommon::OcclLean;
+    using OcclLean::PipelineClass;
+    if (pipeline == nullptr) {
+        return pipeline;
+    }
+    if (pipeline->occl_flag_parent != nullptr) {
+        pipeline = pipeline->occl_flag_parent; // a kept flag variant: decide again
+    }
+    OcclFlag::t_census = OcclFlag::Census::Unknown;
+    if (OcclFlag::Mode() == OcclFlag::Off || !device.IsOcclFlagDeviceAddressEnabled()) {
+        return pipeline;
+    }
+    OcclFlag::Stats& stats = OcclFlag::g_stats;
+    OcclFlag::MaybeLog();
+    const OcclLean::RegsVerdict verdict = OcclLean::ClassifyRegs(regs);
+    if (!verdict.counting) {
+        return pipeline;
+    }
+    if (pipeline->occl_class == 0) {
+        pipeline->occl_class =
+            static_cast<u8>(static_cast<u8>(ClassifyOcclPipeline(*pipeline)) + 1);
+    }
+    const auto pipeline_class = static_cast<PipelineClass>(pipeline->occl_class - 1);
+    using OcclFlag::Census;
+    if (verdict.refused) {
+        OcclFlag::t_census = Census::RegsRefused;
+        OcclFlag::Add(stats.refused_regs);
+        return pipeline;
+    }
+    if (!verdict.colour_off) {
+        // Census: what a flag store in the draw's own pixel program would need.
+        const Census colour_verdict = pipeline_class == PipelineClass::Lean &&
+                                              !pipeline->IsMeshPipeline()
+                                          ? OcclFlagColourVerdict(*pipeline)
+                                          : Census::Unknown;
+        if (colour_verdict == Census::ColourSubgroup) {
+            const auto& infos = pipeline->StageInfos();
+            const Shader::Info& pixel = infos[infos.size() - 1];
+            OcclFlag::Add(stats.sg_vote, pixel.uses_subgroup_vote ? 1 : 0);
+            OcclFlag::Add(stats.sg_mask, pixel.uses_subgroup_mask ? 1 : 0);
+            OcclFlag::Add(stats.sg_shuffle, pixel.uses_subgroup_shuffles ? 1 : 0);
+            OcclFlag::Add(stats.sg_invocation_id, pixel.uses_subgroup_invocation_id ? 1 : 0);
+            OcclFlag::Add(stats.sg_helper, pixel.uses_is_helper_invocation ? 1 : 0);
+        }
+        if (colour_verdict == Census::Flag && pipeline->occl_flag_colour_state != 2 &&
+            OcclFlag::ColourAllowed() && device.IsShaderInt64Supported()) {
+            GraphicsPipeline* colour = pipeline->occl_flag_colour.get();
+            if (colour == nullptr && allow_make) {
+                colour = FindOrMakeOcclFlag(*pipeline, OCCL_FLAG_BUILD_COLOUR);
+            }
+            if (colour != nullptr && colour->Failed()) [[unlikely]] {
+                pipeline->occl_flag_colour_state = 2;
+                OcclFlag::Add(stats.failed);
+                colour = nullptr;
+            }
+            if (colour != nullptr && colour->IsBuilt()) {
+                OcclFlag::t_census = Census::Flag;
+                OcclFlag::Add(stats.colour_flag_draws);
+                colour->MarkUsed(frame_count);
+                return colour;
+            }
+            if (pipeline->occl_flag_colour_state != 2) {
+                OcclFlag::t_census = Census::NotReady;
+                OcclFlag::Add(stats.not_ready);
+                return pipeline;
+            }
+        }
+        // With dynamic colour write masks the host flag variant is drawn with them cleared;
+        // without, a host variant whose key has every attachment's writes off.
+        const bool dynamic_masks = pipeline->Key().state.extended_dynamic_state_3_blend != 0;
+        u8& host_state = dynamic_masks ? pipeline->occl_flag_state
+                                       : pipeline->occl_flag_nocolour_state;
+        if ((colour_verdict == Census::ColourSubgroup || colour_verdict == Census::ColourQuad) &&
+            OcclFlag::ColourPrepassAllowed() && host_state != 2 && pipeline->IsBuilt() &&
+            OcclFlagColourPrepassEligible(*pipeline, regs)) {
+            GraphicsPipeline* host = dynamic_masks ? pipeline->occl_flag.get()
+                                                   : pipeline->occl_flag_nocolour.get();
+            if (host == nullptr && allow_make) {
+                host = FindOrMakeOcclFlag(*pipeline, dynamic_masks ? OCCL_FLAG_BUILD_HOST
+                                                                   : OCCL_FLAG_BUILD_NOCOLOUR);
+            }
+            if (host != nullptr && host->Failed()) [[unlikely]] {
+                host_state = 2;
+                OcclFlag::Add(stats.failed);
+                host = nullptr;
+            }
+            if (host != nullptr && host->IsBuilt() && host->occl_same_descriptors == 1) {
+                OcclFlag::t_census = Census::Flag;
+                OcclFlag::t_colour_prepass = true;
+                OcclFlag::t_colour_prepass_class = colour_verdict;
+                host->MarkUsed(frame_count);
+                return host;
+            }
+            if (host_state != 2 && (host == nullptr || !host->IsBuilt())) {
+                OcclFlag::t_census = Census::NotReady;
+                OcclFlag::Add(stats.not_ready);
+                return pipeline;
+            }
+        }
+        switch (pipeline->IsMeshPipeline() ? PipelineClass::Mesh : pipeline_class) {
+        case PipelineClass::Lean: {
+            OcclFlag::t_census =
+                colour_verdict == Census::Flag ? Census::ColourLean : colour_verdict;
+            static std::unordered_set<const GraphicsPipeline*> seen;
+            static s64 seen_window{};
+            if (const s64 window = stats.window_start.load(std::memory_order_relaxed);
+                window != seen_window) {
+                seen.clear();
+                seen_window = window;
+            }
+            if (seen.insert(pipeline).second) {
+                OcclFlag::Add(stats.colour_lean_pipelines);
+            }
+            break;
+        }
+        case PipelineClass::Discards:
+            OcclFlag::t_census = OcclFlagDiscardsNoWrites(*pipeline, regs)
+                                     ? Census::ColourDiscardsNoWrites
+                                     : Census::ColourDiscards;
+            break;
+        case PipelineClass::KeyState:
+            OcclFlag::t_census = Census::ColourKeyState;
+            break;
+        case PipelineClass::DepthOrMask:
+            OcclFlag::t_census = Census::ColourDepthOrMask;
+            break;
+        case PipelineClass::Stores:
+            OcclFlag::t_census = Census::ColourStores;
+            break;
+        default:
+            OcclFlag::t_census = Census::ColourOther;
+            break;
+        }
+        OcclFlag::Add(stats.refused_regs);
+        return pipeline;
+    }
+    if (pipeline_class == PipelineClass::Discards && OcclFlag::PrepassAllowed() &&
+        pipeline->occl_flag_prepass_state != 2 && pipeline->IsBuilt() &&
+        device.IsShaderInt64Supported() && OcclFlagPrepassEligible(*pipeline, regs)) {
+        GraphicsPipeline* prepass = pipeline->occl_flag_prepass.get();
+        if (prepass == nullptr && allow_make) {
+            prepass = FindOrMakeOcclFlag(*pipeline, OCCL_FLAG_BUILD_PREPASS);
+        }
+        if (prepass != nullptr && prepass->Failed()) [[unlikely]] {
+            pipeline->occl_flag_prepass_state = 2;
+            OcclFlag::Add(stats.failed);
+            prepass = nullptr;
+        }
+        if (prepass != nullptr && prepass->IsBuilt()) {
+            OcclFlag::t_census = Census::Flag;
+            prepass->MarkUsed(frame_count);
+            return prepass;
+        }
+        if (pipeline->occl_flag_prepass_state != 2) {
+            OcclFlag::t_census = Census::NotReady;
+            OcclFlag::Add(stats.not_ready);
+            return pipeline;
+        }
+    }
+    if (pipeline_class != PipelineClass::Lean || pipeline->IsMeshPipeline() ||
+        pipeline->occl_flag_state == 2) {
+        switch (pipeline->occl_flag_state == 2 ? PipelineClass::Failed
+                : pipeline->IsMeshPipeline()     ? PipelineClass::Mesh
+                                                 : pipeline_class) {
+        case PipelineClass::Failed:
+            OcclFlag::t_census = Census::Failed;
+            break;
+        case PipelineClass::Discards:
+            OcclFlag::t_census = OcclFlagDiscardsNoWrites(*pipeline, regs)
+                                     ? Census::OffDiscardsNoWrites
+                                     : Census::OffDiscards;
+            break;
+        case PipelineClass::KeyState:
+            OcclFlag::t_census = Census::OffKeyState;
+            break;
+        case PipelineClass::DepthOrMask:
+            OcclFlag::t_census = Census::OffDepthOrMask;
+            break;
+        case PipelineClass::Stores:
+            OcclFlag::t_census = Census::OffStores;
+            break;
+        default:
+            OcclFlag::t_census = Census::OffOther;
+            break;
+        }
+        OcclFlag::Add(stats.not_lean);
+        return pipeline;
+    }
+    OcclFlag::t_census = Census::NotReady;
+    GraphicsPipeline* flag = pipeline->occl_flag.get();
+    if (flag == nullptr && !allow_make) {
+        OcclFlag::Add(stats.not_ready);
+        return pipeline;
+    }
+    if (flag == nullptr) {
+        flag = FindOrMakeOcclFlag(*pipeline);
+        if (flag == nullptr) {
+            OcclFlag::Add(stats.not_ready);
+            return pipeline;
+        }
+    }
+    if (flag->Failed()) [[unlikely]] {
+        OcclFlag::t_census = Census::Failed;
+        OcclFlag::Add(stats.failed);
+        pipeline->occl_flag_state = 2;
+        return pipeline;
+    }
+    if (!flag->IsBuilt()) {
+        OcclFlag::Add(stats.not_ready);
+        return pipeline;
+    }
+    OcclFlag::t_census = Census::Flag;
+    flag->MarkUsed(frame_count); // the pipeline itself is marked by the lookup
+    return flag;
+}
+
+GraphicsPipeline* PipelineCache::FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind) {
+    namespace OcclFlag = VideoCommon::OcclFlag;
+    // The environments come from the registers of this draw: only while the current key names
+    // full's programs. One translation a frame, shared with the lean siblings.
+    if (graphics_key.unique_hashes != full.Key().unique_hashes || occl_made_frame == frame_count) {
+        return nullptr;
+    }
+    occl_made_frame = frame_count;
+    const GraphicsPipelineCacheKey saved = graphics_key;
+    std::unique_ptr<GraphicsPipeline> made;
+    {
+        graphics_key = full.Key();
+        if (kind == OCCL_FLAG_BUILD_NOCOLOUR) {
+            for (auto& attachment : graphics_key.state.attachments) {
+                attachment.raw = 0; // no colour writes, no blending
+            }
+        }
+        t_occl_flag_build = kind;
+        SCOPE_EXIT {
+            graphics_key = saved;
+            t_occl_flag_build = 0;
+        };
+        try {
+            made = CreateGraphicsPipeline(nullptr, false);
+        } catch (const std::exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {}: {}",
+                      OcclShaders(full.Key()), exception.what());
+            made.reset();
+        }
+    }
+    u8& state = kind == OCCL_FLAG_BUILD_COLOUR     ? full.occl_flag_colour_state
+                : kind == OCCL_FLAG_BUILD_PREPASS  ? full.occl_flag_prepass_state
+                : kind == OCCL_FLAG_BUILD_NOCOLOUR ? full.occl_flag_nocolour_state
+                                                   : full.occl_flag_state;
+    if (!made) {
+        OcclFlag::Add(OcclFlag::g_stats.failed);
+        state = 2;
+        return nullptr;
+    }
+    made->occl_flag_parent = &full;
+    made->occl_flag_kind = kind;
+    state = 1;
+    if (kind == OCCL_FLAG_BUILD_COLOUR) {
+        OcclFlag::Add(OcclFlag::g_stats.colour_made);
+        full.occl_flag_colour = std::move(made);
+        return full.occl_flag_colour.get();
+    }
+    if (kind == OCCL_FLAG_BUILD_PREPASS) {
+        if (!OcclFlagSameDescriptors(*made, full)) {
+            state = 2; // the parent could not bind this variant's descriptors
+            OcclFlag::Add(OcclFlag::g_stats.prepass_refused);
+            LOG_INFO(Render_Vulkan,
+                     "Occlusion flag pre-pass: {}: its translation's descriptors differ from "
+                     "the pipeline's; no pre-pass for it",
+                     OcclShaders(full.Key()));
+            return nullptr;
+        }
+        OcclFlag::Add(OcclFlag::g_stats.prepass_made);
+        full.occl_flag_prepass = std::move(made);
+        return full.occl_flag_prepass.get();
+    }
+    OcclFlag::Add(OcclFlag::g_stats.made);
+    made->occl_same_descriptors = OcclFlagSameDescriptors(*made, full) ? 1 : 2;
+    if (kind == OCCL_FLAG_BUILD_NOCOLOUR) {
+        full.occl_flag_nocolour = std::move(made);
+        return full.occl_flag_nocolour.get();
+    }
+    full.occl_flag = std::move(made);
+    full.occl_flag_state = 1;
+    return full.occl_flag.get();
+}
+
 GraphicsPipeline* PipelineCache::FindOrMakeOcclSibling(GraphicsPipeline& full) {
     namespace OcclLean = VideoCommon::OcclLean;
     OcclLean::Stats& stats = OcclLean::g_stats;
@@ -4103,6 +4781,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         background_slots.store(0, std::memory_order_relaxed);
         serialization_thread.WaitForRequests();
         if (use_vulkan_pipeline_cache && !vulkan_pipeline_cache_filename.empty()) {
+            if (IntelFetchesCacheWhenIdle(device)) {
+                workers.WaitForRequests();
+            }
             SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
                                          CACHE_VERSION);
         }
@@ -5492,7 +6173,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // shader translator. Not the commit (2026-11-09, owner: every dev build re-ran the ~20 minute
     // preparation), and since v5.8 not the release either (every release re-ran it for every
     // player, also releases that changed no shader): NX2_SHADER_STAMP hashes the shader
-    // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake).
+    // recompiler, pipeline creation and the precompile step (CMakeModules/Nx2ShaderStamp.cmake,
+    // which stops the build when the stamp leaves its known values: 6.2 keeps 6.1's).
     const auto stamp_path =
         base_dir / fmt::format("precompiled_prepared.fork-v{}.txt", CACHE_VERSION);
     // With the pipeline binary store saving, its file id too: a new (or started over) store is
@@ -5519,22 +6201,78 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     auto kept_part = kept_path;
     kept_part += ".part";
     const std::string kept_stamp = keep ? KeptStamp(stamp) : std::string{};
+    // FRITCHII_PREP_COMPUTE_CHECK: the compute records alone, prepared again over a finished
+    // preparation whose compute pipelines the driver's cache lost. Its file holds the stamp and
+    // how many such passes ran for it: a driver that drops them again after two (a cache at its
+    // size cap) is not asked a third time.
+    const auto compute_pass_path =
+        base_dir / fmt::format("precompiled_compute_pass.fork-v{}.txt", CACHE_VERSION);
+    bool compute_only = false;
+    u32 compute_passes = 0;
     if (!force && !VideoCommon::Nx2Precompile::Forced()) {
         std::ifstream stamp_file(stamp_path, std::ios::binary);
         const std::string previous{std::istreambuf_iterator<char>(stamp_file), {}};
         if (previous == stamp) {
             if (!keep || LoadKept(kept_path, kept_part, path, kept_stamp, true)) {
                 LOG_INFO(Render_Vulkan, "Precompiled pipelines already prepared for this driver");
-                return;
+                const int check_mode = PrepComputeCheckMode();
+                const auto index = keep ? KeptIndex() : nullptr;
+                if (check_mode == 0 || !index || index->ComputeCount() == 0) {
+                    return;
+                }
+                {
+                    std::ifstream pass_file(compute_pass_path, std::ios::binary);
+                    const std::string text{std::istreambuf_iterator<char>(pass_file), {}};
+                    constexpr std::string_view PassesWord = "passes ";
+                    if (text.starts_with(stamp) &&
+                        std::string_view{text}.substr(stamp.size()).starts_with(PassesWord)) {
+                        compute_passes = static_cast<u32>(std::strtoul(
+                            text.c_str() + stamp.size() + PassesWord.size(), nullptr, 10));
+                    }
+                }
+                // Its passes used up: no check either. The check compiles the biggest programs when
+                // the driver lost them, and the game waits for it at every boot.
+                if (check_mode != 2 && compute_passes >= 2) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Prepared compute check skipped: {} compute passes ran for this "
+                                "preparation and the driver's cache lost the pipelines again (it "
+                                "is likely full: NVIDIA: Shader Cache Size Unlimited in the NVIDIA "
+                                "Control Panel)",
+                                compute_passes);
+                    return;
+                }
+                std::string summary;
+                const bool lost = PreparedComputeLost(*index, summary);
+                if (check_mode != 2 && !lost) {
+                    LOG_INFO(Render_Vulkan, "Prepared compute check: {}: the driver's cache holds "
+                                            "the prepared compute pipelines",
+                             summary);
+                    return;
+                }
+                ++compute_passes;
+                LOG_INFO(Render_Vulkan,
+                         "Prepared compute check: {}: {}, preparing the {} compute pipelines "
+                         "again before play (pass {} for this preparation)",
+                         summary,
+                         check_mode == 2 && !lost
+                             ? "FRITCHII_PREP_COMPUTE_CHECK=2 (test)"
+                             : "the driver's cache lost them (a new exe name, a driver update, a "
+                               "cleared or full shader cache)",
+                         index->ComputeCount(), compute_passes);
+                std::ofstream pass_file(compute_pass_path, std::ios::binary | std::ios::trunc);
+                pass_file << stamp << "passes " << compute_passes << '\n';
+                compute_only = true;
+            } else {
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines were prepared without keeping their infos and "
+                         "SPIR-V for this release and its settings, or this build translates them "
+                         "otherwise (EDEN_NX2_PRECOMPILED_FAST): preparing them again");
             }
-            LOG_INFO(Render_Vulkan,
-                     "Precompiled pipelines were prepared without keeping their infos and SPIR-V "
-                     "for this release and its settings, or this build translates them otherwise "
-                     "(EDEN_NX2_PRECOMPILED_FAST): preparing them again");
         }
     }
-    // Published again once this preparation has written its file.
-    {
+    if (!compute_only) {
+        // Published again once this preparation has written its file. A compute pass keeps the
+        // published one: it writes no kept file.
         std::scoped_lock lock{kept_mutex};
         kept_index.reset();
         kept_available = false;
@@ -5544,12 +6282,17 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     std::vector<std::pair<u64, u64>> env_index;
     std::vector<u64> record_offsets;
     // FRITCHII_PREP_ORDER: each record's rank (lower first): the used list's age, then the disk
-    // cache, compute, the rest.
+    // cache, compute, the rest. FRITCHII_PREP_COMPUTE_FIRST: compute before all of them (rank 0,
+    // the used list's ages from 1), in any order mode.
     const int order_mode = PrepOrderMode(device);
+    const bool compute_first = PrepComputeFirst() && !compute_only;
+    constexpr u8 RankComputeFirst = 0;
     constexpr u8 RankDisk = 32;
     constexpr u8 RankCompute = 33;
     constexpr u8 RankRest = 34;
     std::vector<u8> record_rank;
+    /// Which records are compute ones (the compute pass takes only those).
+    std::vector<u8> record_compute;
     const auto used_keys = precompile_used_keys;
     size_t intel_static_dynamic_records = 0;
     size_t intel_static_convertible = 0;
@@ -5603,15 +6346,19 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 LOG_ERROR(Render_Vulkan, "Precompiled pipeline file {} is damaged", path_text);
                 return;
             }
-            if (order_mode == 0) {
+            record_compute.push_back(compute ? 1 : 0);
+            if (order_mode == 0 || compute_only) {
                 in.seekg(compute ? sizeof(ComputePipelineCacheKey)
                                  : sizeof(GraphicsPipelineCacheKey),
                          std::ios::cur);
+                if (compute_first) {
+                    record_rank.push_back(compute ? RankComputeFirst : RankRest);
+                }
                 continue;
             }
             if (compute) {
                 in.seekg(sizeof(ComputePipelineCacheKey), std::ios::cur);
-                record_rank.push_back(RankCompute);
+                record_rank.push_back(compute_first ? RankComputeFirst : RankCompute);
                 continue;
             }
             GraphicsPipelineCacheKey key{};
@@ -5631,7 +6378,10 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             u8 rank = RankRest;
             if (used_keys) {
                 if (const auto used = used_keys->find(hash); used != used_keys->end()) {
-                    rank = (std::min)(used->second, static_cast<u8>(RankDisk - 1));
+                    rank = compute_first
+                               ? static_cast<u8>(1 + (std::min)(used->second,
+                                                                static_cast<u8>(RankDisk - 2)))
+                               : (std::min)(used->second, static_cast<u8>(RankDisk - 1));
                 }
             }
             if (rank == RankRest && precompile_disk_keys &&
@@ -5666,7 +6416,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // The checkpoint is a position in the order the records are taken in: the file's order, or
     // with FRITCHII_PREP_ORDER the one saved beside it (a third number, 1, in the progress file).
     u32 saved_order_mode = 0;
-    if (!force) {
+    // A compute pass has no checkpoint: it is short, and the progress file is the full
+    // preparation's.
+    if (!force && !compute_only) {
         std::ifstream progress_file(progress_path, std::ios::binary);
         std::string line;
         size_t next{};
@@ -5706,7 +6458,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // another build) the preparation starts from the first record, so every record is kept.
     PrecompiledKept::Writer writer;
     bool keeping = false;
-    if (keep) {
+    if (keep && !compute_only) {
         constexpr u64 KeptSpaceNeeded = u64{1536} << 20; // Ocarina of Time: 758 MiB
         const auto space = std::filesystem::space(base_dir, error);
         if (!error && space.available < KeptSpaceNeeded) {
@@ -5754,9 +6506,16 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
     }
     // The order: positions before the checkpoint as the earlier run took them, then the rest by
-    // rank (FRITCHII_PREP_ORDER) or as the earlier run would have. Empty: the file's order.
+    // rank (FRITCHII_PREP_ORDER, FRITCHII_PREP_COMPUTE_FIRST) or as the earlier run would have.
+    // Empty: the file's order. A compute pass: the compute records only, in file order.
     std::vector<u32> order;
-    if (!record_rank.empty() || !saved_order.empty()) {
+    if (compute_only) {
+        for (u32 index = 0; index < total; ++index) {
+            if (record_compute[index]) {
+                order.push_back(index);
+            }
+        }
+    } else if (!record_rank.empty() || !saved_order.empty()) {
         order.reserve(total);
         std::vector<u8> taken(total, 0);
         for (size_t position = 0; position < start_index; ++position) {
@@ -5777,16 +6536,21 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 return record_rank[lhs] < record_rank[rhs];
             });
             order.insert(order.end(), rest.begin(), rest.end());
-            std::array<size_t, 4> counts{};
+            // Compute first, the used list, the disk cache, compute (FRITCHII_PREP_ORDER), rest.
+            std::array<size_t, 5> counts{};
             for (const u32 index : rest) {
                 const u8 rank = record_rank[index];
-                ++counts[rank < RankDisk ? 0 : rank - RankDisk + 1];
+                ++counts[compute_first && record_compute[index] ? 0
+                         : rank < RankDisk                       ? 1
+                                                                 : rank - RankDisk + 2];
             }
             LOG_INFO(Render_Vulkan,
-                     "Precompiled pipelines in order of likely use (FRITCHII_PREP_ORDER=1): {} "
-                     "the used list holds ({} keys in it), {} the disk cache holds, {} compute, "
-                     "then {} in file order; {} taken before the checkpoint",
-                     counts[0], used_keys ? used_keys->size() : 0, counts[1], counts[2], counts[3],
+                     "Precompiled pipelines in order (FRITCHII_PREP_ORDER={} "
+                     "FRITCHII_PREP_COMPUTE_FIRST={}): {} compute first, {} the used list holds "
+                     "({} keys in it), {} the disk cache holds, {} compute, then {} in file "
+                     "order; {} taken before the checkpoint",
+                     order_mode, compute_first ? 1 : 0, counts[0], counts[1],
+                     used_keys ? used_keys->size() : 0, counts[2], counts[3], counts[4],
                      start_index);
         } else {
             for (size_t position = start_index; position < total; ++position) {
@@ -5804,7 +6568,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
     }
     const u32 order_saved = order.empty() ? 0 : 1;
+    // Positions to take: every record, or a compute pass's compute records.
+    const size_t positions = compute_only ? order.size() : total;
     const auto write_progress = [&](size_t next, u32 count) {
+        if (compute_only) {
+            return;
+        }
         if (keeping) {
             // The kept entries of every record before the checkpoint are on disk first.
             writer.Flush();
@@ -5851,8 +6620,25 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         size_t rate_finished{};
         /// FRITCHII_PREP_THROTTLE: ms worker 0 stayed parked for frame spikes.
         std::atomic<u64> yielded_ms{};
+        /// Compute records: built (fast of them: under FastBuild), failed, and taken. When the
+        /// last one ended (ms after begin), logged once.
+        std::atomic<size_t> compute_built{};
+        std::atomic<size_t> compute_fast{};
+        std::atomic<size_t> compute_failed{};
+        std::atomic<size_t> compute_finished{};
+        std::atomic<u64> compute_slow_ms{};
+        std::atomic<double> compute_done_s{-1.0};
     } state;
-    state.done.assign(total, 0);
+    const size_t compute_records = static_cast<size_t>(
+        std::count(record_compute.begin(), record_compute.end(), u8{1}));
+    // Compute records taken before a resumed checkpoint are not counted: their count is reached
+    // only when none were (the "all done" line then).
+    size_t compute_before_start = 0;
+    for (size_t position = 0; position < start_index && position < positions; ++position) {
+        const size_t index = order.empty() ? position : order[position];
+        compute_before_start += record_compute[index];
+    }
+    state.done.assign(positions, 0);
     state.next = start_index;
     state.finished = start_index;
     state.low_water = state.checkpoint = start_index;
@@ -5866,7 +6652,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     // Threads() workers beside the game; at full speed (the frontend holds the game for the
     // preparation) one per host thread, at normal priority.
     const size_t full_threads = CapLegacyAmdBuildThreads(
-        device, std::max<size_t>(threads, std::max(1U, std::thread::hardware_concurrency())));
+        device, std::max<size_t>(threads, std::max(1U, Common::LowEndSim::LogicalProcessors())));
     // On Intel it does not build beside the game: there its compiles took the CPU from the game
     // (owner, Arc B580 + 6 cores: lag spikes with the preparation running in play, none with
     // EDEN_NX2_PRECOMPILE=0). Like the warm-up, it builds then only while emulation is paused or
@@ -5898,7 +6684,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         {
             std::scoped_lock lock{state.mutex};
             state.done[position] = 1;
-            while (state.low_water < total && state.done[state.low_water]) {
+            while (state.low_water < positions && state.done[state.low_water]) {
                 ++state.low_water;
             }
             if (state.low_water >= state.checkpoint + 512) {
@@ -5919,14 +6705,15 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          "Precompiled pipelines: {} of {} ({:.1f}%), {:.1f} a second in the last "
                          "{:.0f} s ({}, {} threads, {:.0f} s parked for frame spikes); {} left at "
                          "this rate",
-                         finished, total, 100.0 * static_cast<double>(finished) / total, rate,
+                         finished, positions,
+                         100.0 * static_cast<double>(finished) / positions, rate,
                          window,
                          full    ? "full speed"
                          : asked ? "paused or Prepare Shaders Now"
                                  : "beside the game",
                          allowed_threads(full),
                          static_cast<double>(state.yielded_ms.exchange(0)) / 1000.0,
-                         rate > 0.0 ? DurationText(static_cast<double>(total - finished) / rate)
+                         rate > 0.0 ? DurationText(static_cast<double>(positions - finished) / rate)
                                     : std::string{"no estimate"});
                 // Intel fork: what the walk did so far (a killed run writes no end summary).
                 LOG_INFO(Render_Vulkan,
@@ -5952,10 +6739,10 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             }
         }
         if (state.throttle.Due()) {
-            shader_notify.SetWarmProgress(3, finished, total);
+            shader_notify.SetWarmProgress(3, finished, positions);
         }
-        if (callback && (finished % 64 == 0 || finished == total)) {
-            callback(VideoCore::LoadCallbackStage::Build, finished, total);
+        if (callback && (finished % 64 == 0 || finished == positions)) {
+            callback(VideoCore::LoadCallbackStage::Build, finished, positions);
         }
         if (finished % 5000 == 0) {
             // The mode too: a player's preparation ran at 66 pipelines a second while the game
@@ -5965,7 +6752,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             LOG_INFO(Render_Vulkan,
                      "Precompiled pipelines: {} of {} done, {} built ({} fast), {} failed, {:.0f} s "
                      "({}, {} threads)",
-                     finished, total, state.built.load(), state.fast.load(), state.failed.load(),
+                     finished, positions, state.built.load(), state.fast.load(),
+                     state.failed.load(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - begin)
                          .count(),
                      full ? "full speed" : "beside the game", full ? full_threads : threads);
@@ -5984,7 +6772,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             if (worker >= allowed_threads(full)) {
                 // Parked until full speed (or, on Intel, a pause); done once every record is
                 // taken.
-                if (state.next.load() >= total) {
+                if (state.next.load() >= positions) {
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -5994,7 +6782,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             // draw held for an unbuilt pipeline (the game's own builds need the compiler then).
             if (throttle_mode != 0 && !full && !shader_notify.WarmMayBuild() &&
                 PrepShouldYield()) {
-                if (state.next.load() >= total) {
+                if (state.next.load() >= positions) {
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds{100});
@@ -6008,7 +6796,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 placed_full = full;
             }
             const size_t position = state.next.fetch_add(1);
-            if (position >= total) {
+            if (position >= positions) {
                 break;
             }
             const size_t index = order.empty() ? position : order[position];
@@ -6185,23 +6973,58 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             } catch (const std::exception& e) {
                 LOG_DEBUG(Render_Vulkan, "Precompiled pipeline {} failed: {}", index, e.what());
             }
+            const auto build_time = std::chrono::steady_clock::now() - build_begin;
             if (!skipped) {
                 ++(ok ? state.built : state.failed);
-                if (ok && std::chrono::steady_clock::now() - build_begin < FastBuild) {
+                if (ok && build_time < FastBuild) {
                     ++state.fast;
+                }
+            }
+            if (record_compute[index]) {
+                if (ok) {
+                    ++state.compute_built;
+                    if (build_time < FastBuild) {
+                        ++state.compute_fast;
+                    } else {
+                        state.compute_slow_ms += static_cast<u64>(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(build_time)
+                                .count());
+                    }
+                } else {
+                    ++state.compute_failed;
+                }
+                const size_t compute_done = state.compute_finished.fetch_add(1) + 1;
+                if (compute_done + compute_before_start == compute_records) {
+                    // The last compute record: from here a dispatch finds every prepared compute
+                    // pipeline in the driver's cache.
+                    const double at = std::chrono::duration<double>(
+                                          std::chrono::steady_clock::now() - begin)
+                                          .count();
+                    state.compute_done_s.store(at);
+                    LOG_INFO(Render_Vulkan,
+                             "Precompiled compute: all {} compute records done {:.1f} s into the "
+                             "{} ({} built, {} under {} ms each: already in the driver cache, {} "
+                             "compiled for {:.1f} s of thread time, {} failed)",
+                             compute_records, at, compute_only ? "compute pass" : "preparation",
+                             state.compute_built.load(), state.compute_fast.load(),
+                             FastBuild.count(),
+                             state.compute_built.load() - state.compute_fast.load(),
+                             static_cast<double>(state.compute_slow_ms.load()) / 1000.0,
+                             state.compute_failed.load());
                 }
             }
             complete(position);
         }
     };
     LOG_INFO(Render_Vulkan,
-             "Preparing {} precompiled pipelines from {}, from record {}, on {} idle threads ({} "
-             "at full speed), FRITCHII_PREP_ORDER={} FRITCHII_PREP_THROTTLE={}",
-             total, path_text, start_index, threads, full_threads, order.empty() ? 0 : 1,
-             throttle_mode);
-    shader_notify.SetWarmProgress(3, start_index, total);
+             "Preparing {} precompiled pipelines from {}{}, from record {}, on {} idle threads ({} "
+             "at full speed), FRITCHII_PREP_ORDER={} FRITCHII_PREP_THROTTLE={} "
+             "FRITCHII_PREP_COMPUTE_FIRST={}",
+             positions, path_text, compute_only ? " (its compute records only)" : "", start_index,
+             threads, full_threads, order.empty() ? 0 : 1, throttle_mode, compute_first ? 1 : 0);
+    shader_notify.SetWarmProgress(3, start_index, positions);
     if (callback) {
-        callback(VideoCore::LoadCallbackStage::Build, start_index, total);
+        callback(VideoCore::LoadCallbackStage::Build, start_index, positions);
     }
     {
         std::vector<std::jthread> pool;
@@ -6216,20 +7039,21 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     }
     const double seconds =
         std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
-    const size_t reached = std::min(state.finished.load(), total);
+    const size_t reached = std::min(state.finished.load(), positions);
     LOG_INFO(Render_Vulkan,
              "Precompiled pipelines: {} prepared ({} under {} ms each, most likely already in the "
              "driver cache), {} failed, {} skipped ({} in the disk cache, {} for another device), "
              "{} not reached, in {:.1f} s",
              state.built.load(), state.fast.load(), FastBuild.count(), state.failed.load(),
              state.known.load() + state.other_device.load(), state.known.load(),
-             state.other_device.load(), total - reached, seconds);
-    if (reached < total && reached > start_index && seconds > 0.0) {
+             state.other_device.load(), positions - reached, seconds);
+    if (reached < positions && reached > start_index && seconds > 0.0) {
         const double rate = static_cast<double>(reached - start_index) / seconds;
         LOG_INFO(Render_Vulkan,
                  "Precompiled pipelines: {:.1f} a second over this run (held and parked time "
                  "included), the {} left take about {} more at that rate",
-                 rate, total - reached, DurationText(static_cast<double>(total - reached) / rate));
+                 rate, positions - reached,
+                 DurationText(static_cast<double>(positions - reached) / rate));
     }
     LogDriverCacheFolder(device, "after the preparation");
     PipelineBinary::LogCounts("after the preparation");
@@ -6269,7 +7093,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         LOG_WARNING(Render_Vulkan, "Precompiled pipelines for another device: {} ({})",
                     state.other_device.load(), by);
     }
-    const bool finished = !stop_loading.stop_requested() && !warm_cancel && reached >= total;
+    const bool finished = !stop_loading.stop_requested() && !warm_cancel && reached >= positions;
     if (keeping && !finished) {
         // Resumed with the checkpoint next time.
         writer.Close();
@@ -6300,7 +7124,20 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         kept_part.filename().string());
         }
     }
-    if (finished && IntelPrepAppCache(device) && use_vulkan_pipeline_cache &&
+    if (compute_records != 0) {
+        const double compute_done_s = state.compute_done_s.load();
+        LOG_INFO(Render_Vulkan,
+                 "Precompiled compute ({}, FRITCHII_PREP_COMPUTE_FIRST={}): {} of {} compute "
+                 "records taken this run, {} built ({} under {} ms each: already in the driver "
+                 "cache), {} failed; {}",
+                 compute_only ? "compute pass" : "preparation", compute_first ? 1 : 0,
+                 state.compute_finished.load(), compute_records, state.compute_built.load(),
+                 state.compute_fast.load(), FastBuild.count(), state.compute_failed.load(),
+                 compute_done_s >= 0.0
+                     ? fmt::format("all done {:.1f} s into it", compute_done_s)
+                     : std::string{"not all done (stopped first)"});
+    }
+    if (finished && !compute_only && IntelPrepAppCache(device) && use_vulkan_pipeline_cache &&
         !vulkan_pipeline_cache_filename.empty()) {
         // Intel fork D12: the stamp only once the pipelines are on disk.
         const auto save_begin = std::chrono::steady_clock::now();
@@ -6319,11 +7156,18 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - save_begin)
                      .count());
     }
-    if (finished) {
+    if (finished && compute_only) {
+        // The stamp and the kept file stand; the pass file counts this pass.
+        LOG_INFO(Render_Vulkan, "Precompiled compute pass finished: the {} prepared compute "
+                                "pipelines are in the driver's cache again",
+                 compute_records);
+    } else if (finished) {
         std::ofstream stamp_file(stamp_path, std::ios::binary | std::ios::trunc);
         stamp_file << stamp;
         stamp_file.close();
         std::filesystem::remove(progress_path, error);
+        // A finished preparation built every compute record: the compute passes start over.
+        std::filesystem::remove(compute_pass_path, error);
         if (keeping) {
             // Written by this build: its translation, nothing to check.
             LoadKept(kept_path, kept_part, path, kept_stamp, false);
@@ -6816,7 +7660,7 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
     std::atomic<bool> stop{};
     // A few threads at normal priority: the frontend holds the game while this runs, like the
     // stamp check before it, and its "Preparing shaders" screen shows after 0.8 s.
-    const size_t threads = std::clamp<size_t>(std::thread::hardware_concurrency() / 2, 1, 8);
+    const size_t threads = std::clamp<size_t>(Common::LowEndSim::LogicalProcessors() / 2, 1, 8);
     {
         std::vector<std::jthread> pool;
         for (size_t i = 0; i < std::min(threads, items.size()); ++i) {
@@ -6873,6 +7717,114 @@ bool PipelineCache::CheckKeptSample(const PrecompiledKept::Index& index,
                 "ms on {} threads)",
                 equal.load(), items.size(), differences.size(), file_name, ms, threads);
     return false;
+}
+
+bool PipelineCache::PreparedComputeLost(const PrecompiledKept::Index& index,
+                                        std::string& summary) {
+    // The biggest programs are the ones a dispatch waits seconds for when the driver compiles
+    // them, and a cache hit takes a few ms whatever the size (2-10 ms on NVIDIA in tester logs):
+    // the Built biggest of Sampled spread over the index. Another sample each boot (the clock
+    // is in the seed), so a pass stopped half way shows at a later boot although it built this
+    // boot's sample.
+    constexpr size_t Sampled = 48;
+    constexpr size_t Built = 6;
+    constexpr auto Miss = std::chrono::milliseconds{40};
+    const auto records = index.AllCompute();
+    const u64 seed =
+        PrecompiledKept::SampleSeed() ^
+        static_cast<u64>(std::chrono::steady_clock::now().time_since_epoch().count());
+    struct Candidate {
+        size_t position;
+        size_t words;
+    };
+    std::vector<Candidate> candidates;
+    for (const size_t position :
+         PrecompiledKept::SamplePositions(records.size(), Sampled, seed)) {
+        const PrecompiledKept::Record& record = records[position];
+        if (record.env_count != 1 || record.infos[0] == PrecompiledKept::NoBlob ||
+            record.spirv[0] == PrecompiledKept::NoBlob) {
+            continue;
+        }
+        std::vector<u32> words;
+        if (index.ReadSpirv(record.spirv[0], words)) {
+            candidates.push_back({position, words.size()});
+        }
+    }
+    std::ranges::sort(candidates, std::ranges::greater{}, &Candidate::words);
+    if (candidates.size() > Built) {
+        candidates.resize(Built);
+    }
+    // Built as CreatePrecompiledComputePipeline's pipeline is at a dispatch: the kept info (the
+    // layout and flags come from it) and SPIR-V, the program hash (BuildsUnoptimized) from the
+    // precompiled record's key. Timed around the build; -1 when it made nothing.
+    const auto build_one = [&](size_t position) -> double {
+        const PrecompiledKept::Record& record = records[position];
+        u64 offset{};
+        std::array<u8, 4> head{};
+        if (!index.RecordOffset(true, position, offset) || !index.ReadPrecompiled(offset, head) ||
+            head[0] != 1 || head[1] != 1) {
+            return -1.0;
+        }
+        ComputePipelineCacheKey key{};
+        if (!index.ReadPrecompiled(offset + 4 + sizeof(u32),
+                                   std::span(reinterpret_cast<u8*>(&key), sizeof(key))) ||
+            key.Hash() != record.key_hash) {
+            return -1.0;
+        }
+        Shader::Info info{};
+        std::vector<u32> words;
+        if (!index.ReadInfo(record.infos[0], info) || !index.ReadSpirv(record.spirv[0], words)) {
+            return -1.0;
+        }
+        try {
+            vk::ShaderModule module = BuildShader(device, words);
+            const auto begin = std::chrono::steady_clock::now();
+            ComputePipeline pipeline(device, scheduler, WarmPipelineCache(), descriptor_pool,
+                                     guest_descriptor_queue, descriptor_buffer_ring, nullptr,
+                                     nullptr, nullptr, info, std::move(module), key.unique_hash);
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - begin)
+                                  .count();
+            return pipeline.BuildFailed() ? -1.0 : ms;
+        } catch (const std::exception& exception) {
+            LOG_DEBUG(Render_Vulkan, "Prepared compute check: {:016x}: {}", key.unique_hash,
+                      exception.what());
+            return -1.0;
+        }
+    };
+    std::vector<double> times(candidates.size(), -1.0);
+    const auto begin = std::chrono::steady_clock::now();
+    {
+        // One thread each, at normal priority: the frontend holds the game while this runs.
+        std::vector<std::jthread> pool;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            pool.emplace_back([&, i] {
+                Common::SetCurrentThreadName("VkComputeCheck");
+                PlacePrecompileThread(true);
+                times[i] = build_one(candidates[i].position);
+            });
+        }
+    }
+    size_t built = 0;
+    size_t missed = 0;
+    std::string list;
+    for (const double ms : times) {
+        if (ms < 0.0) {
+            continue;
+        }
+        ++built;
+        missed += ms > static_cast<double>(Miss.count()) ? 1 : 0;
+        list += fmt::format("{}{:.0f}", list.empty() ? "" : ", ", ms);
+    }
+    summary = fmt::format("the {} biggest of {} sampled kept compute pipelines built in {} ms "
+                          "({} over {} ms, {:.0f} ms in all)",
+                          built, Sampled, list.empty() ? "-" : list, missed, Miss.count(),
+                          std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - begin)
+                              .count());
+    // Half or more of them compiled: the driver's cache does not hold the prepared compute
+    // pipelines (a hit under load stays far under Miss; one slow build alone decides nothing).
+    return built >= 2 && missed * 2 >= built;
 }
 
 std::unique_ptr<GraphicsPipeline> PipelineCache::CreatePrecompiledGraphicsPipeline(
@@ -7135,7 +8087,9 @@ ComputePipelineCacheEntry PipelineCache::CreatePrecompiledComputePipeline(
         SelfCheckSpirv(words, shader, "compute");
         device.SaveShader(words);
         precompiled_worker_builds.fetch_add(1, std::memory_order_relaxed);
-        return BuildShader(device, words);
+        vk::ShaderModule module = BuildShader(device, words);
+        NoteRuntimeComputeModule(*module, shader, true);
+        return module;
     };
     ComputePipelineCacheEntry entry{
         .pipeline = std::make_unique<ComputePipeline>(
@@ -7386,6 +8340,17 @@ void PipelineCache::QueueVulkanPipelineCacheFlush() {
     if (flush_in_flight.load(std::memory_order_acquire)) {
         return;
     }
+    if (LeanPipelineCacheSaves()) {
+        // A save reads the whole cache into new memory and then into the file cache, which pushes
+        // the game's pages out when RAM is short. Put off: the next try is an interval away, and
+        // the exit save still writes everything.
+        const u64 free_ram = Common::GetProcessMemoryUsage().available_physical;
+        const u64 wanted = u64{last_cache_size.load(std::memory_order_relaxed)} * 2 + (u64{4} << 30);
+        if (free_ram != 0 && free_ram < wanted) {
+            last_flush = now;
+            return;
+        }
+    }
     pipelines_since_flush = 0;
     last_flush = now;
     QueueVulkanPipelineCacheSave(false);
@@ -7406,7 +8371,10 @@ bool PipelineCache::VulkanPipelineCacheSaveDue(std::chrono::steady_clock::time_p
 }
 
 void PipelineCache::QueueVulkanPipelineCacheSave(bool again_if_busy) {
-    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty()) {
+    // Intel fork D12: the preparation's saves are made under vk::PipelineCacheReadLock (no build
+    // runs while the data is fetched), so they stay with FRITCHII_INTEL_PCACHE_FETCH.
+    if (!use_vulkan_pipeline_cache || vulkan_pipeline_cache_filename.empty() ||
+        (IntelFetchesCacheWhenIdle(device) && !IntelPrepAppCache(device))) {
         return;
     }
     if (flush_in_flight.exchange(true, std::memory_order_acq_rel)) {
@@ -7764,6 +8732,7 @@ void PipelineCache::TickFrame() {
     ReportAsyncDiscard();
     ReportTranslateProfile();
     ComputePipeline::ReportFastFirst();
+    ReportRuntimeComputeBuilds();
     if (PrecompiledFastMode() != 0) {
         CheckPrecompiledBuilds();
         ReportPrecompiled();
@@ -7851,10 +8820,10 @@ PipelineCache::MemoryOwnerCounts PipelineCache::MemoryOwners() {
     // The VkPipelineCache object keeps every binary built this session in memory. Its size comes
     // from the saves, and between them from a query once a minute on the serialization thread
     // (some drivers serialize the whole cache to answer it), never while a save is under way.
-    // Not where reading the cache races builds (see CanReadPipelineCacheDuringBuilds): the size
-    // then comes from the saves only.
+    // Not where reading the cache races builds (see CanReadPipelineCacheDuringBuilds), nor with
+    // FRITCHII_INTEL_PCACHE_FETCH: the size then comes from the saves only.
     if (use_vulkan_pipeline_cache && vulkan_pipeline_cache &&
-        CanReadPipelineCacheDuringBuilds(device)) {
+        CanReadPipelineCacheDuringBuilds(device) && !IntelFetchesCacheWhenIdle(device)) {
         const auto now = std::chrono::steady_clock::now();
         if (now - last_cache_size_query >= std::chrono::minutes{1} &&
             !flush_in_flight.load(std::memory_order_acquire)) {
@@ -8938,6 +9907,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
     // pipelines, transform feedback, a static rasterizer discard, and stages whose texture or
     // image counts do not fit the split rescaling bits.
     const bool use_libraries = [&] {
+        if (t_occl_flag_build) {
+            return false; // FRITCHII_OCCL_FLAG: a whole pipeline (a flag variant)
+        }
         if (!device.IsExtGraphicsPipelineLibrarySupported() || key.state.xfb_enabled != 0) {
             return false;
         }
@@ -8993,6 +9965,14 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         infos[stage_index] = &program.info;
 
         auto runtime_info{MakeRuntimeInfo(programs, key, program, previous_stage, device)};
+        if (t_occl_flag_build == OCCL_FLAG_BUILD_COLOUR &&
+            program.stage == Shader::Stage::Fragment) {
+            runtime_info.occl_flag_store = true; // FRITCHII_OCCL_FLAG: the colour flag variant
+        }
+        if (t_occl_flag_build == OCCL_FLAG_BUILD_PREPASS &&
+            program.stage == Shader::Stage::Fragment) {
+            runtime_info.occl_flag_store_at_end = true; // FRITCHII_OCCL_FLAG: the pre-pass
+        }
         if (mesh_emulation && (program.stage == Shader::Stage::Mesh ||
                                program.stage == Shader::Stage::Task)) {
             runtime_info.mesh_as_compute = true;
@@ -9104,6 +10084,15 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
         }
         previous_stage = &program;
     }
+    // FRITCHII_OCCL_FLAG: the flag variant's pixel stage is the host flag program (the guest
+    // pixel program was translated for its infos, which the variant keeps).
+    const bool occl_flag_variant =
+        (t_occl_flag_build == OCCL_FLAG_BUILD_HOST ||
+         t_occl_flag_build == OCCL_FLAG_BUILD_NOCOLOUR) &&
+        key.unique_hashes[5] != 0;
+    if (occl_flag_variant && !emit_pools && !(record && record->translate_only)) {
+        modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
+    }
     if (record) {
         record->complete = true;
         record->mesh_emulated = mesh_emulation.has_value();
@@ -9125,7 +10114,8 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 infos[stage] = &job->programs[stage + 1].info;
             }
         }
-        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries](
+        emit_stages = [this, job = std::move(job), hashes = key.unique_hashes, use_libraries,
+                       occl_flag_variant](
                           std::array<u128, Maxwell::MaxShaderStage>& stage_hashes) mutable {
             const auto begin = std::chrono::steady_clock::now();
             std::array<vk::ShaderModule, Maxwell::MaxShaderStage> stage_modules;
@@ -9143,6 +10133,9 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                         stage_binding, hashes[stage + 1], stage, job->reference_spirv[stage],
                         use_libraries ? &stage_hashes[stage] : nullptr);
                 }
+            }
+            if (occl_flag_variant) {
+                stage_modules[4] = BuildShader(device, VULKAN_OCCL_FLAG_FRAG_SPV);
             }
             auto job_pools = std::move(job->pools);
             job.reset();
@@ -9900,6 +10893,10 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
     SelfCheckSpirv(code, key.unique_hash, "compute");
     device.SaveShader(code);
     vk::ShaderModule spv_module{BuildShader(device, code)};
+    if (build_in_parallel && !warm) {
+        // A dispatch's pipeline (the run-time compute counter).
+        NoteRuntimeComputeModule(*spv_module, key.unique_hash, false);
+    }
 
     // Text log + .spv dump. Same split as the graphics path.
     const bool should_log = GPU::Logging::IsActive();
@@ -9963,6 +10960,22 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
 void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& filename,
                                                  const vk::PipelineCache& pipeline_cache,
                                                  u32 cache_version) try {
+    size_t cache_size = 0;
+    std::vector<char> cache_data;
+    if (pipeline_cache) {
+        // Size and data under one lock: no build (whose read would crash Intel's Windows driver,
+        // see CanReadPipelineCacheDuringBuilds) grows the cache between them (Intel fork).
+        const vk::PipelineCacheReadLock read_lock;
+        pipeline_cache.Read(&cache_size, nullptr);
+        // A boot that finds every pipeline in the cache counts as many builds as one that makes
+        // them, and would write the same gigabyte again.
+        if (LeanPipelineCacheSaves() &&
+            cache_size == saved_cache_size.load(std::memory_order_relaxed)) {
+            return;
+        }
+        cache_data.resize(cache_size);
+        pipeline_cache.Read(&cache_size, cache_data.data());
+    }
     // Written beside the cache and renamed over it: the emulator stopped mid-write left the cache
     // empty, and every later boot failed to read it.
     auto temporary = filename;
@@ -9977,16 +10990,6 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
     file.write(VULKAN_CACHE_MAGIC_NUMBER.data(), VULKAN_CACHE_MAGIC_NUMBER.size())
         .write(reinterpret_cast<const char*>(&cache_version), sizeof(cache_version));
 
-    size_t cache_size = 0;
-    std::vector<char> cache_data;
-    if (pipeline_cache) {
-        // Size and data under one lock: no build (whose read would crash Intel's Windows driver,
-        // see CanReadPipelineCacheDuringBuilds) grows the cache between them.
-        const vk::PipelineCacheReadLock read_lock;
-        pipeline_cache.Read(&cache_size, nullptr);
-        cache_data.resize(cache_size);
-        pipeline_cache.Read(&cache_size, cache_data.data());
-    }
     Common::NoteShutdownProgress();
     // In pieces: a cache of tens of thousands of pipelines is gigabytes, and a shutdown waiting
     // on it is told the write still moves.
@@ -10005,6 +11008,7 @@ void PipelineCache::SerializeVulkanPipelineCache(const std::filesystem::path& fi
         std::filesystem::remove(temporary, error);
         return;
     }
+    saved_cache_size.store(cache_size, std::memory_order_relaxed);
 
     LOG_INFO(Render_Vulkan, "Vulkan driver pipelines cached at: {}",
              Common::FS::PathToUTF8String(filename));
@@ -10077,7 +11081,10 @@ vk::PipelineCache PipelineCache::LoadVulkanPipelineCache(const std::filesystem::
                  "Loaded Vulkan driver pipeline cache: {}", Common::FS::PathToUTF8String(filename));
 
         try {
-            return create_pipeline_cache(cache_size, cache_data.data());
+            vk::PipelineCache loaded = create_pipeline_cache(cache_size, cache_data.data());
+            saved_cache_size.store(cache_size, std::memory_order_relaxed);
+            last_cache_size.store(cache_size, std::memory_order_relaxed);
+            return loaded;
         } catch (const vk::Exception& e) {
             // The blob came from another driver or driver version (e.g. switching between
             // MoltenVK and KosmicKrisp on macOS): the driver rejects it. Start empty instead of

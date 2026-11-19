@@ -1384,6 +1384,11 @@ private:
     static constexpr u32 LIST_DRAW_SLOTS = 1024;
     static constexpr u32 LIST_DRAW_SLOT_BYTES = 32;
     vk::Buffer list_draw_buffer;
+    /// FRITCHII_LIST_ARGS_LOCAL: the arguments stay in device memory; this host copy of their
+    /// fixed words fills them once, with the first list draw.
+    vk::Buffer list_draw_template;
+    bool list_draw_fill_pending{};
+    bool list_draw_args_local{};
     u32 list_draw_cursor{};
     bool list_draw_requested{};
     ListDrawArgs list_draw_args{};

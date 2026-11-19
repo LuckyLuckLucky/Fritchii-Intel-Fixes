@@ -90,6 +90,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
     INSERT(Settings, cpu_accuracy, tr("Accuracy:"),
            tr("Change the accuracy of the emulated CPU (for debugging only)."));
     INSERT(Settings, cpu_backend, tr("Backend:"), QString());
+    INSERT(Settings, hybrid_cpu_placement, tr("Intel P-cores:"),
+           tr("Automatic lets Windows place the GPU threads.\nApplies at the next game start."));
 
     INSERT(Settings, cpu_clock, tr("CPU Clocks"),
            tr("Raises the clock the emulated CPU reports, which removes some FPS limiters.\n"
@@ -156,8 +158,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "of a game's DLSS (AMD FSR 3.1); 0% turns it off.\nAlso sets the sharpening "
               "of the AMD FSR 1 and SGSR window adapting filters."));
     INSERT(Settings, nvidia_dlss_preset, tr("DLSS preset:"),
-           tr("The DLSS model. K is the tested default; L and M are NVIDIA's newer models, J the "
-              "older one. Default lets NVIDIA choose per quality mode."));
+           tr("The DLSS model. Automatic picks one for your card; K is the tested one, L and M "
+              "are NVIDIA's newer models, J the older one. Default lets NVIDIA choose per quality "
+              "mode. The status bar shows the model in use."));
     INSERT(Settings, nvidia_dlss, tr("Use NVIDIA DLSS in place of a game's DLSS (experimental)"),
            tr("Uses NVIDIA DLSS on GeForce RTX cards in place of a Switch 2 game's own DLSS, "
               "instead of AMD FSR 3.1.\nNeeds NVIDIA's Streamline loader, and NVIDIA DLSS unless "
@@ -178,6 +181,8 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
               "Custom uses the LOD bias you set.\nTakes effect when the game starts."));
     // Set by the picture menu's "Resolution" row (ConfigureGraphics::UpdatePictureMenu).
     INSERT(Settings, oot_upscale_output, QString(), QString());
+    // Set by the picture menu's "Resolution" row while an upscaler is on.
+    INSERT(Settings, oot_render_height, QString(), QString());
     INSERT(Settings, oot_lod_bias_custom, tr("LOD bias:"),
            tr("Lower is sharper. Too low makes textures shimmer.\nTakes effect when the game "
               "starts."));
@@ -334,6 +339,9 @@ std::unique_ptr<TranslationMap> InitializeTranslations(QObject* parent) {
            tr("Caps Ocarina of Time at 30 FPS. The game keeps its normal speed. Takes effect at "
               "once; the 60 FPS / 30 FPS button in the status bar switches it too."));
     INSERT(Settings, oot_high_refresh, QString(), QString());
+    INSERT(Settings, occlusion_speedup, tr("OoT occlusion speed-up:"),
+           tr("Lets OoT skip slow GPU checks for hidden things.\nFull skips more and can give more "
+              "fps on AMD cards.\nTakes effect when the game starts."));
     INSERT(Settings, oot_high_refresh_cap, tr("OoT: high refresh rate (experimental)"),
            tr("Lets Ocarina of Time run above 60 FPS, up to the chosen cap, at its normal speed. "
               "Untested in much of the game: timers, cutscenes or minigames may run off. Takes "
@@ -606,11 +614,17 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                           }});
     translations->insert({Settings::EnumMetadata<Settings::DlssPreset>::Index(),
                           {
+                              PAIR(DlssPreset, Auto, tr("Automatic")),
                               PAIR(DlssPreset, Default, tr("Default (NVIDIA's choice)")),
                               PAIR(DlssPreset, J, tr("J")),
                               PAIR(DlssPreset, K, tr("K (recommended)")),
                               PAIR(DlssPreset, L, tr("L")),
                               PAIR(DlssPreset, M, tr("M")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::HybridCpuPlacement>::Index(),
+                          {
+                              PAIR(HybridCpuPlacement, Automatic, tr("Automatic")),
+                              PAIR(HybridCpuPlacement, PinGpu, tr("Pin GPU to P-cores")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotMovieUpscale>::Index(),
                           {
@@ -624,6 +638,12 @@ std::unique_ptr<ComboboxTranslationMap> ComboboxEnumeration(QObject* parent) {
                               PAIR(OotAntiAliasing, NoSharpening, tr("No sharpening")),
                               PAIR(OotAntiAliasing, Fsr3, tr("AMD FSR 3.1")),
                               PAIR(OotAntiAliasing, Fsr4, tr("AMD FSR 4")),
+                          }});
+    translations->insert({Settings::EnumMetadata<Settings::OcclusionSpeedup>::Index(),
+                          {
+                              PAIR(OcclusionSpeedup, Off, tr("Off")),
+                              PAIR(OcclusionSpeedup, Standard, tr("Standard")),
+                              PAIR(OcclusionSpeedup, Full, tr("Full")),
                           }});
     translations->insert({Settings::EnumMetadata<Settings::OotRefreshCap>::Index(),
                           {

@@ -137,6 +137,11 @@ void AlphaTest(EmitContext& ctx) {
 } // Anonymous namespace
 
 void EmitPrologue(EmitContext& ctx) {
+    if (ctx.UsesOcclFlagStore() && !ctx.OcclFlagStoreAtEnd()) {
+        // FRITCHII_OCCL_FLAG: with early fragment tests this runs only for fragments that passed
+        // depth and stencil (helpers do not store): "any sample passed" for the open query.
+        ctx.OpFunctionCall(ctx.void_id, ctx.occl_flag_store_function);
+    }
     if (ctx.stage == Stage::Fragment && ctx.runtime_info.dual_source_blend) {
         // Initialize dual-source blending outputs - prevents MoltenVK crash.
         const Id zero{ctx.Const(0.0f)};
@@ -197,6 +202,12 @@ void EmitEpilogue(EmitContext& ctx) {
     }
     if (ctx.stage == Stage::Fragment) {
         AlphaTest(ctx);
+        if (ctx.OcclFlagStoreAtEnd()) {
+            // FRITCHII_OCCL_FLAG pre-pass: after the alpha test and every discard on this exit
+            // (a demoted invocation's store is dropped, a killed one never gets here), with early
+            // fragment tests: "a sample passed depth and stencil and was not discarded".
+            ctx.OpFunctionCall(ctx.void_id, ctx.occl_flag_store_function);
+        }
     }
 }
 

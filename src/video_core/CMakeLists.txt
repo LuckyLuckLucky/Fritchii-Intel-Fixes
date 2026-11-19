@@ -324,6 +324,12 @@ add_library(video_core STATIC
     renderer_vulkan/vk_side_queue.h
     renderer_vulkan/vk_state_tracker.cpp
     renderer_vulkan/vk_state_tracker.h
+    renderer_vulkan/vk_pcie_link.cpp
+    renderer_vulkan/vk_pcie_link.h
+    renderer_vulkan/vk_sim_gpu_slow.cpp
+    renderer_vulkan/vk_sim_gpu_slow.h
+    renderer_vulkan/vk_sim_link_hog.cpp
+    renderer_vulkan/vk_sim_link_hog.h
     renderer_vulkan/vk_submit_times.cpp
     renderer_vulkan/vk_submit_times.h
     renderer_vulkan/vk_swapchain.cpp
@@ -475,7 +481,8 @@ endif()
 
 # "Preparing shaders" is stamped with a hash of what decides the driver's compiled pipelines (the
 # shader recompiler, pipeline creation, the precompile step), not the release version
-# (CMakeModules/Nx2ShaderStamp.cmake): releases that change no shader skip the step.
+# (CMakeModules/Nx2ShaderStamp.cmake): releases that change no shader skip the step. A change to
+# any of these files, even a comment, makes every player prepare again: read that script first.
 file(GLOB_RECURSE NX2_SHADER_STAMP_INPUTS CONFIGURE_DEPENDS
     "${PROJECT_SOURCE_DIR}/src/shader_recompiler/*.cpp"
     "${PROJECT_SOURCE_DIR}/src/shader_recompiler/*.h"

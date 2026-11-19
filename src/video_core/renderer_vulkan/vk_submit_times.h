@@ -84,7 +84,9 @@ public:
     };
 
     static constexpr u32 Slots = 256;
-    static constexpr u32 Crumbs = 8;
+    static constexpr u32 Crumbs = 8;   ///< submissions a report lists, newest
+    static constexpr u32 History = 256; ///< submissions kept, to find the oldest unfinished
+    static constexpr u32 OldestChecked = 8; ///< from the first not reported done
 
     SlowGpu() = default;
     /// Waits for the GPU to be done with the newest stamped submission (the pool goes with this).
@@ -105,8 +107,9 @@ public:
     void End(vk::CommandBuffer cmdbuf, u64 tick, const Origin& origin);
     /// The worker, after vkQueueSubmit returned for `tick`: when it was called (NowNs).
     void Submitted(u64 tick, u64 call_ns);
-    /// Any thread (hang report, device loss): the newest submissions, what they held and whether
-    /// the GPU finished or started them. Never waits for the GPU; skips a lock held 100 ms.
+    /// Any thread (hang report, device loss): the oldest submission the GPU has not finished and
+    /// the newest submissions, what they held and whether the GPU finished or started them. Never
+    /// waits for the GPU, never reports a loss itself; skips a lock held 100 ms.
     void LogBreadcrumbs(const char* prefix, MasterSemaphore& master) const;
     /// The newest tick with stamps the GPU may still write (0: none).
     [[nodiscard]] u64 LastStampedTick() const noexcept {
@@ -134,7 +137,14 @@ private:
     void Summary(u64 now, bool verbose);
     u64 Unwrap(u64 raw);
     /// The start stamp of `slot` if it still belongs to `tick`: 1 written, 0 not yet, -1 unknown.
-    int Started(u32 slot, u64 tick) const;
+    int Started(u32 slot, u64 tick) const {
+        return StampWritten(slot, tick, 0);
+    }
+    /// The same for the end stamp.
+    int Ended(u32 slot, u64 tick) const {
+        return StampWritten(slot, tick, 1);
+    }
+    int StampWritten(u32 slot, u64 tick, u32 which) const;
 
     const Device* device{};
     MasterSemaphore* master_semaphore{}; ///< from Begin, for the destructor's wait
@@ -177,7 +187,7 @@ private:
     u32 minute_lines{};
 
     mutable std::mutex crumb_mutex;
-    std::array<Crumb, Crumbs> crumbs{};
+    std::unique_ptr<Crumb[]> crumbs{new Crumb[History]{}};
     u64 crumb_next{};     ///< crumbs written (under crumb_mutex)
 };
 

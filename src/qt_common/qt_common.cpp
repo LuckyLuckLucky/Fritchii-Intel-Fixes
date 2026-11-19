@@ -13,6 +13,7 @@
 #include "common/fs/fs.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "common/lowend_sim.h"
 #ifdef _WIN32
 #include "common/windows/crash_handler.h"
 #endif
@@ -287,6 +288,7 @@ void Init(QWidget* root) {
     }
 #endif
     LOG_INFO(Frontend, "Host CPU Threads: {}", processor_count);
+    Common::LowEndSim::LogProcessLimits();
     LOG_INFO(Frontend, "Host OS: {}", PrettyProductName().toStdString());
     LOG_INFO(Frontend, "Host RAM: {:.2f} GiB",
              Common::GetMemInfo().TotalPhysicalMemory / f64{1_GiB});

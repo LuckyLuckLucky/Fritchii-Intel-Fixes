@@ -1293,6 +1293,8 @@ if (ARCHITECTURE_x86_64 OR ARCHITECTURE_arm64 OR ARCHITECTURE_riscv64 OR ARCHITE
         arm/dynarmic/arm_dynarmic_64.h
         arm/dynarmic/arm_dynarmic_32.cpp
         arm/dynarmic/arm_dynarmic_32.h
+        arm/dynarmic/host_routines.cpp
+        arm/dynarmic/host_routines.h
         arm/dynarmic/dynarmic_cp15.cpp
         arm/dynarmic/dynarmic_cp15.h
         arm/dynarmic/dynarmic_exclusive_monitor.cpp

@@ -7,6 +7,7 @@
 #include <cstdlib>
 
 #include "common/logging.h"
+#include "common/lowend_sim.h"
 #include "video_core/nx2_debug_control.h"
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -60,6 +61,7 @@ s64 NowNs() {
 }
 
 void Pause() {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     _mm_pause();
 #elif defined(__aarch64__)

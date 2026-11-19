@@ -26,6 +26,17 @@ void GuaranteeStackForCrashReport();
 /// suspends the other threads for the write). At most three a process. Returns what to log.
 std::string WriteHangDump(const std::filesystem::path& directory);
 
+/// A fatal error the process ends itself for (the GPU driver lost the Vulkan device), where the
+/// exception route is not taken: logs one Critical "Host crash" line with the calling thread's
+/// stack, and has a helper process write <dump_directory>/eden_crash.dmp. From another process no
+/// lock held by a stopped thread here can block the dump. Waits for the helper for at most 20 s,
+/// and the helper ends this process itself if the dump gets stuck, so this can't hang.
+void ReportFatalError(const char* what);
+
+/// main(), before anything else: true in the helper process ReportFatalError starts, which has
+/// then done its work (return `exit_code` from main).
+[[nodiscard]] bool RunDumpHelper(int& exit_code);
+
 /// The hang report's and the shutdown watch's thread list: one line per stack, threads with the
 /// same stack on one line ("2 threads [name id (CPU ms), ...]: module+offset < caller ..."),
 /// x64 frames as module+offset (resolve them with the build's PDB, e.g. llvm-symbolizer). Each

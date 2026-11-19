@@ -20,6 +20,7 @@
 #include "video_core/renderer_vulkan/vk_present_manager.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_swapchain.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_surface.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -264,7 +265,9 @@ Frame* PresentManager::GetRenderFrame() {
     }
 
     // Wait for the presentation to be finished so all frame resources are free
-    frame->present_done.Wait();
+    if (frame->present_done.Wait() == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
     frame->present_done.Reset();
 
     return frame;
@@ -664,7 +667,20 @@ void PresentManager::DiscardFrame(Frame* frame) {
     };
 
     std::scoped_lock submit_lock{scheduler.submit_mutex};
-    void(device.GetGraphicsQueue().Submit(submit_info, *frame->present_done));
+    const VkResult result = device.GetGraphicsQueue().Submit(submit_info, *frame->present_done);
+    if (result == VK_SUCCESS) {
+        return;
+    }
+    if (result == VK_ERROR_DEVICE_LOST) {
+        device.ReportLoss();
+    }
+    // Nothing will signal the fence now, and the next use of this frame waits on it for good.
+    LOG_ERROR(Render_Vulkan, "Discarding a frame failed ({})", string_VkResult(result));
+    frame->present_done = device.GetLogical().CreateFence({
+        .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+        .pNext = nullptr,
+        .flags = VK_FENCE_CREATE_SIGNALED_BIT,
+    });
 }
 
 void PresentManager::CopyToSwapchain(Frame* frame) {

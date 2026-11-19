@@ -149,7 +149,8 @@ ENUM(ResolutionSetup, Res1_4X, Res1_2X, Res3_4X, Res1X, Res5_4X, Res3_2X, Res2X,
 ENUM(ScalingFilter, NearestNeighbor, Bilinear, Bicubic, Gaussian, Lanczos, ScaleForce, Fsr, Area, ZeroTangent, BSpline, Mitchell, Spline1, Mmpx, Sgsr, SgsrEdge, Fsr3, Auto);
 ENUM(AntiAliasing, None, Fxaa, Smaa);
 ENUM(OotAntiAliasing, Game, NoSharpening, Fsr3, Fsr4);
-ENUM(DlssPreset, Default, J, K, L, M);
+// New values go last: the number is what config files store.
+ENUM(DlssPreset, Default, J, K, L, M, E, Auto);
 ENUM(NvidiaDlssQuality, Automatic, Native, Quality, Balanced, Performance, UltraPerformance);
 ENUM(AspectRatio, R16_9, R4_3, R21_9, R16_10, Stretch);
 ENUM(ConsoleMode, Handheld, Docked);
@@ -167,9 +168,14 @@ ENUM(SpeedMode, Standard, Turbo, Slow);
 ENUM(MeshShaderMode, Automatic, Native, Compute);
 // Ocarina of Time's movies: the game's own upscaler, or a bilinear copy (Settings oot_movie_upscale).
 ENUM(OotMovieUpscale, Automatic, Bilinear, Game);
+// Intel CPUs with P- and E-cores: where the GPU emulation threads run (hybrid_cpu_placement).
+ENUM(HybridCpuPlacement, Automatic, PinGpu);
 // Ocarina of Time's frame rate cap with its high refresh rate mode on (Settings oot_high_refresh).
 // New values go at the end: saved configs store the index.
 ENUM(OotRefreshCap, Display, Hz90, Hz120, Hz144, Hz165, Unlimited);
+// Occlusion tests without host queries in Ocarina of Time (Settings occlusion_speedup,
+// FRITCHII_OCCL_FLAG). New values go at the end: saved configs store the index.
+ENUM(OcclusionSpeedup, Off, Standard, Full);
 // Ocarina of Time's texture LOD bias while DLSS or FSR upscales (Settings oot_texture_sharpness).
 ENUM(OotTextureSharpness, Auto, Sharper, Custom);
 

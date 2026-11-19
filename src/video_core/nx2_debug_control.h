@@ -144,6 +144,13 @@ inline std::atomic<int> g_report_wait{-1};
 /// its pipeline without the pixel program when that program can change nothing else (1 on,
 /// 2 verify: siblings made and compared, the full pipeline draws, 3 dry: census and timer only).
 inline std::atomic<int> g_occl_lean{-1};
+/// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h; set at each boot from a switch or the Occlusion
+/// speed-up setting): occlusion test draws store a flag instead of running a host query
+/// (2 verify: compared with the host queries, which still decide).
+inline std::atomic<int> g_occl_flag{-1};
+/// FRITCHII_TEST_DEVICE_LOSS (live, TEST, default 0): 1 = the next queue submission reports a
+/// device loss, so the report and the exit can be tested (docs/fritchii/switches.md).
+inline std::atomic<int> g_test_device_loss{0};
 /// EDEN_NX2_FEED_MEMORY_OVERLAY: docs/fritchii/switches.md.
 inline std::atomic<int> g_feed_memory_overlay{-1};
 /// FRITCHII_FEED_REARM: docs/fritchii/switches.md.
@@ -240,6 +247,8 @@ inline std::atomic<int> g_ram_prebuilt_keep{-1};
 inline std::atomic<int> g_depth_pool_retry{-1};
 /// FRITCHII_VRAM_POOL_FIT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vram_pool_fit{-1};
+/// FRITCHII_VRAM_POOL_FLOOR: docs/fritchii/switches.md (0 off, 1 on).
+inline std::atomic<int> g_vram_pool_floor{-1};
 /// FRITCHII_VRAM_CRITICAL_FIT: docs/fritchii/switches.md.
 inline std::atomic<int> g_vram_critical_fit{-1};
 /// FRITCHII_VRAM_REPORT: docs/fritchii/switches.md.
@@ -279,6 +288,8 @@ inline std::atomic<int> g_vram_budget_mode{-1};
 inline std::atomic<int> g_vram_headroom_mib{-1};
 /// FRITCHII_TC_CRITICAL_ENFORCE: docs/fritchii/switches.md.
 inline std::atomic<int> g_tc_critical_enforce{-1};
+/// FRITCHII_TC_THRASH_GUARD: docs/fritchii/switches.md (0 off, 1 on, 2 counts only).
+inline std::atomic<int> g_tc_thrash_guard{-1};
 /// FRITCHII_VRAM_OWNERS: docs/fritchii/switches.md (seconds between lines, 0 = off).
 inline std::atomic<int> g_vram_owners{-1};
 /// FRITCHII_VRAM_PACK: docs/fritchii/switches.md (0 off, 1 on, 2 auto = with the small card).
@@ -357,6 +368,8 @@ inline std::atomic<int> g_unswizzle_in_place{-1};
 inline std::atomic<int> g_keep_blocks{-1};
 /// FRITCHII_STAGING_RING (boot size, live use, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_staging_ring{-1};
+/// FRITCHII_LINK_STATS (live, default 0): docs/fritchii/switches.md.
+inline std::atomic<int> g_link_stats{-1};
 /// FRITCHII_ZERO_UPLOAD (live, default 0): docs/fritchii/switches.md.
 inline std::atomic<int> g_zero_upload{-1};
 /// FRITCHII_HOSTTIMING_SPIN_BUDGET (live, percent, default 0): docs/fritchii/switches.md.

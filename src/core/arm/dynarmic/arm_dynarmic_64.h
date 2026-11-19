@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include "common/container/unordered_map.h"
 
 #include <dynarmic/interface/A64/a64.h>
@@ -14,6 +15,7 @@
 #include "common/common_types.h"
 #include "common/hash.h"
 #include "core/arm/arm_interface.h"
+#include "core/arm/dynarmic/host_routines.h"
 #include "core/arm/dynarmic/dynarmic_exclusive_monitor.h"
 #include "dynarmic/interface/A64/config.h"
 
@@ -60,6 +62,11 @@ public:
     u64 GetTicksRemaining() override;
     u64 GetCNTPCT() override;
     bool CheckMemoryAccess(u64 addr, u64 size, Kernel::DebugWatchpointType type);
+    /// Fritchii host routines (host_routines.h): the hooked entries of this process, worked out
+    /// once (the first code read or breakpoint of any thread using these callbacks).
+    const HostRoutines::Sites& HostSites();
+    /// The word to compile at vaddr: `instruction`, or a host routine's BRK.
+    u32 HostCode(u64 vaddr, u32 instruction);
     void ReturnException(u64 pc, Dynarmic::HaltReason hr);
 
     Dynarmic::CodePage cached_code_page;
@@ -80,6 +87,8 @@ public:
     u64 m_spin_ticks{32}; ///< Reads closer than this (~1.7 us) count as a polling loop
     Kernel::KProcess* m_process{};
     std::shared_ptr<WindowTrace::Session> m_window_trace;
+    std::once_flag m_host_sites_once;
+    HostRoutines::Sites m_host_sites{};
     const bool m_debugger_enabled{};
     const bool m_check_memory_access{};
     static constexpr u64 MinimumRunCycles = 10000U;

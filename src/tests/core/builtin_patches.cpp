@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -204,6 +205,14 @@ constexpr u32 WaterCall = 0x94EFFE4A;   // bl 0x3c46f20
 // Ocarina's main as the high refresh rate tests need it: the water renderer's fcvtzs and mul (the
 // ripple hook's and nop's originals), a BSS that holds the routine's state, and zero bytes from
 // Dark's routine to the end of its page.
+void SetTestEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
+
 std::vector<u8> MakeOcarinaMain() {
     constexpr size_t Code = sizeof(Loader::NSOHeader);
     auto nso = MakeMain(OcarinaBuildId, NopInstruction);
@@ -758,6 +767,13 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Hook{0x2AB804, 0x1E270100, 0x14E66C23}, // -> b 0x3c46890
         Hook{0x2C207A4, 0xBD466D00, 0x14409853}, // -> b 0x3c468f0
         Hook{0x2C2208C, 0xBD466D02, 0x14409231}, // -> b 0x3c46950
+        Hook{0x3CDFC0, 0x1E380008, 0x14E1E27C}, // time of day cut -> b 0x3c469b0
+        Hook{0x632D00, 0x1E380016, 0x14D84F31}, // Deku Tree web cut -> b 0x3c469c4
+        Hook{0x38AEBF4, 0x1E380001, 0x940E5FAE}, // solver steps -> bl 0x3c46aac
+        Hook{0x38AFD20, 0x1E380001, 0x940E5B63}, // solver steps -> bl 0x3c46aac
+        Hook{0x2C3AE20, 0x54000145, 0x14402F64}, // Epona's jump b.pl -> b 0x3c46bb0
+        Hook{0x3292C88, 0x36000060, 0x1426CF56}, // song notes, playback -> b 0x3c469e0
+        Hook{0x3292ED4, 0x36000B80, 0x1793B124}, // song notes, the other playback -> b 0x177f364
     };
     // Each stub's first and last word.
     struct Stub {
@@ -768,7 +784,7 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
     };
     constexpr std::array Stubs{
         Stub{0x3C463A0, 0x88, 0xA9BF47F0, 0xD65F03C0}, // sound gate: stp x16, x17 ... ret
-        Stub{0x3C46430, 0x38, 0xBD401100, 0x171F3BB5}, // sound feed: ldr s0 ... b 0x415338
+        Stub{0x3C46430, 0x38, 0xBD401100, 0x176CE450}, // sound feed: ldr s0 ... b 0x177f5a4 (run count)
         Stub{0x3C46470, 0x88, 0xADBF07E0, 0xD65F03C0}, // step ticks: stp q0, q1 ... ret
         Stub{0x3C46500, 0x50, 0xA9BF47F0, 0x17D933B2}, // playback ... b 0x3293414
         Stub{0x3C46550, 0x60, 0xA9BF47F0, 0x17CC3330}, // countdown ... b 0x2f5326c
@@ -784,6 +800,27 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         Stub{0x3C46890, 0x5C, 0xA9BF47F0, 0x171993C8}, // cloth b ... b 0x2ab808
         Stub{0x3C468F0, 0x5C, 0xA9BF47F0, 0x17BF6798}, // cloth c ... b 0x2c207a8
         Stub{0x3C46950, 0x5C, 0xA9BF47F0, 0x17BF6DBA}, // cloth d ... b 0x2c22090
+        Stub{0x3C469B0, 0x14, 0x9100F26D, 0x171E1D81}, // time of day: add x13 ... b 0x3cdfc4
+        Stub{0x3C469C4, 0x14, 0x9123E26D, 0x1727B0CC}, // Deku Tree web: add x13 ... b 0x632d04
+        Stub{0x3C469D8, 0x8, 0x3A83126F, 0x3DCCCCCD},  // the solver's constants
+        Stub{0x3C469E0, 0x1C, 0xA9BF47F0, 0x17D930A7}, // song notes a ... b 0x3292c94
+        Stub{0x3C46AAC, 0x50, 0x1E380001, 0xD65F03C0}, // solver: fcvtzs w1, s0 ... ret
+        Stub{0x3C46BB0, 0x44, 0x54000205, 0x17BFD096}, // Epona: b.pl ... b 0x2c3ae48
+        Stub{0x3C46E8C, 0x84, 0x1E38000C, 0xD65F03C0}, // whole units: fcvtzs w12, s0 ... ret
+        Stub{0x3C46FB4, 0x48, 0xA9BF3FEE, 0xD65F03C0}, // song cue: stp x14, x15 ... ret
+        Stub{0x177F364, 0x1C, 0xA9BF47F0, 0x146C4F32}, // song notes b ... b 0x3293044
+        Stub{0x177F5A4, 0x1C, 0xA9BF47F0, 0x17B2575F}, // sound job runs ... b 0x415338
+    };
+    // The hooks a test switch can leave out, one at a time.
+    struct Switched {
+        const char* env;
+        size_t offset;
+        u32 original;
+    };
+    constexpr std::array SwitchedHooks{
+        Switched{"FRITCHII_NO_HR_TIME", 0x3CDFC0, 0x1E380008},
+        Switched{"FRITCHII_NO_HR_WEB", 0x632D00, 0x1E380016},
+        Switched{"FRITCHII_NO_HR_HORSE", 0x2C3AE20, 0x54000145},
     };
     constexpr u32 GateCallWord = 0xB94CC610; // ldr w16, [x16, #0xcc4] (the frame step's call)
     const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
@@ -822,6 +859,39 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
         REQUIRE(applied(context.Manager().PatchNSO(nso, "main")));
     }
 
+    SECTION("A site's test switch leaves only its hook out") {
+        for (const Switched& site : SwitchedHooks) {
+            SetTestEnv(site.env, "1");
+            const auto patched = context.Manager().PatchNSO(nso, "main");
+            SetTestEnv(site.env, "");
+            REQUIRE(word_at(patched, Code + site.offset) == site.original);
+            for (const Hook& hook : Hooks) {
+                if (hook.offset != site.offset) {
+                    REQUIRE(word_at(patched, Code + hook.offset) == hook.branch);
+                }
+            }
+            for (const Stub& stub : Stubs) {
+                REQUIRE(word_at(patched, Code + stub.offset) == stub.first);
+            }
+        }
+    }
+
+    SECTION("Cloth below 60 fps: on by default, its switch puts the two old words back") {
+        constexpr std::array ClothStubs{0x3C46830, 0x3C46890, 0x3C468F0, 0x3C46950};
+        const auto on = context.Manager().PatchNSO(nso, "main");
+        SetTestEnv("FRITCHII_NO_CLOTH_SLOW", "1");
+        const auto off = context.Manager().PatchNSO(nso, "main");
+        SetTestEnv("FRITCHII_NO_CLOTH_SLOW", "");
+        REQUIRE(applied(on));
+        REQUIRE(applied(off));
+        for (const size_t stub : ClothStubs) {
+            REQUIRE(word_at(on, Code + stub + 0x1C) == NopInstruction);
+            REQUIRE(word_at(on, Code + stub + 0x34) == 0x72A7B110);  // movk w16, #0x3d88, lsl #16
+            REQUIRE(word_at(off, Code + stub + 0x1C) == 0x540001C1); // b.ne +0x38
+            REQUIRE(word_at(off, Code + stub + 0x34) == 0x72A79110); // movk w16, #0x3c88, lsl #16
+        }
+    }
+
     SECTION("Another word at a hook, a stub word in use, or off in Add-Ons: skipped whole") {
         SECTION("first hook") {
             std::memcpy(nso.data() + Code + Hooks.front().offset, &NopInstruction, sizeof(u32));
@@ -844,6 +914,41 @@ TEST_CASE("High refresh fixes built-in hooks its sites in both modes", "[patch_m
             REQUIRE(word_at(patched, Code + hook.offset) == word_at(nso, Code + hook.offset));
         }
         REQUIRE(word_at(patched, Code + Stubs.front().offset) == 0);
+    }
+}
+
+TEST_CASE("Texture heap tidy-up built-in gaps the compaction asks", "[patch_manager]") {
+    constexpr size_t Code = sizeof(Loader::NSOHeader);
+    constexpr size_t Hook = Code + 0x777278;
+    constexpr size_t Stub = Code + 0x3C46DD0;
+    constexpr u32 Tbz = 0x36080088;    // tbz w8, #1, 0x777288
+    constexpr u32 Branch = 0x14D33ED6; // b 0x3c46dd0
+    const auto word_at = [](const std::vector<u8>& nso, size_t offset) {
+        u32 word;
+        std::memcpy(&word, nso.data() + offset, sizeof(word));
+        return word;
+    };
+    PatchManagerTestContext context;
+    auto nso = MakeOcarinaMain();
+    std::memcpy(nso.data() + Hook, &Tbz, sizeof(Tbz));
+
+    SECTION("Applied: the hook, the stub from its tbz to its way back") {
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        REQUIRE(word_at(patched, Hook) == Branch);
+        REQUIRE(word_at(patched, Stub) == 0x36080168);        // tbz w8, #1, skip
+        REQUIRE(word_at(patched, Stub + 0x2C) == 0x172CC123); // b 0x777288
+    }
+    SECTION("Its switch, or another word at the hook: the game's ask at every frame") {
+        SECTION("switch") {
+            SetTestEnv("FRITCHII_NO_TEX_COMPACT_GAP", "1");
+        }
+        SECTION("hook") {
+            std::memcpy(nso.data() + Hook, &NopInstruction, sizeof(u32));
+        }
+        const auto patched = context.Manager().PatchNSO(nso, "main");
+        SetTestEnv("FRITCHII_NO_TEX_COMPACT_GAP", "");
+        REQUIRE(word_at(patched, Hook) == word_at(nso, Hook));
+        REQUIRE(word_at(patched, Stub) == 0);
     }
 }
 

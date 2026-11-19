@@ -18,6 +18,7 @@
 
 #include <fmt/format.h>
 
+#include "common/lowend_sim.h"
 #include "common/cityhash.h"
 #include "common/fs/fs_util.h"
 #include "common/fs/path_util.h"
@@ -523,7 +524,7 @@ Result BuildWarmFilesWith(Core::System& system, const fs::path& game_path, u64 t
     const size_t threads =
         options.threads != 0
             ? options.threads
-            : std::clamp<size_t>(std::thread::hardware_concurrency() / 4, 2, 6);
+            : std::clamp<size_t>(Common::LowEndSim::LogicalProcessors() / 4, 2, 6);
     auto converter = std::make_unique<Converter>(threads, stop);
 
     // Consumes finished conversions in submission order (first program wins on equal keys).

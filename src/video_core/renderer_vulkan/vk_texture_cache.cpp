@@ -55,6 +55,7 @@
 #include "video_core/texture_cache/samples_helper.h"
 #include "video_core/texture_cache/util.h"
 #include "video_core/dlss_contract.h"
+#include "video_core/vulkan_common/vk_enum_string_helper.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #ifdef EGLANTINE_STREAMLINE
 #include "video_core/vulkan_common/streamline.h"
@@ -3235,6 +3236,7 @@ void TextureCacheRuntime::UpdatePoolFitCap() {
     const u64 budget = device.GetDeviceMemoryBudget();
     if (budget == 0) {
         pool_fit_cap = ~u64{0};
+        pool_floor_bytes = 0;
         return;
     }
     // What the driver counts: the live usage (pool included) plus the kept blocks and the unused
@@ -3245,6 +3247,16 @@ void TextureCacheRuntime::UpdatePoolFitCap() {
     const u64 margin = (std::min)(budget / 8, u64{1} << 30);
     const u64 ceiling = budget - (std::min)(budget, margin);
     pool_fit_cap = ceiling > others ? ceiling - others : 0;
+    // FRITCHII_VRAM_POOL_FLOOR (live, default 1, 0 off): past the budget the fit gave 0, for as
+    // long as the card stayed over. Castle Town on a simulated 4 GB card: every render target
+    // given to the pool was destroyed on the spot and none taken (0 taken, 2,800-5,400 missed,
+    // 640-2,400 given and evicted per 600 frames; 16 GB card: ~640 taken, 20-50 missed). The
+    // targets of a frame come back within a few frames, so a small pool of them costs little more
+    // than the images in flight would. 1/24 of the budget, 64 to 192 MiB, each waiting 16 frames.
+    pool_floor_bytes = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_floor,
+                                                        "FRITCHII_VRAM_POOL_FLOOR", 1) > 0
+                           ? std::clamp(budget / 24, u64{64} << 20, u64{192} << 20)
+                           : 0;
     pool_fit_budget = budget;
     pool_fit_others = others;
     pool_fit_lowest = (std::min)(pool_fit_lowest, pool_fit_cap);
@@ -3564,8 +3576,8 @@ void TextureCacheRuntime::TickFrame() {
         // switch is off or device memory ran short (an image did not fit or could not be made).
         const u32 pressure = memory_allocator.MemoryPressureEvents();
         const u32 failed = memory_allocator.FailedImages();
-        const bool short_of_memory =
-            pressure != image_pool_seen_pressure || failed != image_pool_seen_failed;
+        const bool image_failed = failed != image_pool_seen_failed;
+        const bool short_of_memory = pressure != image_pool_seen_pressure || image_failed;
         image_pool_seen_pressure = pressure;
         image_pool_seen_failed = failed;
         // FRITCHII_KEEP_BLOCKS: kept blocks go before any pooled image, then one is trimmed a
@@ -3583,6 +3595,7 @@ void TextureCacheRuntime::TickFrame() {
             VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_vram_pool_fit,
                                              "FRITCHII_VRAM_POOL_FIT") == 0) {
             pool_fit_cap = ~u64{0};
+            pool_floor_bytes = 0;
             pool_fit_frames = 0;
         } else if (pool_fit_frames++ % 30 == 0) {
             UpdatePoolFitCap();
@@ -3601,13 +3614,28 @@ void TextureCacheRuntime::TickFrame() {
         SampleVramReport();
         TickVramTrim();
         const int pool_switch = VideoCore::Nx2Debug::Experiment(42);
-        if (pool_switch == 0 || short_of_memory) {
+        // FRITCHII_VRAM_POOL_FLOOR: an image refused by the budget halves the pool, one that could
+        // not be made at all empties it. On a card that stays over budget refusals keep coming,
+        // and emptying the pool at each one is the flush the floor is there to stop.
+        if (pool_switch == 0 || image_failed || (short_of_memory && pool_floor_bytes == 0)) {
             TrimImagePool(0);
             if (ghost_pools) [[unlikely]] {
                 ghost_pools->Clear();
             }
+        } else if (short_of_memory) {
+            TrimImagePool(FittedPoolCap() / 2);
         } else {
             TrimImagePool(FittedPoolCap()); // a lowered EXP66 applies at once
+        }
+        // Only the floor keeps these: what is not taken back soon goes.
+        if (pool_floor_bytes != 0 && pool_fit_cap < pool_floor_bytes) {
+            while (!image_pool.empty() &&
+                   image_pool_frame - image_pool.front().frame > ImagePoolFloorFrames) {
+                image_pool_bytes -= image_pool.front().bytes;
+                DropPooledImage(std::move(image_pool.front().image), image_pool.front().bytes);
+                image_pool.pop_front();
+                ++image_pool_evicted;
+            }
         }
         // EDEN_NX2_EXP82 (live, frames, 0 = off; fable52_answer_after7778 1): proven entries (a
         // shape taken from the pool before) stay this many frames instead of ImagePoolMaxFrames.
@@ -5584,14 +5612,15 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             LOG_INFO(Render_Vulkan, "Ocarina texture LOD bias 0 (FSR 4 without camera jitter)");
         } else {
             // From the sizes, docked (handheld drops the bias). Max Resolution: the scene is
-            // 1440p tall, or what the DLSS render scale made it, and the output 4K. Without it
+            // 1440p tall, or what oot_render_height made it, and the output 4K (or the picked
+            // output; one below 1440p from a lowered scene is made at its own size). Without it
             // the game's dynamic scene (1080p at most) goes to 1440p. DLAA (the quality when the
             // game started) keeps the scene's size. FRITCHII_DLSS_SCALED: the scaled scene, and
             // a scene above the output is upscaled to its own size (supersampling).
             const bool max_resolution = Settings::OcarinaMaxResolutionOn();
             u32 render_height =
                 max_resolution
-                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale())
+                    ? Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderHeight())
                     : 1080;
             const auto& resolution = Settings::values.resolution_info;
             if (VideoCommon::OcarinaScaledUpscale() && resolution.active) {
@@ -5605,11 +5634,12 @@ f32 TextureCacheRuntime::OcarinaFsrLodBias() {
             // FRITCHII_FSR_OUTPUT; 1440p without Max Resolution), the scene's size for 1x AA.
             const auto plan = VideoCommon::PlanOcarinaPassOutput(
                 OcarinaUpscaleOutput(device).height, max_resolution,
-                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderScale()), dlaa,
+                Settings::OcarinaRenderHeightFor(Settings::AppliedOcarinaRenderHeight()), dlaa,
                 OcarinaFsrOutputsGameSize(backend));
             const u32 output_height =
-                plan.native_aa
-                    ? render_height
+                plan.native_aa ? render_height
+                : plan.small_height != 0
+                    ? plan.small_height
                     : std::max(render_height, plan.big_height != 0 ? plan.big_height : 1440U);
             const bool dlss_jitter =
                 VideoCommon::OcarinaDlssJitterOn(Settings::values.oot_dlss_jitter.GetValue());
@@ -5692,6 +5722,7 @@ Sampler::Sampler(TextureCacheRuntime& runtime, const Tegra::Texture::TSCEntry& t
     // size's mips; the bias keeps the output's detail (VideoCommon::OcarinaFsrLodBias).
     f32 lod_bias = tsc.LodBias();
     ocarina_fsr_failed = &runtime.ocarina_fsr_failed;
+    spare_sampler = &runtime.spare_sampler;
     if (const f32 fsr_lod_bias = runtime.OcarinaFsrLodBias();
         fsr_lod_bias != 0.0f && tsc.mipmap_filter != TextureMipmapFilter::None) {
         const f32 biased = std::clamp(lod_bias + fsr_lod_bias, -15.0f, 15.0f);
@@ -5755,7 +5786,7 @@ VkSampler Sampler::Find(const VariantKey& key) const noexcept {
     if (it == variants.end()) {
         return VK_NULL_HANDLE;
     }
-    return *it->sampler;
+    return it->Get();
 }
 
 VkSampler Sampler::Emplace(VariantKey key) {
@@ -5826,11 +5857,42 @@ VkSampler Sampler::Emplace(VariantKey key) {
     if (!custom_border) {
         create_info.borderColor = ConvertBorderColor(color);
     }
-    variants.push_back(Variant{
-        .key = key,
-        .sampler = device_ptr->GetLogical().CreateSampler(create_info),
-    });
-    return *variants.back().sampler;
+    // Drivers limit how many samplers exist (maxSamplerAllocationCount: about 4,000 on NVIDIA) and
+    // the cache keeps every one. Past that a sampler that is close enough beats ending the game:
+    // this sampler's first variant, or else the first sampler made (linear filtering).
+    Variant variant{.key = key};
+    try {
+        // FRITCHII_TEST_SAMPLER_LIMIT=<n> (boot, TEST): the driver refuses samplers after n.
+        static const u32 test_limit = [] {
+            const char* const value = std::getenv("FRITCHII_TEST_SAMPLER_LIMIT");
+            return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+        }();
+        static std::atomic<u32> made{0};
+        if (test_limit != 0 && made.fetch_add(1, std::memory_order_relaxed) >= test_limit) {
+            throw vk::Exception(VK_ERROR_TOO_MANY_OBJECTS);
+        }
+        variant.sampler = device_ptr->GetLogical().CreateSampler(create_info);
+        VkSampler none = VK_NULL_HANDLE;
+        spare_sampler->compare_exchange_strong(none, *variant.sampler, std::memory_order_relaxed);
+    } catch (const vk::Exception& exception) {
+        const VkResult result = exception.GetResult();
+        variant.borrowed =
+            !variants.empty() ? variants.front().Get() : spare_sampler->load(std::memory_order_relaxed);
+        if ((result != VK_ERROR_TOO_MANY_OBJECTS && result != VK_ERROR_OUT_OF_HOST_MEMORY &&
+             result != VK_ERROR_OUT_OF_DEVICE_MEMORY) ||
+            variant.borrowed == VK_NULL_HANDLE) {
+            throw;
+        }
+        static std::atomic<u32> told{0};
+        if (told.fetch_add(1, std::memory_order_relaxed) < 8) {
+            LOG_ERROR(Render_Vulkan,
+                      "The driver refused a sampler ({}, its limit is {}): using another one",
+                      string_VkResult(result),
+                      device_ptr->GetMaxSamplerAllocationCount());
+        }
+    }
+    variants.push_back(std::move(variant));
+    return variants.back().Get();
 }
 
 VkSampler Sampler::HandleFor(const ImageView& image_view, bool is_depth) {

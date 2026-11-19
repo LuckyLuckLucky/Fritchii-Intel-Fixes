@@ -2713,6 +2713,10 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
     bool configured;
     {
         Profile::Scope scope{Profile::Zone::ConfigureDraw};
+        if (occl_flag_parent != nullptr) [[unlikely]] {
+            occl_prepass_rescaling = rescaling.Data(); // FRITCHII_OCCL_FLAG pre-pass
+            occl_prepass_render_area = render_area;
+        }
         configured = ConfigureDraw(rescaling, render_area);
     }
     if (step_trace) [[unlikely]] {
@@ -2734,6 +2738,12 @@ bool GraphicsPipeline::ConfigureImpl(bool is_indexed) {
         }
     }
     return configured;
+}
+
+bool GraphicsPipeline::ConfigureAfterOcclPrepass(const GraphicsPipeline& variant) {
+    RescalingPushConstant rescaling;
+    rescaling.Assign(variant.occl_prepass_rescaling);
+    return ConfigureDraw(rescaling, variant.occl_prepass_render_area);
 }
 
 bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,

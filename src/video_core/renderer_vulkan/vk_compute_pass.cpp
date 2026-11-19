@@ -31,6 +31,7 @@
 #include "video_core/renderer_vulkan/vertex_repack.h"
 #include "video_core/surface.h"
 #include "video_core/renderer_vulkan/vk_descriptor_pool.h"
+#include "video_core/renderer_vulkan/vk_mem_stage_hook.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -850,6 +851,26 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
         return value == nullptr || value[0] != '0';
     }();
     if (!target.wait) {
+        return;
+    }
+    // FRITCHII_ASTC_HELD_DEFER (boot, default 0; helper BG's fix, ported by helper FJ): inside a
+    // held draw fill (EXP123 >= 2: the texture work sits between the fill and its PlayRest) this
+    // submit splits the packet across two command buffers (Memory seam 5.5). An RX 7900 XT and an
+    // RX 9070 XT lost the device 10-15 ms after such submits at the title (2026-11-16), which is
+    // why EXP123 is held to 1 on AMD's driver and the one follower posts nothing there. 1 = the
+    // decode and its barrier stay in this command buffer, ahead of the draw on the same queue, and
+    // the next flush submits them.
+    static const bool held_defer = [] {
+        const char* value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
+        return value != nullptr && value[0] == '1';
+    }();
+    if (held_defer && SeamHook::Holding()) [[unlikely]] {
+        static std::atomic<u32> held_skips{};
+        if (held_skips.fetch_add(1, std::memory_order_relaxed) == 0) {
+            LOG_INFO(Render_Vulkan, "ASTC GPU decode inside a held draw fill: submit left to the "
+                                    "next flush (FRITCHII_ASTC_HELD_DEFER=1)");
+        }
+        (void)scheduler.DeferFlushUntilWanted(); // off the back thread: the next flush takes it
         return;
     }
     const auto start = std::chrono::steady_clock::now();

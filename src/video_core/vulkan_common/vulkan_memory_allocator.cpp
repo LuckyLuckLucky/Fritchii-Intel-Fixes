@@ -1445,6 +1445,23 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (min_alignment <= 1) {
         return CreateBuffer(ci, usage);
     }
+    return CreateAlignedBuffer(ci, usage, min_alignment, true);
+}
+
+vk::Buffer MemoryAllocator::CreateBufferOverBudget(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                                   VkDeviceSize min_alignment) const {
+    static std::atomic<u32> logged{};
+    if (logged.fetch_add(1, std::memory_order_relaxed) < RefusalDetailEvents) {
+        LOG_WARNING(Render_Vulkan, "Buffer of {} KiB (usage {}) goes over the memory budget; {}",
+                    ci.size >> 10, static_cast<u32>(usage), HeapBudgetsText(allocator));
+    }
+    return CreateAlignedBuffer(ci, usage, min_alignment > 1 ? min_alignment : VkDeviceSize{1},
+                               false);
+}
+
+vk::Buffer MemoryAllocator::CreateAlignedBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                                VkDeviceSize min_alignment,
+                                                bool within_budget) const {
     const VideoCommon::MemoryStageLink::AllocatorOp allocator_op{allocator};
     VkMemoryPropertyFlags anv_flags = 0;
     if (usage == MemoryUsage::Stream &&
@@ -1455,9 +1472,12 @@ vk::Buffer MemoryAllocator::CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsa
     if (usage == MemoryUsage::Stream) {
         memory_type_bits = 0u;
     }
+    VmaAllocationCreateFlags budget_flag = 0;
+    if (within_budget) {
+        budget_flag = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+    }
     const VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT | MemoryUsageVmaFlags(usage) |
-                 PackStrategy(),
+        .flags = budget_flag | MemoryUsageVmaFlags(usage) | PackStrategy(),
         .usage = MemoryUsageVma(usage),
         .requiredFlags = 0,
         .preferredFlags = MemoryUsagePreferredVmaFlags(usage) | anv_flags,

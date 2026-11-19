@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <unordered_map>
 #include <cstring>
@@ -67,7 +68,7 @@ size_t BytesPerIndex(VkIndexType index_type) {
 }
 
 vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allocator, u64 size,
-                        VkDeviceSize sparse_alignment) {
+                        VkDeviceSize sparse_alignment, bool within_budget = true) {
     VkBufferUsageFlags flags =
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
         VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT |
@@ -96,11 +97,72 @@ vk::Buffer CreateBuffer(const Device& device, const MemoryAllocator& memory_allo
         .queueFamilyIndexCount = 0,
         .pQueueFamilyIndices = nullptr,
     };
+    if (!within_budget) {
+        return memory_allocator.CreateBufferOverBudget(
+            buffer_ci,
+            sparse_alignment <= 1 && device.IsMoltenVK() ? MemoryUsage::Stream
+                                                         : MemoryUsage::DeviceLocal,
+            sparse_alignment);
+    }
     if (sparse_alignment > 1) {
         return memory_allocator.CreateBuffer(buffer_ci, MemoryUsage::DeviceLocal, sparse_alignment);
     }
     return memory_allocator.CreateBuffer(
         buffer_ci, device.IsMoltenVK() ? MemoryUsage::Stream : MemoryUsage::DeviceLocal);
+}
+
+[[nodiscard]] bool IsOutOfMemory(const vk::Exception& exception) noexcept {
+    return exception.GetResult() == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+           exception.GetResult() == VK_ERROR_OUT_OF_HOST_MEMORY;
+}
+
+/// A guest buffer the draw being set up can't go on without. With no memory for it (low VRAM, or
+/// an integrated GPU's share of the RAM), the staging pool gives back what the GPU is done with,
+/// then the buffer goes over the budget: slower than fitting, but the exception would end the
+/// emulator on the GPU thread. At most three creates and no wait, and the result is a real buffer
+/// or the exception, never an empty one. The staging pool is emptied at most once a second: while
+/// the budget stays full every new buffer lands here, and emptying it each time would only make
+/// the next uploads build their staging buffers again.
+vk::Buffer CreateGuestBuffer(const Device& device, const MemoryAllocator& memory_allocator,
+                             StagingBufferPool& staging_pool, u64 size,
+                             VkDeviceSize sparse_alignment) {
+    try {
+        return CreateBuffer(device, memory_allocator, size, sparse_alignment);
+    } catch (const vk::Exception& exception) {
+        if (!IsOutOfMemory(exception)) {
+            throw;
+        }
+    }
+    using Clock = std::chrono::steady_clock;
+    static std::atomic<s64> last_release_ms{-1000};
+    const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           Clock::now().time_since_epoch())
+                           .count();
+    s64 last_ms = last_release_ms.load(std::memory_order_relaxed);
+    if (now_ms - last_ms >= 1000 &&
+        last_release_ms.compare_exchange_strong(last_ms, now_ms, std::memory_order_relaxed)) {
+        const size_t freed = staging_pool.ReleaseIdleBuffers();
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 32) {
+            LOG_WARNING(Render_Vulkan,
+                        "No memory for a guest buffer of {} KiB; freed {} idle staging buffers",
+                        size >> 10, freed);
+        }
+        try {
+            return CreateBuffer(device, memory_allocator, size, sparse_alignment);
+        } catch (const vk::Exception& exception) {
+            if (!IsOutOfMemory(exception)) {
+                throw;
+            }
+        }
+    }
+    try {
+        return CreateBuffer(device, memory_allocator, size, sparse_alignment, false);
+    } catch (const vk::Exception& exception) {
+        LOG_CRITICAL(Render_Vulkan, "No memory for a guest buffer of {} KiB, even over the budget: {}",
+                     size >> 10, exception.what());
+        throw;
+    }
 }
 } // Anonymous namespace
 
@@ -423,7 +485,8 @@ RecycledBuffer BufferCacheRuntime::CreateCacheBuffer(u64 size, bool sparse_compa
     const VkDeviceSize sparse_alignment = SparseAlignmentFor(sparse_compatible);
     if (sparse_alignment > 1) {
         // Bound by their memory location (multi-range sparse binds): never pooled.
-        return RecycledBuffer{CreateBuffer(device, memory_allocator, size, sparse_alignment)};
+        return RecycledBuffer{
+            CreateGuestBuffer(device, memory_allocator, staging_pool, size, sparse_alignment)};
     }
     BufferRecycler& recycler = staging_pool.Recycler();
     u64 bytes = size;
@@ -443,15 +506,19 @@ RecycledBuffer BufferCacheRuntime::CreateCacheBuffer(u64 size, bool sparse_compa
         }
     }
     vk::Buffer created;
-    try {
-        created = CreateBuffer(device, memory_allocator, bytes, 0);
-    } catch (const vk::Exception&) {
-        // Out of device memory: give back what the pool holds, retry at the exact size.
-        if (recycler.DropAll() == 0 && bytes == size) {
-            throw;
+    if (bytes != size) {
+        try {
+            created = CreateBuffer(device, memory_allocator, bytes, 0);
+        } catch (const vk::Exception& exception) {
+            if (!IsOutOfMemory(exception)) {
+                throw;
+            }
+            // No room for the size class: the exact size below.
+            bytes = size;
         }
-        bytes = size;
-        created = CreateBuffer(device, memory_allocator, bytes, 0);
+    }
+    if (!created) {
+        created = CreateGuestBuffer(device, memory_allocator, staging_pool, bytes, 0);
     }
     return RecycledBuffer{std::move(created), &recycler, bytes};
 }

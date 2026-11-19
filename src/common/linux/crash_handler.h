@@ -13,4 +13,9 @@ namespace Common::Linux {
 /// code).
 void InstallCrashHandler();
 
+/// A fatal error the process ends itself for (the GPU driver lost the Vulkan device): one "Host
+/// crash" line and the calling thread's stack, into the log file and stderr, as for a crash. The
+/// process goes on; no core dump.
+void LogFatalError(const char* what);
+
 } // namespace Common::Linux

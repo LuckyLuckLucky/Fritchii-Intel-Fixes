@@ -32,6 +32,22 @@ struct MemoryInfo {
 /// Ported.
 [[nodiscard]] std::optional<u64> GetSystemCommitRoom();
 
+#ifdef _WIN32
+/// Commits reserved pages read-write, waiting at Windows' commit limit (RAM plus the page files):
+/// a refusal there is often over in moments, while a system-managed page file grows or the texture
+/// cache gives memory back (HostCriticalMemory). Tries again every 50 ms for up to 5 s, only for
+/// out-of-memory errors. quiet: logs nothing (exception handlers). False if it still failed, with
+/// the last error set. FRITCHII_TEST_COMMIT_REFUSE (boot, ms, default 0) refuses commits for that
+/// long from the first one on, as a test of this path.
+[[nodiscard]] bool CommitPagesWaiting(void* address, u64 bytes, bool quiet = false);
+/// Commits and C++ allocations given up at the commit limit so far, for the crash report.
+[[nodiscard]] u64 CommitRefusals();
+#endif
+/// `operator new` refused with little commit left waits and tries again for up to 5 s on that
+/// thread before std::bad_alloc, as CommitPagesWaiting does (with more left the refusal is no
+/// commit limit, a size gone wrong: std::bad_alloc at once, as without this). Windows only.
+void InstallCommitLimitNewHandler();
+
 /// FRITCHII_VRAM_BUDGET_MODE=os: the OS's count of dedicated video memory in use on one adapter
 /// (by every process) and this process's part of it.
 struct AdapterVideoMemory {

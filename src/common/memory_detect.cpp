@@ -31,6 +31,8 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <new>
+#include <optional>
 #include <set>
 #include <sstream>
 #include <stop_token>
@@ -225,6 +227,173 @@ std::optional<u64> GetSystemCommitRoom() {
     }
 #endif
     return std::nullopt;
+}
+
+#ifdef _WIN32
+namespace {
+using CommitClock = std::chrono::steady_clock;
+constexpr std::chrono::seconds CommitWaitLimit{5};
+constexpr DWORD CommitRetryMs = 50;
+/// A refused `operator new` counts as the commit limit only with less than this left.
+constexpr u64 NewHandlerCommitRoom = u64{4} << 30;
+
+std::atomic<u64> g_commit_refusals{};
+
+/// FRITCHII_TEST_COMMIT_REFUSE: when the first commit asked for it, in clock ticks; 0: not yet.
+std::atomic<CommitClock::rep> g_test_refuse_start{0};
+
+u32 TestRefuseWindowMs() {
+    static const u32 window_ms = [] {
+        const char* const value = std::getenv("FRITCHII_TEST_COMMIT_REFUSE");
+        return value != nullptr ? static_cast<u32>(std::strtoul(value, nullptr, 10)) : 0U;
+    }();
+    return window_ms;
+}
+
+bool TestRefusesCommit(bool is_commit) {
+    const u32 window_ms = TestRefuseWindowMs();
+    if (window_ms == 0) [[likely]] {
+        return false;
+    }
+    const CommitClock::time_point now = CommitClock::now();
+    CommitClock::rep start = g_test_refuse_start.load(std::memory_order_relaxed);
+    if (start == 0) {
+        if (!is_commit) {
+            return false;
+        }
+        const CommitClock::rep ticks = now.time_since_epoch().count();
+        start = g_test_refuse_start.compare_exchange_strong(start, ticks) ? ticks : start;
+    }
+    const CommitClock::time_point begin{CommitClock::duration{start}};
+    return now - begin < std::chrono::milliseconds{window_ms};
+}
+
+bool IsOutOfCommit(DWORD error) {
+    return error == ERROR_COMMITMENT_LIMIT || error == ERROR_NOT_ENOUGH_MEMORY ||
+           error == ERROR_OUTOFMEMORY || error == ERROR_NO_SYSTEM_RESOURCES ||
+           error == ERROR_PAGEFILE_QUOTA;
+}
+
+bool TryCommit(void* address, u64 bytes) {
+    if (TestRefusesCommit(true)) {
+        SetLastError(ERROR_COMMITMENT_LIMIT);
+        return false;
+    }
+    return VirtualAlloc(address, static_cast<SIZE_T>(bytes), MEM_COMMIT, PAGE_READWRITE) != nullptr;
+}
+
+u64 CommitRoomMiB() {
+    return GetSystemCommitRoom().value_or(0) >> 20;
+}
+
+void OnNewRefused() {
+    // Logging allocates: a refusal inside the log line must not log again.
+    thread_local bool in_log = false;
+    thread_local CommitClock::time_point first{};
+    thread_local CommitClock::time_point last{};
+    static std::atomic<int> told{0};
+    const CommitClock::time_point now = CommitClock::now();
+    if (last == CommitClock::time_point{} || now - last > std::chrono::milliseconds{250}) {
+        first = now;
+    }
+    last = now;
+    const std::optional<u64> real_room = GetSystemCommitRoom();
+    const std::optional<u64> room = TestRefusesCommit(false) ? std::optional<u64>{0} : real_room;
+    if (!room || *room > NewHandlerCommitRoom) {
+        throw std::bad_alloc{};
+    }
+    if (now - first >= CommitWaitLimit) {
+        g_commit_refusals.fetch_add(1, std::memory_order_relaxed);
+        if (!in_log) {
+            in_log = true;
+            LOG_CRITICAL(Common_Memory,
+                         "Out of memory: a C++ allocation was refused for 5 s at Windows' commit "
+                         "limit ({} MiB of commit left). Close other programs or enlarge the page "
+                         "file",
+                         *room >> 20);
+            in_log = false;
+        }
+        throw std::bad_alloc{};
+    }
+    if (!in_log && told.fetch_add(1, std::memory_order_relaxed) < 8) {
+        in_log = true;
+        LOG_WARNING(Common_Memory,
+                    "A C++ allocation was refused at Windows' commit limit ({} MiB of commit "
+                    "left): trying again for up to 5 s",
+                    *room >> 20);
+        in_log = false;
+    }
+    Sleep(CommitRetryMs);
+}
+} // Anonymous namespace
+
+bool CommitPagesWaiting(void* address, u64 bytes, bool quiet) {
+    if (TryCommit(address, bytes)) [[likely]] {
+        return true;
+    }
+    DWORD error = GetLastError();
+    if (!IsOutOfCommit(error)) {
+        return false;
+    }
+    static std::atomic<int> told{0};
+    const bool tell = !quiet && told.fetch_add(1, std::memory_order_relaxed) < 8;
+    if (tell) {
+        LOG_WARNING(Common_Memory,
+                    "Committing {} KiB was refused at Windows' commit limit (error {}, {} MiB of "
+                    "commit left): trying again for up to 5 s",
+                    bytes >> 10, error, CommitRoomMiB());
+    }
+    const CommitClock::time_point start = CommitClock::now();
+    while (CommitClock::now() - start < CommitWaitLimit) {
+        Sleep(CommitRetryMs);
+        if (TryCommit(address, bytes)) {
+            if (tell) {
+                LOG_INFO(Common_Memory, "The commit went through after {} ms",
+                         std::chrono::duration_cast<std::chrono::milliseconds>(
+                             CommitClock::now() - start)
+                             .count());
+            }
+            return true;
+        }
+        error = GetLastError();
+        if (!IsOutOfCommit(error)) {
+            break;
+        }
+    }
+    g_commit_refusals.fetch_add(1, std::memory_order_relaxed);
+    if (!quiet) {
+        LOG_CRITICAL(Common_Memory,
+                     "Out of memory: committing {} KiB was refused for 5 s at Windows' commit "
+                     "limit (error {}, {} MiB of commit left). Close other programs or enlarge "
+                     "the page file",
+                     bytes >> 10, error, CommitRoomMiB());
+    }
+    SetLastError(error);
+    return false;
+}
+
+u64 CommitRefusals() {
+    return g_commit_refusals.load(std::memory_order_relaxed);
+}
+#endif
+
+void InstallCommitLimitNewHandler() {
+#ifdef _WIN32
+    std::set_new_handler(OnNewRefused);
+    if (TestRefuseWindowMs() != 0) {
+        // The test of the handler: an allocation no PC can give, while commits are refused.
+        std::thread([] {
+            while (g_test_refuse_start.load(std::memory_order_relaxed) == 0) {
+                Sleep(CommitRetryMs);
+            }
+            try {
+                ::operator delete(::operator new(size_t{1} << 46));
+            } catch (const std::bad_alloc&) {
+                LOG_INFO(Common_Memory, "FRITCHII_TEST_COMMIT_REFUSE: std::bad_alloc came through");
+            }
+        }).detach();
+    }
+#endif
 }
 
 #ifdef _WIN32

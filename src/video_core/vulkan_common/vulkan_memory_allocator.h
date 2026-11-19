@@ -166,6 +166,11 @@ namespace Vulkan {
         vk::Buffer CreateBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
                                 VkDeviceSize min_alignment) const;
 
+        /// CreateBuffer without the memory budget, for a buffer the game can't go on without once
+        /// what could be freed was freed: the driver pages rather than the emulator stopping.
+        vk::Buffer CreateBufferOverBudget(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                          VkDeviceSize min_alignment = 1) const;
+
         /**
          * Commits a memory with the specified requirements.
          *
@@ -190,6 +195,10 @@ namespace Vulkan {
                     return false;
             }
         }
+
+        /// The buffer through VMA's aligned create, within the memory budget or not.
+        vk::Buffer CreateAlignedBuffer(const VkBufferCreateInfo &ci, MemoryUsage usage,
+                                       VkDeviceSize min_alignment, bool within_budget) const;
 
         /// CreateImage's fallbacks; the image is left null when the result is an error.
         /// may_fail: the caller handles VK_ERROR_OUT_OF_DEVICE_MEMORY (see UsesUnbackedFallback).

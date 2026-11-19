@@ -214,6 +214,11 @@ void TextureCache<P>::RunGarbageCollector(bool out_of_memory) {
                 ++stats.over_young;
             }
         }
+        // FRITCHII_TC_THRASH_GUARD: images the game keeps coming back to stay, however far past
+        // critical the cache is. An allocation that failed needs the memory now.
+        if (!out_of_memory) {
+            ticks_to_destroy = (std::max)(ticks_to_destroy, thrash_floor);
+        }
     };
     // FRITCHII_TC_COLLECT_EVICTABLE (live, default 0; zortos #1731): images this pass may not
     // delete are skipped before they count against its budget. Without it, 10 or 20 old costly
@@ -1461,7 +1466,7 @@ void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
         const char* value = std::getenv("EDEN_NX2_TC_MIN_AGE");
         return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ULL;
     }();
-    const u64 idle_frames = (std::max)(u64{10}, min_age);
+    const u64 idle_frames = (std::max)({u64{10}, min_age, thrash_floor});
     constexpr u32 MaxPerFrame = 256;
     constexpr size_t MaxPerPass = 32;
     constexpr size_t MaxLooked = 512;
@@ -1475,6 +1480,13 @@ void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
         return;
     }
     if (frame_tick <= idle_frames) {
+        return;
+    }
+    // FRITCHII_TC_THRASH_GUARD: with the cache over critical for good, every image made walked
+    // the idle list again for nothing (26,000 passes in 10 s, 0 images deleted).
+    const bool skip_empty = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_thrash_guard,
+                                                             "FRITCHII_TC_THRASH_GUARD", 1) > 0;
+    if (skip_empty && create_enforce_empty_frame == frame_tick) {
         return;
     }
     ++stats.passes;
@@ -1503,6 +1515,9 @@ void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
         }
         return candidates.size() >= MaxPerPass || ++looked >= MaxLooked;
     });
+    if (candidates.empty() && looked < MaxLooked) {
+        create_enforce_empty_frame = frame_tick;
+    }
     const DeleteReasonScope delete_reason_scope{*this, DeleteReason::GarbageCollect};
     for (const ImageId image_id : candidates) {
         if (total_used_memory + incoming <= critical_memory ||
@@ -1525,6 +1540,165 @@ void TextureCache<P>::EnforceCriticalAtCreate(u64 incoming) {
     if (total_used_memory + incoming > critical_memory) {
         ++stats.short_of;
     }
+}
+
+template <class P>
+void TextureCache<P>::NoteThrashDelete(const Image& image) {
+    if (VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_thrash_guard,
+                                         "FRITCHII_TC_THRASH_GUARD", 1) <= 0) {
+        return;
+    }
+    if (thrash_ghosts.empty()) {
+        thrash_ghosts.resize(ThrashGhostSlots);
+    }
+    const u64 shape = RelocationShapeKey(image.info);
+    const bool pressured = delete_reason == DeleteReason::GarbageCollect &&
+                           (budget_pressure || total_used_memory >= critical_memory);
+    thrash_ghosts[ThrashSlot(image.gpu_addr, shape)] = ThrashGhost{
+        .gpu_addr = image.gpu_addr,
+        .shape = shape,
+        .last_use = image.last_use_tick,
+        .kib = static_cast<u32>(ImageMemoryBytes(image) >> 10),
+        .cause = static_cast<u8>(pressured ? ThrashCausePressured
+                                           : static_cast<size_t>(delete_reason)),
+        .costly = True(image.flags & ImageFlagBits::CostlyLoad),
+    };
+}
+
+template <class P>
+void TextureCache<P>::NoteThrashMade(const ImageInfo& info, GPUVAddr gpu_addr) {
+    ++thrash_stats.made;
+    if (thrash_ghosts.empty()) {
+        return;
+    }
+    const u64 shape = RelocationShapeKey(info);
+    ThrashGhost& ghost = thrash_ghosts[ThrashSlot(gpu_addr, shape)];
+    if (ghost.gpu_addr != gpu_addr || ghost.shape != shape) {
+        return;
+    }
+    const u64 interval = frame_tick - (std::min)(frame_tick, ghost.last_use);
+    const size_t cause = ghost.cause;
+    const bool costly = ghost.costly;
+    const u32 kib = ghost.kib;
+    ghost = ThrashGhost{};
+    // Back after half a minute or more is a scene coming back, not a loop.
+    if (interval > 1800) {
+        return;
+    }
+    auto& stats = thrash_stats;
+    ++stats.remade[cause];
+    stats.remade_kib += kib;
+    stats.remade_costly += costly ? 1 : 0;
+    stats.interval_sum += interval;
+    if (cause == ThrashCausePressured && interval <= ThrashMaxFloor) {
+        size_t bucket = 0;
+        while (bucket + 1 < ThrashBuckets && interval > (u64{4} << bucket)) {
+            ++bucket;
+        }
+        ++thrash_window[bucket];
+    }
+}
+
+template <class P>
+void TextureCache<P>::TickThrashGuard() {
+    // FRITCHII_TC_THRASH_GUARD (live; 0 off, 1 = default, 2 counts only). The collector works from
+    // the driver's usage, which on a small card holds far more than images: Castle Town on a
+    // simulated 4 GB card (budget 3,328 MiB) had 4,100-4,900 MiB in the cache's view with 1,500 in
+    // images, against a critical of 2,100-2,400. Deleting every image could not reach it, so the
+    // collector stayed 1 GiB+ over, where it takes up to 1,064 images a frame unused for just 3
+    // frames, ASTC included. Textures the game comes back to every few frames were deleted and
+    // made again 55-60 times a frame (normal: under 1), each an image, its memory and an ASTC
+    // decode on the GPU, 44 fps with 20 fps lows against 75.
+    //
+    // Deleted images are remembered by address and shape. When the game asks for one again soon
+    // after the collector took it under pressure, the time since its last use says how long it
+    // should have stayed: while 8+ a second come back, the collector and the evictions before
+    // creates leave alone what was used within 1.25x the 90th percentile of those gaps. Only
+    // keeping images longer: what they hold is what a big card keeps anyway. Bounds: 600
+    // frames, and live images at 3/4 of the budget, where the floor halves (past that, memory
+    // comes first). It only acts under pressure, so cards with room never get one.
+    const int mode = VideoCore::Nx2Debug::SwitchValue(VideoCore::Nx2Debug::g_tc_thrash_guard,
+                                                      "FRITCHII_TC_THRASH_GUARD", 1);
+    if (mode <= 0) {
+        thrash_floor = 0;
+        thrash_window = {};
+        thrash_stats = {};
+        if (!thrash_ghosts.empty()) {
+            thrash_ghosts = std::vector<ThrashGhost>{};
+        }
+        return;
+    }
+    constexpr u64 CheckFrames = 60;
+    constexpr u32 MinRemakes = 8;
+    if (frame_tick % CheckFrames == 0) {
+        const bool pressure = budget_pressure || total_used_memory >= critical_memory;
+        thrash_calm_frames = pressure ? 0 : thrash_calm_frames + CheckFrames;
+        const u32 remakes = std::accumulate(thrash_window.begin(), thrash_window.end(), u32{0});
+        u64 wanted = 0;
+        if (remakes >= MinRemakes) {
+            u32 seen = 0;
+            for (size_t bucket = 0; bucket < ThrashBuckets; ++bucket) {
+                seen += thrash_window[bucket];
+                if (seen * 10 >= remakes * 9) {
+                    const u64 gap = u64{4} << bucket;
+                    wanted = (std::min)(gap + gap / 4 + 2, ThrashMaxFloor);
+                    break;
+                }
+            }
+        }
+        thrash_window = {};
+        u64 floor = thrash_floor;
+        if (mode == 1 && wanted > floor) {
+            floor = wanted;
+            ++thrash_stats.raised;
+        } else if (mode != 1) {
+            floor = 0;
+        } else if (thrash_calm_frames >= 600 && floor != 0) {
+            // Inert without pressure; going down slowly it is ready for the next spell.
+            floor -= floor / 8 + 1;
+        }
+        if (floor != 0) {
+            u64 bytes = 0;
+            for (const auto [image_id, image] : slot_images) {
+                if (False(image->flags & ImageFlagBits::Unbacked)) {
+                    bytes += ImageMemoryBytes(*image);
+                }
+            }
+            thrash_image_bytes = bytes;
+            if constexpr (requires { runtime.GetDeviceMemoryBudget(); }) {
+                const u64 budget = runtime.GetDeviceMemoryBudget();
+                if (budget != 0 && bytes > budget / 4 * 3) {
+                    floor /= 2;
+                    ++thrash_stats.capped;
+                }
+            }
+        }
+        thrash_floor = floor;
+    }
+    if (frame_tick % 600 != 0) {
+        return;
+    }
+    auto& s = thrash_stats;
+    const u64 remade = std::accumulate(s.remade.begin(), s.remade.end(), u64{0});
+    if (remade != 0 || thrash_floor != 0 || s.capped != 0) {
+        const auto at = [&s](DeleteReason reason) { return s.remade[static_cast<size_t>(reason)]; };
+        LOG_INFO(HW_GPU,
+                 "Image churn (FRITCHII_TC_THRASH_GUARD={}) last 600 frames: {} images made, {} "
+                 "made again after a delete ({} MiB, {} costly to load, {:.1f} frames after their "
+                 "last use); deleted by: collector under pressure {}, collector {}, cold sweep "
+                 "{}, superseded sweep {}, slot retire {}, join {}, unmap {}, unmap sweep {}, "
+                 "other {}; collector age floor {} frames (raised {} times, halved {} times at "
+                 "3/4 of the budget), live images {} MiB",
+                 mode, s.made, remade, s.remade_kib >> 10, s.remade_costly,
+                 remade != 0 ? static_cast<double>(s.interval_sum) / static_cast<double>(remade)
+                             : 0.0,
+                 s.remade[ThrashCausePressured], at(DeleteReason::GarbageCollect),
+                 at(DeleteReason::ColdSweep), at(DeleteReason::SupersededSweep),
+                 at(DeleteReason::SlotRetire), at(DeleteReason::Join), at(DeleteReason::Unmap),
+                 at(DeleteReason::UnmapSweep), at(DeleteReason::Other), thrash_floor, s.raised,
+                 s.capped, thrash_image_bytes >> 20);
+    }
+    s = {};
 }
 
 template <class P>
@@ -1997,6 +2171,7 @@ void TextureCache<P>::TickFrame() {
     SweepUnmapped();
     SweepSuperseded();
     SweepColdImages();
+    TickThrashGuard();
     // An image that could not be made at all: the driver is out of memory whatever the counts
     // say, so collect as at the critical threshold.
     bool out_of_memory = false;
@@ -6710,6 +6885,7 @@ ImageId TextureCache<P>::JoinImages(const ImageInfo& info, GPUVAddr gpu_addr, DA
         std::ranges::for_each(join_right_aliased_ids, mark);
     }
     NoteMadeShape(new_info);
+    NoteThrashMade(new_info, gpu_addr);
     if constexpr (requires(const Image& image) { image.FromPool(); }) {
         rt_stats.pooled_images += slot_images[new_image_id].FromPool() ? 1 : 0;
         Churn::Add(Churn::ImagesPooled, slot_images[new_image_id].FromPool() ? 1 : 0);
@@ -7806,6 +7982,7 @@ void TextureCache<P>::UnregisterImage(ImageId image_id) {
                "Trying to unregister an already registered image");
     image.flags &= ~ImageFlagBits::Registered;
     image.flags &= ~ImageFlagBits::BadOverlap;
+    image.last_use_tick = lru_cache.Tick(image.lru_index);
     lru_cache.Free(image.lru_index);
     const auto& clear_page_table =
         [image_id](u64 page, ::Common::unordered_map<u64, std::vector<ImageId>, Common::IdentityHash<u64>>& selected_page_table) {
@@ -7956,6 +8133,7 @@ void TextureCache<P>::DeleteImage(ImageId image_id, bool immediate_delete) {
     }
     ++images_deleted;
     Churn::Add(Churn::ImagesDeleted);
+    NoteThrashDelete(slot_images[image_id]);
     if (image.unmapped_tick != 0) {
         // Still flagged by an unmap. Unused since: no upload or full overwrite took the
         // CpuModified the unmap set, so nothing could have downloaded it either.

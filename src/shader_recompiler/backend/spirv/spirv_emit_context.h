@@ -341,6 +341,31 @@ public:
     Id mesh_draw_base_push_constant{};
     u32 mesh_draw_base_member_index{};
 
+    /// FRITCHII_OCCL_FLAG (RuntimeInfo::occl_flag_store): the push constant block holding the
+    /// flag slot address (a u64 at offset 40; the rescaling or render area block when the
+    /// program declares one: one push constant block per entry point), the member's index, and
+    /// the store's types. The address is a u64 member, never a struct the slot pointer could
+    /// share: Sirit merges identical type declarations, decorations and all.
+    Id occl_flag_push_constant{};
+    u32 occl_flag_member_index{};
+    Id occl_flag_u64{};
+    Id occl_flag_slot_pointer{};
+    /// The store, a function of its own: its branch must not split main's first block (the
+    /// deferred phis name their predecessors by the IR blocks' labels).
+    Id occl_flag_store_function{};
+
+    /// FRITCHII_OCCL_FLAG: this module stores the occlusion flag (fragment, Vulkan).
+    [[nodiscard]] bool UsesOcclFlagStore() const {
+        return stage == Stage::Fragment &&
+               (runtime_info.occl_flag_store || runtime_info.occl_flag_store_at_end) &&
+               profile.unified_descriptor_binding;
+    }
+
+    /// FRITCHII_OCCL_FLAG pre-pass: the store is at the end of main, not at its start.
+    [[nodiscard]] bool OcclFlagStoreAtEnd() const {
+        return UsesOcclFlagStore() && runtime_info.occl_flag_store_at_end;
+    }
+
     Id local_memory{};
 
     bool uses_explicit_workgroup_layout{};
@@ -501,6 +526,7 @@ private:
     void DefineRenderArea(const Info& info);
     void DefineMeshDrawBase();
     [[nodiscard]] bool UsesMeshDrawBase() const;
+    void DefineOcclFlag();
     [[nodiscard]] u32 MeshDrawBaseOffset() const;
 
     void DefineInputs(const IR::Program& program);

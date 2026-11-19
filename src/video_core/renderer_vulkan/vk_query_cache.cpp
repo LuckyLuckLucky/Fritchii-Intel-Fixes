@@ -12,6 +12,7 @@
 #include <memory>
 #include <span>
 #include <type_traits>
+#include "video_core/fritchii_occl_flag.h"
 #include "common/container/unordered_map.h"
 #include <utility>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "video_core/rasterizer_interface.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/link_stats.h"
 #include "video_core/renderer_vulkan/vk_query_cache.h"
 #include "video_core/one_follower.h"
 #include "video_core/renderer_vulkan/vk_resource_pool.h"
@@ -95,6 +97,9 @@ public:
     }
 
     void Sync(size_t start, size_t size) {
+        if (VideoCommon::LinkStats::On()) [[unlikely]] {
+            VideoCommon::LinkStats::NoteQueryResults(size);
+        }
         const auto& dev = device.GetLogical();
         const VkResult query_result = dev.GetQueryResults(
             *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
@@ -116,6 +121,11 @@ public:
 
     size_t GetIndex() const {
         return index;
+    }
+
+    /// FRITCHII_OCCL_FLAG=1: a flag slot's value (the fencing thread, in place of Sync's).
+    void SetResult(size_t slot, u64 value) {
+        host_results[slot] = value;
     }
 
     const std::array<u64, BANK_SIZE>& GetResults() const {
@@ -175,14 +185,92 @@ public:
         });
     }
 
-    ~SamplesStreamer() = default;
+    ~SamplesStreamer() {
+        if (flag_buffer != VK_NULL_HANDLE) {
+            device.GetDispatchLoader().vkDestroyBuffer(*device.GetLogical(), flag_buffer, nullptr);
+        }
+        if (flag_mirror != VK_NULL_HANDLE) {
+            device.GetDispatchLoader().vkDestroyBuffer(*device.GetLogical(), flag_mirror, nullptr);
+        }
+    }
+
+    /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h; the recording thread, right after CounterEnable
+    /// for a draw drawn with a flag pipeline): the address its pixel program stores to, the open
+    /// query's slot (a sink slot never compared when no query is open). 0: no flag area.
+    u64 OcclFlagAddress() {
+        if (!EnsureFlagArea()) {
+            return 0;
+        }
+        if (!has_started || current_bank_id >= FLAG_BANKS) {
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.no_slot);
+            return flag_address + FLAG_SINK_SLOT * SamplesQueryBank::QUERY_SIZE;
+        }
+        const size_t slot = current_bank_id * SamplesQueryBank::BANK_SIZE + current_bank_slot;
+        flag_marks[slot].fetch_or(1, std::memory_order_relaxed);
+        return flag_address + slot * SamplesQueryBank::QUERY_SIZE;
+    }
+
+    /// FRITCHII_OCCL_FLAG: the flag area exists (made now if it can be).
+    bool OcclFlagReady() {
+        return EnsureFlagArea();
+    }
+
+    /// FRITCHII_OCCL_FLAG: a counted draw drawn without a flag pipeline (its slot's reports are
+    /// "mixed" and not compared).
+    /// FRITCHII_OCCL_FLAG pre-pass (the recording thread): the open slot runs a host query.
+    bool OcclQuerySlotOpen() const {
+        return has_started && !current_flag_slot;
+    }
+
+    /// FRITCHII_OCCL_FLAG pre-pass: ends the open host query before the pre-pass draw, and opens
+    /// the window's next slot (a host query) after it, which the real draw is counted in.
+    void OcclPrepassPause() {
+        PauseCounter();
+    }
+    void OcclPrepassResume() {
+        next_flag_draw = false;
+        StartCounter();
+    }
+
+    void NoteOtherCountedDraw(bool blocks = true) {
+        if (flag_map.load(std::memory_order_relaxed) == nullptr || !has_started ||
+            current_bank_id >= FLAG_BANKS) {
+            return;
+        }
+        // 8 (census): a draw that keeps the host query even with colour Lean flag stores.
+        flag_marks[current_bank_id * SamplesQueryBank::BANK_SIZE + current_bank_slot].fetch_or(
+            blocks ? 10 : 2, std::memory_order_relaxed);
+    }
 
     void StartCounter() override {
+        // FRITCHII_OCCL_FLAG=1: a flag draw takes a flag slot (no host query), any other counted
+        // draw a query slot; the open slot is closed when the kind changes (the window's value
+        // is the sum of its slots, as for a window across submissions).
+        const bool want_flag = std::exchange(next_flag_draw, false);
         if (has_started) {
-            return;
+            // Only a flag slot is closed for the other kind: a flag draw in an open query slot
+            // is counted exactly by that query (its store lands in a slot no one reads), so a
+            // window gains at most one slot per segment, as few as possible for the multi-slot
+            // paths (prefix scan, the EXP16 limit).
+            if (!current_flag_slot || want_flag) {
+                return;
+            }
+            PauseCounter();
         }
 
         ReserveHostQuery();
+        // A bank past the flag area takes a host query (its slots have no flag slot).
+        current_flag_slot = want_flag && current_bank_id < FLAG_BANKS;
+        if (current_flag_slot) {
+            flag_marks[current_bank_id * SamplesQueryBank::BANK_SIZE + current_bank_slot].fetch_or(
+                4, std::memory_order_relaxed);
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.flag_slots);
+            has_started = true;
+            return;
+        }
+        if (flag_map.load(std::memory_order_relaxed) != nullptr) {
+            VideoCommon::OcclFlag::Add(VideoCommon::OcclFlag::g_stats.query_slots);
+        }
 
         scheduler.Record([query_pool = current_query_pool,
                                  query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
@@ -199,11 +287,31 @@ public:
         if (!has_started) {
             return;
         }
-        scheduler.Record([query_pool = current_query_pool,
-                          query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
-            cmdbuf.EndQuery(query_pool, static_cast<u32>(query_index));
-        });
+        if (!std::exchange(current_flag_slot, false)) {
+            // Census: what the query slot's counted draws were.
+            if (flag_map.load(std::memory_order_relaxed) != nullptr &&
+                current_bank_id < FLAG_BANKS) {
+                auto& g = VideoCommon::OcclFlag::g_stats;
+                const u8 marks =
+                    flag_marks[current_bank_id * SamplesQueryBank::BANK_SIZE + current_bank_slot]
+                        .load(std::memory_order_relaxed);
+                VideoCommon::OcclFlag::Add((marks & 8) != 0   ? g.qslot_blocked
+                                           : (marks & 3) != 0 ? g.qslot_injectable
+                                                              : g.qslot_empty);
+            }
+            scheduler.Record([query_pool = current_query_pool,
+                              query_index = current_bank_slot](vk::CommandBuffer cmdbuf) {
+                cmdbuf.EndQuery(query_pool, static_cast<u32>(query_index));
+            });
+        }
         has_started = false;
+    }
+
+    /// FRITCHII_OCCL_FLAG=1 (the recording thread, right before CounterEnable): the next
+    /// StartCounter is for a flag draw. Only with the flag area and the bank in it.
+    void SetNextFlagDraw(bool flag) {
+        next_flag_draw = flag && flag_map.load(std::memory_order_relaxed) != nullptr &&
+                         (!current_bank || current_bank_id < FLAG_BANKS - 1);
     }
 
     void ResetCounter() override {
@@ -290,6 +398,23 @@ public:
             return;
         }
         sync_values_stash.clear();
+        const u8* const flags = flag_map.load(std::memory_order_relaxed);
+        if (flags != nullptr) {
+            // FRITCHII_OCCL_FLAG: the flag stores of the draws before this sync, visible to the
+            // result copies below and to the fencing thread once the fence signals.
+            scheduler.RequestOutsideRenderPassOperationContext();
+            scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                static constexpr VkMemoryBarrier FLAG_BARRIER{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+                };
+                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                       VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                       0, FLAG_BARRIER);
+            });
+        }
         sync_values_stash.emplace_back();
         std::vector<HostSyncValues>* sync_values = &sync_values_stash.back();
         sync_values->reserve(num_slots_used);
@@ -310,6 +435,94 @@ public:
             auto& resolve_buffer = buffers[resolve_buffer_index];
             VkQueryPool query_pool = bank->GetInnerPool();
             scheduler.RequestOutsideRenderPassOperationContext();
+            if (flags != nullptr) {
+                CopyFlagsToMirror(bank_id, start, amount);
+            }
+            // FRITCHII_OCCL_FLAG=1: flag runs copied from the flag area, query runs from the pool
+            // (never a slot no query ran in).
+            bool has_flag_slots = false;
+            if (flags != nullptr) {
+                for (size_t i = start; i < start + amount && !has_flag_slots; ++i) {
+                    has_flag_slots = IsFlagSlot(*bank, i);
+                }
+            }
+            if (has_flag_slots) {
+                size_t run = start;
+                while (run < start + amount) {
+                    const bool flag = IsFlagSlot(*bank, run);
+                    size_t end = run + 1;
+                    while (end < start + amount && IsFlagSlot(*bank, end) == flag) {
+                        ++end;
+                    }
+                    const VkDeviceSize dst =
+                        base_offset + (run - start) * SamplesQueryBank::QUERY_SIZE;
+                    const size_t count = end - run;
+                    if (flag) {
+                        scheduler.Record([src = flag_buffer,
+                                          src_offset = (bank_id * SamplesQueryBank::BANK_SIZE +
+                                                        run) * SamplesQueryBank::QUERY_SIZE,
+                                          dst, count, buffer = *resolve_buffer](
+                                             vk::CommandBuffer cmdbuf) {
+                            const VkBufferCopy copy{
+                                .srcOffset = src_offset,
+                                .dstOffset = dst,
+                                .size = count * SamplesQueryBank::QUERY_SIZE,
+                            };
+                            cmdbuf.CopyBuffer(src, buffer, copy);
+                        });
+                    } else {
+                        scheduler.Record([query_pool, run, count, dst, wait_on_last,
+                                          buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
+                            if (wait_on_last && count > 1) {
+                                const size_t last = count - 1;
+                                cmdbuf.CopyQueryPoolResults(
+                                    query_pool, static_cast<u32>(run + last), 1, buffer,
+                                    dst + last * SamplesQueryBank::QUERY_SIZE,
+                                    SamplesQueryBank::QUERY_SIZE,
+                                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+                                const VkMemoryBarrier waited{
+                                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                                    .pNext = nullptr,
+                                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                    .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                                };
+                                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, waited);
+                                cmdbuf.CopyQueryPoolResults(
+                                    query_pool, static_cast<u32>(run), static_cast<u32>(last),
+                                    buffer, dst, SamplesQueryBank::QUERY_SIZE,
+                                    VK_QUERY_RESULT_64_BIT);
+                            } else {
+                                cmdbuf.CopyQueryPoolResults(
+                                    query_pool, static_cast<u32>(run), static_cast<u32>(count),
+                                    buffer, dst, SamplesQueryBank::QUERY_SIZE,
+                                    VK_QUERY_RESULT_WAIT_BIT | VK_QUERY_RESULT_64_BIT);
+                            }
+                        });
+                    }
+                    run = end;
+                }
+                scheduler.Record([buffer = *resolve_buffer, base_offset,
+                                  size = amount * SamplesQueryBank::QUERY_SIZE](
+                                     vk::CommandBuffer cmdbuf) {
+                    const VkBufferMemoryBarrier barrier{
+                        .sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+                        .buffer = buffer,
+                        .offset = base_offset,
+                        .size = size,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, barrier);
+                });
+                offsets[bank_id] = {start, base_offset};
+                base_offset += amount * SamplesQueryBank::QUERY_SIZE;
+                return;
+            }
             scheduler.Record([start, amount, base_offset, query_pool, wait_on_last,
                               buffer = *resolve_buffer](vk::CommandBuffer cmdbuf) {
                 const VkBufferMemoryBarrier copy_query_pool_barrier{
@@ -442,6 +655,9 @@ public:
         ApplyBankOp(new_query, [](SamplesQueryBank* bank, size_t start, size_t amount) {
             bank->AddReference(amount);
         });
+        if (flag_map.load(std::memory_order_relaxed) != nullptr) {
+            new_query->flag_epoch = EpochSum(*new_query); // FRITCHII_OCCL_FLAG
+        }
         pending_sync.push_back(index);
         pending_flush_queries.push_back(index);
         return index;
@@ -471,9 +687,37 @@ public:
             current_flush_queries = std::move(pending_flush_sets.front());
             pending_flush_sets.pop_front();
         }
+        const u8* const flags = flag_map.load(std::memory_order_acquire);
         ApplyBanksWideOp<false>(
-            current_flush_queries,
-            [](SamplesQueryBank* bank, size_t start, size_t amount) { bank->Sync(start, amount); });
+            current_flush_queries, [this, flags](SamplesQueryBank* bank, size_t start, size_t amount) {
+                if (flags == nullptr) {
+                    bank->Sync(start, amount);
+                    return;
+                }
+                // FRITCHII_OCCL_FLAG=1: query runs from the pool (never a slot no query ran in),
+                // flag runs from the flag area.
+                size_t run = start;
+                while (run < start + amount) {
+                    const bool flag = IsFlagSlot(*bank, run);
+                    size_t end = run + 1;
+                    while (end < start + amount && IsFlagSlot(*bank, end) == flag) {
+                        ++end;
+                    }
+                    if (flag) {
+                        for (size_t i = run; i < end; ++i) {
+                            u64 value;
+                            std::memcpy(&value,
+                                        flags + (bank->GetIndex() * SamplesQueryBank::BANK_SIZE +
+                                                 i) * SamplesQueryBank::QUERY_SIZE,
+                                        sizeof(value));
+                            bank->SetResult(i, value);
+                        }
+                    } else {
+                        bank->Sync(run, end - run);
+                    }
+                    run = end;
+                }
+            });
         for (auto q : current_flush_queries) {
             auto* query = GetQuery(q);
             u64 total = 0;
@@ -485,6 +729,10 @@ public:
             });
             query->value = total;
             query->flags |= VideoCommon::QueryFlagBits::IsFinalValueSynced;
+            if (const u8* const map = flag_map.load(std::memory_order_acquire);
+                map != nullptr && VideoCommon::OcclFlag::Mode() == VideoCommon::OcclFlag::Verify) {
+                CompareFlags(*query, total, map);
+            }
             if (const u64 trace =
                     VideoCommon::QueryTrace::Sample(VideoCommon::QueryTrace::Event::HostResult)) {
                 LOG_INFO(Render_Vulkan,
@@ -497,6 +745,262 @@ public:
     }
 
 private:
+    /// FRITCHII_OCCL_FLAG: flag slots for the first FLAG_BANKS banks (bank index * 256 + slot,
+    /// 64-bit like a query result), then a sink slot. Host-visible system memory in verify mode
+    /// (read by the fencing thread); made at the first flag draw.
+    static constexpr size_t FLAG_BANKS = 1024;
+    static constexpr size_t FLAG_SINK_SLOT = FLAG_BANKS * SamplesQueryBank::BANK_SIZE;
+    VkBuffer flag_buffer{};          ///< device-local flag slots (the stores land here)
+    vk::DeviceMemory flag_memory;
+    VkBuffer flag_mirror{};          ///< host-visible copy of synced slots (the fencing thread reads)
+    vk::DeviceMemory flag_mirror_memory;
+    std::atomic<u8*> flag_map{}; ///< published last, with release (the fencing thread reads it)
+    u64 flag_address{};
+    bool flag_tried{};
+    std::unique_ptr<std::atomic<u8>[]> flag_marks; ///< per slot: 1 flag draw, 2 other counted draw
+    bool next_flag_draw{};    ///< FRITCHII_OCCL_FLAG=1: the next StartCounter is a flag draw's
+    bool current_flag_slot{}; ///< FRITCHII_OCCL_FLAG=1: the open slot is a flag slot
+
+    /// FRITCHII_OCCL_FLAG=1: whether slot `i` of `bank` is a flag slot (no host query was run).
+    [[nodiscard]] bool IsFlagSlot(const SamplesQueryBank& bank, size_t i) const {
+        const size_t id = bank.GetIndex();
+        return id < FLAG_BANKS &&
+               (flag_marks[id * SamplesQueryBank::BANK_SIZE + i].load(std::memory_order_relaxed) &
+                4) != 0;
+    }
+
+    /// Per bank: bumped each time the bank is reserved again (before its flags are cleared).
+    std::array<std::atomic<u32>, FLAG_BANKS> bank_epoch{};
+
+    u32 EpochSum(VideoCommon::HostQueryBase& query) {
+        u32 sum = 0;
+        ApplyBankOp(&query, [&](SamplesQueryBank* bank, size_t, size_t) {
+            const size_t id = bank->GetIndex();
+            if (id < FLAG_BANKS) {
+                sum += bank_epoch[id].load(std::memory_order_acquire) * 2654435761U + static_cast<u32>(id);
+            }
+        });
+        return sum;
+    }
+
+    /// FRITCHII_OCCL_FLAG: a synced range's device slots into the host mirror (the fencing
+    /// thread reads it once the fence signals; the sync's Barriers(false) makes it visible).
+    /// Outside a render pass, after the sync's flag barrier.
+    void CopyFlagsToMirror(size_t bank_id, size_t start, size_t amount) {
+        if (bank_id >= FLAG_BANKS || amount == 0) {
+            return;
+        }
+        scheduler.Record([src = flag_buffer, dst = flag_mirror,
+                          offset = (bank_id * SamplesQueryBank::BANK_SIZE + start) *
+                                   SamplesQueryBank::QUERY_SIZE,
+                          size = amount * SamplesQueryBank::QUERY_SIZE](vk::CommandBuffer cmdbuf) {
+            const VkBufferCopy copy{.srcOffset = offset, .dstOffset = offset, .size = size};
+            cmdbuf.CopyBuffer(src, dst, copy);
+        });
+    }
+
+    /// FRITCHII_OCCL_FLAG: a buffer for the flag area: device-local (preferably not host
+    /// visible, so the small BAR heap is left alone) with a device address, or host-visible
+    /// coherent system memory (cached when there is such a type) for the mirror.
+    bool MakeFlagBuffer(VkDeviceSize size, VkBufferUsageFlags usage, bool host, VkBuffer& buffer,
+                        vk::DeviceMemory& memory) {
+        const auto& dld = device.GetDispatchLoader();
+        const VkDevice dev = *device.GetLogical();
+        const VkBufferCreateInfo buffer_ci{
+            .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .size = size,
+            .usage = usage,
+            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+            .queueFamilyIndexCount = 0,
+            .pQueueFamilyIndices = nullptr,
+        };
+        if (dld.vkCreateBuffer(dev, &buffer_ci, nullptr, &buffer) != VK_SUCCESS) {
+            buffer = VK_NULL_HANDLE;
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no buffer");
+            return false;
+        }
+        const VkMemoryRequirements requirements =
+            device.GetLogical().GetBufferMemoryRequirements(buffer);
+        const auto props = device.GetPhysical().GetMemoryProperties().memoryProperties;
+        const VkMemoryPropertyFlags wanted =
+            host ? VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
+                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        // Passes: preferred and not avoided, preferred, not avoided, any. Host (the mirror, read
+        // by the CPU): cached, not device local (a unified-memory device still gets a cached
+        // type). Device: not host visible (leaves the small BAR heap alone).
+        const VkMemoryPropertyFlags preferred =
+            host ? VK_MEMORY_PROPERTY_HOST_CACHED_BIT : VkMemoryPropertyFlags{0};
+        const VkMemoryPropertyFlags avoided =
+            host ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        u32 type = ~0U;
+        for (u32 pass = 0; pass < 4 && type == ~0U; ++pass) {
+            for (u32 i = 0; i < props.memoryTypeCount; ++i) {
+                const VkMemoryPropertyFlags f = props.memoryTypes[i].propertyFlags;
+                if ((requirements.memoryTypeBits & (1U << i)) == 0 || (f & wanted) != wanted) {
+                    continue;
+                }
+                const bool has_preferred = (f & preferred) == preferred;
+                const bool has_avoided = (f & avoided) != 0;
+                if ((pass == 0 && (!has_preferred || has_avoided)) ||
+                    (pass == 1 && !has_preferred) || (pass == 2 && has_avoided)) {
+                    continue;
+                }
+                type = i;
+                break;
+            }
+        }
+        if (type == ~0U) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no memory type");
+            return false;
+        }
+        const VkMemoryAllocateFlagsInfo flags_info{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO,
+            .pNext = nullptr,
+            .flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT,
+            .deviceMask = 0,
+        };
+        try {
+            memory = device.GetLogical().AllocateMemory(VkMemoryAllocateInfo{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .pNext = host ? nullptr : &flags_info,
+                .allocationSize = requirements.size,
+                .memoryTypeIndex = type,
+            });
+        } catch (const vk::Exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {}", exception.what());
+            return false;
+        }
+        if (dld.vkBindBufferMemory(dev, buffer, *memory, 0) != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): bind failed");
+            return false;
+        }
+        LOG_INFO(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {} buffer in memory type {}",
+                 host ? "mirror" : "flag", type);
+        return true;
+    }
+
+    bool EnsureFlagArea() {
+        if (flag_map.load(std::memory_order_relaxed) != nullptr) {
+            return true;
+        }
+        if (flag_tried) {
+            return false;
+        }
+        const auto driver = device.GetDriverID();
+        if (driver == VK_DRIVER_ID_QUALCOMM_PROPRIETARY || driver == VK_DRIVER_ID_ARM_PROPRIETARY ||
+            driver == VK_DRIVER_ID_MESA_TURNIP) {
+            // Their sync returns before the flag barrier (PresyncWrites): no flag area.
+            flag_tried = true;
+            return false;
+        }
+        if (!device.IsOcclFlagDeviceAddressEnabled()) {
+            flag_tried = true;
+            LOG_WARNING(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): the device has no "
+                                       "buffer device address for the flag area");
+            return false;
+        }
+        flag_tried = true;
+        const VkDeviceSize size = (FLAG_SINK_SLOT + 1) * SamplesQueryBank::QUERY_SIZE;
+        // The slots in device-local memory (the pixel stores stay off PCIe), and a host-visible
+        // mirror the syncs copy the synced slots into for the fencing thread.
+        if (!MakeFlagBuffer(size,
+                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                                VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
+                            false, flag_buffer, flag_memory) ||
+            !MakeFlagBuffer(size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, true, flag_mirror,
+                            flag_mirror_memory)) {
+            return false;
+        }
+        u8* map = nullptr;
+        try {
+            map = flag_mirror_memory.Map(0, VK_WHOLE_SIZE);
+        } catch (const vk::Exception& exception) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): {}", exception.what());
+            return false;
+        }
+        flag_address = device.GetLogical().GetBufferDeviceAddress(flag_buffer);
+        if (flag_address == 0) {
+            LOG_ERROR(Render_Vulkan, "Occlusion flags (FRITCHII_OCCL_FLAG): no device address");
+            return false;
+        }
+        flag_marks = std::make_unique<std::atomic<u8>[]>(FLAG_SINK_SLOT + 1);
+        std::memset(map, 0, size);
+        // The device slots start at 0: filled ahead of the submission's work (upload buffer).
+        scheduler.RecordWithUploadBuffer(
+            [buffer = flag_buffer, size](vk::CommandBuffer, vk::CommandBuffer upload) {
+                upload.FillBuffer(buffer, 0, size, 0);
+            });
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion flags (FRITCHII_OCCL_FLAG): {} KiB of flag slots for {} banks in device "
+                 "memory, mirrored to host memory; device address {:#x}",
+                 size >> 10, FLAG_BANKS, flag_address);
+        flag_map.store(map, std::memory_order_release); // last: the area is complete
+        return true;
+    }
+
+    /// FRITCHII_OCCL_FLAG=2 on the fencing thread, after the query's results: for a report whose
+    /// counted draws were all flag draws, "the query counted samples" against "a flag was
+    /// stored" (must agree).
+    void CompareFlags(VideoCommon::HostQueryBase& query, u64 total, const u8* map) {
+        namespace OcclFlag = VideoCommon::OcclFlag;
+        // A bank reserved again since the report was made has new flags (or cleared ones):
+        // not comparable. Epochs read before and after the flags catch a reuse in between.
+        if (EpochSum(query) != query.flag_epoch) {
+            OcclFlag::Add(OcclFlag::g_stats.reused);
+            return;
+        }
+        u8 marks = 0;
+        bool flag_set = false;
+        bool covered = true;
+        ApplyBankOp(&query, [&](SamplesQueryBank* bank, size_t start, size_t amount) {
+            const size_t id = bank->GetIndex();
+            if (id >= FLAG_BANKS) {
+                covered = false;
+                return;
+            }
+            for (size_t i = start; i < start + amount; ++i) {
+                const size_t slot = id * SamplesQueryBank::BANK_SIZE + i;
+                marks |= flag_marks[slot].load(std::memory_order_relaxed);
+                u64 value;
+                std::memcpy(&value, map + slot * SamplesQueryBank::QUERY_SIZE, sizeof(value));
+                flag_set |= value != 0;
+            }
+        });
+        OcclFlag::Stats& stats = OcclFlag::g_stats;
+        if (EpochSum(query) != query.flag_epoch) {
+            OcclFlag::Add(stats.reused);
+            return;
+        }
+        if (!covered || (marks & 1) == 0) {
+            OcclFlag::Add(stats.no_flag);
+            return;
+        }
+        if ((marks & 6) != 0) {
+            // Other counted draws, or flag slots (mode 1 before a live switch to 2: their value
+            // is the flag itself): not comparable.
+            OcclFlag::Add(stats.mixed);
+            return;
+        }
+        OcclFlag::Add(stats.compared);
+        const bool counted = total != 0;
+        if (counted == flag_set) {
+            OcclFlag::Add(stats.agree);
+            return;
+        }
+        OcclFlag::Add(counted ? stats.q1_f0 : stats.q0_f1);
+        OcclFlag::Add(stats.disagree_total);
+        static std::atomic<u32> logged{};
+        if (logged.fetch_add(1, std::memory_order_relaxed) < 16) {
+            LOG_WARNING(Render_Vulkan,
+                        "Occlusion flags (FRITCHII_OCCL_FLAG=2): disagreement at {:#x}: the query "
+                        "counted {} samples over {} slots, flag {}",
+                        query.guest_address, total, query.size_slots, flag_set ? "set" : "clear");
+        }
+    }
+
     template <typename Func>
     void ApplyBankOp(VideoCommon::HostQueryBase* query, Func&& func) {
         size_t size_slots = query->size_slots;
@@ -548,6 +1052,24 @@ private:
         }
         current_bank = &bank_pool.GetBank(current_bank_id);
         current_query_pool = current_bank->GetInnerPool();
+        // FRITCHII_OCCL_FLAG: a new bank, or a dead one (the GPU is done with it, so with its
+        // flags): its flags and marks start at 0.
+        if (u8* const map = flag_map.load(std::memory_order_relaxed);
+            map != nullptr && current_bank_id < FLAG_BANKS) {
+            bank_epoch[current_bank_id].fetch_add(1, std::memory_order_acq_rel);
+            const size_t first = current_bank_id * SamplesQueryBank::BANK_SIZE;
+            // The device slots: filled ahead of the submission's work (upload buffer). The bank
+            // is dead, so the GPU is done with them; the mirror is rewritten by the syncs.
+            scheduler.RecordWithUploadBuffer(
+                [buffer = flag_buffer, offset = first * SamplesQueryBank::QUERY_SIZE](
+                    vk::CommandBuffer, vk::CommandBuffer upload) {
+                    upload.FillBuffer(buffer, offset,
+                                      SamplesQueryBank::BANK_SIZE * SamplesQueryBank::QUERY_SIZE, 0);
+                });
+            for (size_t i = 0; i < SamplesQueryBank::BANK_SIZE; ++i) {
+                flag_marks[first + i].store(0, std::memory_order_relaxed);
+            }
+        }
     }
 
     size_t ReserveBankSlot() {
@@ -624,6 +1146,15 @@ private:
         ApplyBankOp(new_query, [](SamplesQueryBank* bank, size_t start, size_t amount) {
             bank->AddReference(amount);
         });
+        // FRITCHII_OCCL_FLAG: the running window can reach past every pending report (counted
+        // draws after the last one): its slots into the mirror as well, before Barriers(false).
+        if (flag_map.load(std::memory_order_relaxed) != nullptr) {
+            scheduler.RequestOutsideRenderPassOperationContext();
+            ApplyBankOp(new_query, [this](SamplesQueryBank* bank, size_t start, size_t amount) {
+                CopyFlagsToMirror(bank->GetIndex(), start, amount);
+            });
+            new_query->flag_epoch = EpochSum(*new_query);
+        }
         pending_flush_queries.push_back(index);
         std::function<void()> func([this, index] {
             auto* query = GetQuery(index);
@@ -1715,6 +2246,34 @@ VideoCommon::StreamerInterface* QueryCacheRuntime::GetStreamerInterface(QueryTyp
     default:
         return nullptr;
     }
+}
+
+u64 QueryCacheRuntime::OcclFlagAddress() {
+    return impl->sample_streamer.OcclFlagAddress();
+}
+
+bool QueryCacheRuntime::OcclQuerySlotOpen() {
+    return impl->sample_streamer.OcclQuerySlotOpen();
+}
+
+void QueryCacheRuntime::OcclPrepassPause() {
+    impl->sample_streamer.OcclPrepassPause();
+}
+
+void QueryCacheRuntime::OcclPrepassResume() {
+    impl->sample_streamer.OcclPrepassResume();
+}
+
+void QueryCacheRuntime::NoteOtherCountedDraw(bool blocks) {
+    impl->sample_streamer.NoteOtherCountedDraw(blocks);
+}
+
+bool QueryCacheRuntime::OcclFlagReady() {
+    return impl->sample_streamer.OcclFlagReady();
+}
+
+void QueryCacheRuntime::SetNextFlagDraw(bool flag) {
+    impl->sample_streamer.SetNextFlagDraw(flag);
 }
 
 void QueryCacheRuntime::Barriers(bool is_prebarrier) {

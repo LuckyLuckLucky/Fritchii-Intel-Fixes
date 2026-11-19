@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <chrono>
+
 namespace Common::ShutdownWatch {
 
 // Shutdown watch (2026-11-16, a test whose stop sat at 0% CPU forever after the frontend had
@@ -26,5 +28,11 @@ void Step(const char* step);
 void Exiting(const char* step);
 /// Disarms (a stop finished and the app stays open).
 void End();
+/// Flushes the log and ends the process at once (exit code 2), without DLL detach: for when
+/// nothing can be saved any more (the GPU driver lost the Vulkan device).
+[[noreturn]] void EndProcessNow();
+/// A safety net for a report made on the way out: ends the process after `delay` whatever the
+/// other threads are doing, without flushing the log.
+void EndProcessAfter(std::chrono::seconds delay);
 
 } // namespace Common::ShutdownWatch

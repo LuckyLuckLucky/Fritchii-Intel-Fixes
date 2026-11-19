@@ -169,7 +169,7 @@ public:
     DescriptorLayoutBuilder(const Device& device_) : device{&device_} {}
 
     bool CanUsePushDescriptor() const noexcept {
-        if (!device->IsKhrPushDescriptorSupported() ||
+        if (device->PrefersDescriptorSets() || !device->IsKhrPushDescriptorSupported() ||
             num_descriptors > device->MaxPushDescriptors()) {
             return false;
         }
@@ -179,8 +179,8 @@ public:
 
     bool CanUseDescriptorBuffer() const noexcept {
         const auto& props = device->DescriptorBufferProperties();
-        if (!device->IsExtDescriptorBufferSupported() || bindings.empty() ||
-            !props.combinedImageSamplerDescriptorSingleArray) {
+        if (device->PrefersDescriptorSets() || !device->IsExtDescriptorBufferSupported() ||
+            bindings.empty() || !props.combinedImageSamplerDescriptorSingleArray) {
             return false;
         }
         return !props.bufferlessPushDescriptors || !CanUsePushDescriptor();

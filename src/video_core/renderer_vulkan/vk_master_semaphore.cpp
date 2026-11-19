@@ -8,9 +8,11 @@
 #include <algorithm>
 #include <ranges>
 #include <fmt/format.h>
+#include "common/lowend_sim.h"
 #include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/link_stats.h"
 #include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
@@ -71,7 +73,8 @@ std::string MasterSemaphore::StallTicks(const void* self_) {
     const auto* const self = static_cast<const MasterSemaphore*>(self_);
     // What the card has reported, read now (the known tick only moves when someone refreshes).
     const u64 known = self->gpu_tick.load(std::memory_order_acquire);
-    const u64 reported = self->semaphore ? (std::max)(self->semaphore.GetCounter(), known) : known;
+    u64 read = 0;
+    const u64 reported = self->TryReadGpuTick(read) ? (std::max)(read, known) : known;
     const u64 submitted = self->stall_submitted_tick.load(std::memory_order_acquire);
     const u64 submitted_ns = self->stall_submitted_ns.load(std::memory_order_relaxed);
     const u64 now = Common::Nx2Hitch::NowNs();
@@ -84,6 +87,22 @@ std::string MasterSemaphore::StallTicks(const void* self_) {
                        reported, known, submitted > reported ? submitted - reported : 0);
 }
 
+bool MasterSemaphore::TryReadGpuTick(u64& tick) const noexcept {
+    if (!semaphore) {
+        return false;
+    }
+    try {
+        const u64 counter = semaphore.GetCounter();
+        if (counter >= CurrentTick()) {
+            return false; // no submission signals this: a lost device's value
+        }
+        tick = counter;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 void MasterSemaphore::Refresh() {
     if (!semaphore) {
         // If we don't support timeline semaphores, there's nothing to refresh
@@ -94,9 +113,22 @@ void MasterSemaphore::Refresh() {
     u64 counter{};
     do {
         this_tick = gpu_tick.load(std::memory_order_acquire);
-        counter = semaphore.GetCounter();
+        try {
+            counter = semaphore.GetCounter();
+        } catch (const vk::Exception& exception) {
+            if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                device.ReportLoss();
+            }
+            throw;
+        }
         // Unchanged: no store, which would take the cache line from the threads reading it.
         if (counter <= this_tick) {
+            return;
+        }
+        // A lost device can report UINT64_MAX with VK_SUCCESS. Past every tick handed out it is
+        // no progress: kept out, the known tick stays the last real one, nothing looks finished,
+        // and the wait that follows gets the loss.
+        if (counter >= CurrentTick()) [[unlikely]] {
             return;
         }
     } while (!gpu_tick.compare_exchange_weak(this_tick, counter, std::memory_order_release,
@@ -104,6 +136,7 @@ void MasterSemaphore::Refresh() {
 }
 
 void MasterSemaphore::Wait(u64 tick) {
+    const Common::LowEndSim::CpuWaitScope sim_wait; // waiting for the GPU is not CPU work
     if (!semaphore) {
         // Fast check: already reached the requested tick?
         if (gpu_tick.load(std::memory_order_acquire) >= tick) {
@@ -131,13 +164,25 @@ void MasterSemaphore::Wait(u64 tick) {
     }
 
     // If none of the above is hit, fallback to a regular wait
+    const bool link_stats = VideoCommon::LinkStats::On();
+    const auto wait_start =
+        link_stats ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     try {
         while (!semaphore.Wait(tick)) {
         }
     } catch (const vk::Exception& exception) {
-        // The throw ends the process; say why first (a device loss reached nothing else here).
+        if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+            device.ReportLoss();
+        }
+        // The throw ends the process; say why first.
         LOG_CRITICAL(Render_Vulkan, "Waiting for GPU tick {} failed: {}", tick, exception.what());
         throw;
+    }
+    if (link_stats) [[unlikely]] {
+        VideoCommon::LinkStats::NoteWait(static_cast<u64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - wait_start)
+                .count()));
     }
 
     Refresh();

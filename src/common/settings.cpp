@@ -110,6 +110,11 @@ NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings() {
 
 namespace {
 std::atomic<u32> applied_ocarina_render_scale{};
+std::atomic<bool> ocarina_card_runs_dlss{true};
+}
+
+void SetOcarinaCardRunsDlss(bool runs) {
+    ocarina_card_runs_dlss.store(runs, std::memory_order_relaxed);
 }
 
 bool OcarinaDlssRenderScaleSwitch() {
@@ -120,33 +125,76 @@ bool OcarinaDlssRenderScaleSwitch() {
     return on;
 }
 
-std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale() {
-    const auto quality = values.nvidia_dlss_quality.GetValue();
-    const auto aa = values.oot_anti_aliasing.GetValue();
-    // Balanced (0.871) pads its 2276x1280 scene into 2288x1280 targets, which the upscaler does
-    // not take yet: it keeps 2560x1440.
+bool OcarinaRenderStepsSwitch() {
+    static const bool on = [] {
+        const char* const value = std::getenv("FRITCHII_OOT_RENDER_STEPS");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+bool OcarinaRenderHeightOffered(u32 height) {
+    // The heights every player gets. To release one (540 and 360 are next), add it here: the
+    // picture menu, its "Below ..." line and the render patch all follow this list.
+    // 1280x720, 1920x1080 and 2560x1440 are the sizes the game is known to draw exactly. The
+    // others are exact scales too (0.25, 0.375, 0.5625, 0.625, 0.875), but the game may round
+    // its scene to a padded target as it does at 0.871 (2276x1280 in 2288x1280), which the
+    // upscaler does not take: only with FRITCHII_OOT_RENDER_STEPS until a run shows their sizes.
+    constexpr std::array<u32, 3> released{720, 1080, 1440};
+    if (std::find(released.begin(), released.end(), height) != released.end()) {
+        return true;
+    }
+    return OcarinaRenderStepsSwitch() &&
+           std::find(OcarinaRenderHeights.begin(), OcarinaRenderHeights.end(), height) !=
+               OcarinaRenderHeights.end();
+}
+
+std::optional<u32> OcarinaRenderHeight() {
     // The patch changes Max Resolution's fixed-scale path: without Max Resolution it does nothing.
-    if (!OcarinaDlssRenderScaleSwitch() || !values.nvidia_dlss.GetValue() || !IsDockedMode() ||
-        !OcarinaMaxResolutionOn() ||
-        aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4 ||
-        (quality != NvidiaDlssQuality::Performance &&
-         quality != NvidiaDlssQuality::UltraPerformance)) {
+    if (!IsDockedMode() || !OcarinaMaxResolutionOn()) {
         return std::nullopt;
     }
-    return quality;
+    const auto aa = values.oot_anti_aliasing.GetValue();
+    const bool fsr = aa == OotAntiAliasing::Fsr3 || aa == OotAntiAliasing::Fsr4;
+    if (!fsr && (!values.nvidia_dlss.GetValue() ||
+                 !ocarina_card_runs_dlss.load(std::memory_order_relaxed))) {
+        // The game's own upscale: it draws its full 1440p. A DLSS "on" saved for another card
+        // counts as off, as in the picture menu.
+        return std::nullopt;
+    }
+    // The picture menu's "Resolution" (oot_render_height): 1440 is the game's own size.
+    if (const u32 chosen = values.oot_render_height.GetValue(); chosen != 0) {
+        if (chosen >= 1440 || !OcarinaRenderHeightOffered(chosen)) {
+            return std::nullopt;
+        }
+        return chosen;
+    }
+    // Not chosen yet: FRITCHII_DLSS_RENDER_SCALE's DLSS qualities, as before. Balanced (0.871)
+    // pads its 2276x1280 scene into 2288x1280 targets, which the upscaler does not take yet: it
+    // keeps 2560x1440.
+    const auto quality = values.nvidia_dlss_quality.GetValue();
+    if (!OcarinaDlssRenderScaleSwitch() || fsr) {
+        return std::nullopt;
+    }
+    if (quality == NvidiaDlssQuality::Performance) {
+        return 1080;
+    }
+    if (quality == NvidiaDlssQuality::UltraPerformance) {
+        return 720;
+    }
+    return std::nullopt;
 }
 
-void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality) {
-    applied_ocarina_render_scale.store(quality ? static_cast<u32>(*quality) + 1 : 0,
-                                       std::memory_order_relaxed);
+void SetAppliedOcarinaRenderHeight(std::optional<u32> height) {
+    applied_ocarina_render_scale.store(height.value_or(0), std::memory_order_relaxed);
 }
 
-std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale() {
+std::optional<u32> AppliedOcarinaRenderHeight() {
     const u32 value = applied_ocarina_render_scale.load(std::memory_order_relaxed);
     if (value == 0) {
         return std::nullopt;
     }
-    return static_cast<NvidiaDlssQuality>(value - 1);
+    return value;
 }
 
 bool OcarinaMaxResolutionOn() {
@@ -171,14 +219,8 @@ bool OcarinaMaxResolutionOn() {
     return true;
 }
 
-u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale) {
-    if (scale == NvidiaDlssQuality::Performance) {
-        return 1080;
-    }
-    if (scale == NvidiaDlssQuality::UltraPerformance) {
-        return 720;
-    }
-    return 1440;
+u32 OcarinaRenderHeightFor(std::optional<u32> height) {
+    return height.value_or(1440);
 }
 
 std::string GetTimeZoneString(TimeZone time_zone) {

@@ -98,6 +98,7 @@
 
 #include <fmt/format.h>
 
+#include "common/lowend_sim.h"
 #include "common/logging.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/thread.h"
@@ -123,6 +124,7 @@ namespace Profile = VideoCommon::Nx2Profile;
 using Maxwell3D = Tegra::Engines::Maxwell3D;
 
 void Pause() noexcept {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
     _mm_pause();
 #elif defined(__x86_64__) || defined(__i386__)
@@ -796,7 +798,9 @@ void E2Main(std::stop_token) {
                      g_async ? AsyncPollLimit : E2PollLimit));
             continue;
         }
+        Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Back);
         RunJob(g.jobs[next % Slots]);
+        Common::LowEndSim::CpuWorkEnd();
         g.done.store(next, std::memory_order_seq_cst);
         WakeE1();
         if ((next & 1023) == 0) {

@@ -60,6 +60,12 @@ struct BuiltinPatchRecord {
     std::span<const u8> bytes;
     bool checked;
     u32 original;
+    /// When set, this environment variable at 1 leaves this one record out: a hook stays the
+    /// game's word while the rest of the patch applies (tests of one site of a patch).
+    const char* skip_env = nullptr;
+    /// When set, this record applies only while this environment variable is 1: the other form of
+    /// a word whose usual record has the same variable as its skip_env.
+    const char* need_env = nullptr;
 };
 
 struct BuiltinPatch {
@@ -81,10 +87,10 @@ struct BuiltinPatch {
     /// When set, guest state the patch keeps in the module (offset, size): it must lie in BSS.
     size_t state_offset = 0;
     size_t state_size = 0;
-    /// FRITCHII_DLSS_RENDER_SCALE: the DLSS quality whose render scale this patch sets. It needs
-    /// Max Resolution applied (it changes that path), and the renderer reads what was applied
-    /// (Settings::AppliedOcarinaRenderScale).
-    std::optional<Settings::NvidiaDlssQuality> render_scale{};
+    /// OoT's render height this patch sets (oot_render_height, Settings::OcarinaRenderHeight). It
+    /// needs Max Resolution applied (it changes that path), and the renderer reads what was
+    /// applied (Settings::AppliedOcarinaRenderHeight). 0 = not a render-height patch.
+    u32 render_height = 0;
 };
 
 // Ocarina of Time takes its "dynamic resolution disabled" path, so the 3D renders at full scale
@@ -99,32 +105,92 @@ constexpr std::array MAX_RESOLUTION_RECORDS{
 
 constexpr std::string_view MAX_RESOLUTION_NAME = "Max Resolution (built-in)";
 
-// DLSS render scales (FRITCHII_DLSS_RENDER_SCALE, ProfessorTee's community patch as ported to
-// Lichii): Max Resolution's fixed-scale path loads 1.0 of 2560x1440 (main+0x806420:
-// mov w9, #0x3f800000), which DLSS takes to 4K. The lower scales give the other modes' render
-// sizes; the emulator's resolution scale stays 1x, so every pass runs at the game's own size.
-constexpr u32 RENDER_SCALE_ONE = 0x52A7F009;                                  // 1.0
-constexpr std::array<u8, 4> RENDER_SCALE_PERFORMANCE{0x09, 0xE8, 0xA7, 0x52}; // 0.75, 1920x1080
-constexpr std::array<u8, 4> RENDER_SCALE_ULTRA{0x09, 0xE0, 0xA7, 0x52};       // 0.5, 1280x720
-constexpr std::array RENDER_PERFORMANCE_RECORDS{
-    BuiltinPatchRecord{.module_offset = 0x806420,
-                       .bytes = RENDER_SCALE_PERFORMANCE,
-                       .checked = true,
-                       .original = RENDER_SCALE_ONE},
-};
-constexpr std::array RENDER_ULTRA_RECORDS{
-    BuiltinPatchRecord{.module_offset = 0x806420,
-                       .bytes = RENDER_SCALE_ULTRA,
-                       .checked = true,
-                       .original = RENDER_SCALE_ONE},
-};
-
-bool OcarinaPerformanceScaleOn() {
-    return Settings::OcarinaDlssRenderScale() == Settings::NvidiaDlssQuality::Performance;
+// OoT's render heights (oot_render_height; before, FRITCHII_DLSS_RENDER_SCALE's DLSS qualities:
+// ProfessorTee's community patch as ported to Lichii): Max Resolution's fixed-scale path loads
+// 1.0 of 2560x1440 (main+0x806420: mov w9, #0x3f800000, the float's top 16 bits). Lower scales
+// make the game draw a smaller scene that DLSS or FSR enlarge; the emulator's resolution scale
+// stays 1x, so every pass of the game, its compute passes too, runs at the game's own size.
+constexpr u32 RENDER_SCALE_ONE = 0x52A7F009; // 1.0
+// mov w9, #imm16, lsl #16 with the scale's top 16 bits (each scale below is exact in them).
+constexpr std::array<u8, 4> RenderScaleBytes(u32 float_top) {
+    const u32 instruction = 0x52A00009U | (float_top << 5);
+    return {static_cast<u8>(instruction), static_cast<u8>(instruction >> 8),
+            static_cast<u8>(instruction >> 16), static_cast<u8>(instruction >> 24)};
 }
-
-bool OcarinaUltraScaleOn() {
-    return Settings::OcarinaDlssRenderScale() == Settings::NvidiaDlssQuality::UltraPerformance;
+constexpr std::array<u8, 4> RENDER_SCALE_360 = RenderScaleBytes(0x3E80);  // 0.25, 640x360
+constexpr std::array<u8, 4> RENDER_SCALE_540 = RenderScaleBytes(0x3EC0);  // 0.375, 960x540
+constexpr std::array<u8, 4> RENDER_SCALE_720 = RenderScaleBytes(0x3F00);  // 0.5, 1280x720
+constexpr std::array<u8, 4> RENDER_SCALE_810 = RenderScaleBytes(0x3F10);  // 0.5625, 1440x810
+constexpr std::array<u8, 4> RENDER_SCALE_900 = RenderScaleBytes(0x3F20);  // 0.625, 1600x900
+constexpr std::array<u8, 4> RENDER_SCALE_1080 = RenderScaleBytes(0x3F40); // 0.75, 1920x1080
+constexpr std::array<u8, 4> RENDER_SCALE_1260 = RenderScaleBytes(0x3F60); // 0.875, 2240x1260
+static_assert(RenderScaleBytes(0x3F80) == std::array<u8, 4>{0x09, 0xF0, 0xA7, 0x52});
+static_assert(RENDER_SCALE_1080 == std::array<u8, 4>{0x09, 0xE8, 0xA7, 0x52});
+static_assert(RENDER_SCALE_720 == std::array<u8, 4>{0x09, 0xE0, 0xA7, 0x52});
+static_assert(RENDER_SCALE_540 == std::array<u8, 4>{0x09, 0xD8, 0xA7, 0x52});
+static_assert(RENDER_SCALE_360 == std::array<u8, 4>{0x09, 0xD0, 0xA7, 0x52});
+constexpr std::array RENDER_360_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_360,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender360On() {
+    return Settings::OcarinaRenderHeight() == u32{360};
+}
+constexpr std::array RENDER_540_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_540,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender540On() {
+    return Settings::OcarinaRenderHeight() == u32{540};
+}
+constexpr std::array RENDER_720_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_720,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender720On() {
+    return Settings::OcarinaRenderHeight() == u32{720};
+}
+constexpr std::array RENDER_810_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_810,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender810On() {
+    return Settings::OcarinaRenderHeight() == u32{810};
+}
+constexpr std::array RENDER_900_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_900,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender900On() {
+    return Settings::OcarinaRenderHeight() == u32{900};
+}
+constexpr std::array RENDER_1080_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_1080,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender1080On() {
+    return Settings::OcarinaRenderHeight() == u32{1080};
+}
+constexpr std::array RENDER_1260_RECORDS{
+    BuiltinPatchRecord{.module_offset = 0x806420,
+                       .bytes = RENDER_SCALE_1260,
+                       .checked = true,
+                       .original = RENDER_SCALE_ONE},
+};
+bool OcarinaRender1260On() {
+    return Settings::OcarinaRenderHeight() == u32{1260};
 }
 
 // Texture pool patch (a ported community patch): with Max Resolution the
@@ -457,6 +523,7 @@ struct OotFixHook {
     size_t offset;
     std::array<u8, 4> bytes;
     u32 original;
+    const char* skip_env = nullptr; // =1 leaves this hook out (BuiltinPatchRecord::skip_env)
 };
 struct OotFixStub {
     size_t offset;
@@ -498,7 +565,7 @@ constexpr std::array<u8, 56> SOUND_FEED{
     0x10, 0xC6, 0x4C, 0xB9, 0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72,
     0x1F, 0x02, 0x11, 0x6B, 0xF0, 0x47, 0xC1, 0xA8, 0xA1, 0x00, 0x00, 0x54,
     0xF0, 0x0F, 0x9F, 0x3C, 0x10, 0x10, 0x2E, 0x1E, 0x00, 0x68, 0x30, 0x1E,
-    0xF0, 0x07, 0xC1, 0x3C, 0xB5, 0x3B, 0x1F, 0x17, // b 0x415338
+    0xF0, 0x07, 0xC1, 0x3C, 0x50, 0xE4, 0x6C, 0x17, // b 0x177f5a4 (HR_SOUND_COUNT, then 0x415338)
 };
 
 // Step counters: three counters cut the step or count frames. The ocarina playback tick adds
@@ -660,15 +727,24 @@ constexpr std::array<u8, 80> SCARECROW_LAST{
 // 0x2C2208C. High refresh: min(T+0x18 (step / 60), 1/60), 1/60 when that is not positive (the
 // bits compared as integers), so a step of 1 and more still gives the game's 1/60 exactly. One
 // stub per site (no bl: x30 stays as it is), x16/x17 saved.
-//   gate (else dark) ; save x16, x17 ; w17 = [T + 0x18] ; w16 = 0x3c888888 ;
+// Below 60 fps (a step over 1) it was the other way round: each frame simulated 1/60 s while the
+// game moved on step / 60, so the cloth trailed and over-swung (Link's cap flared out after he
+// stopped and took about a second to settle at 18 fps). Now, in both frame-step modes, the time is
+// T+0x18 itself, at most 4/60: the gate's b.ne to the game's load is a nop and the bound is 4/60
+// (one word each). A step of exactly 1 still gives 1/60 (the game's 60 fps value), and above 60 fps
+// nothing changes. Both step routines keep the step in (0, 3] at normal speed, so the bound only
+// limits Turbo; a step of 0 or less would also give 4/60, and neither routine returns one.
+// FRITCHII_NO_CLOTH_SLOW=1 puts back the two words of each stub (HR_FIX_VARIANTS): the high
+// refresh mode's min(T+0x18, 1/60) and Dark's mode's game load, as before.
+//   gate (nop: always on) ; save x16, x17 ; w17 = [T + 0x18] ; w16 = 0x3d888888 ;
 //   w17 = (w17 - 1 < w16 ? w17 - 1 : w16) + 1 ; fmov s0|s2, w17 ; restore ; b back
-//   dark: the game's load ; b back
+//   dark (unreached): the game's load ; b back
 constexpr std::array<u8, 92> CLOTH_DT_A{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x20, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0xAC, 0xFE, 0x13, 0x17,
     0x00, 0x6D, 0x46, 0xBD, 0xAA, 0xFE, 0x13, 0x17, // ldr s0, [x8, #0x66c] ; b 0x146330
@@ -676,9 +752,9 @@ constexpr std::array<u8, 92> CLOTH_DT_A{
 constexpr std::array<u8, 92> CLOTH_DT_B{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x20, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0xCA, 0x93, 0x19, 0x17,
     0x00, 0x01, 0x27, 0x1E, 0xC8, 0x93, 0x19, 0x17, // fmov s0, w8 ; b 0x2ab808
@@ -686,9 +762,9 @@ constexpr std::array<u8, 92> CLOTH_DT_B{
 constexpr std::array<u8, 92> CLOTH_DT_C{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x20, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0x9A, 0x67, 0xBF, 0x17,
     0x00, 0x6D, 0x46, 0xBD, 0x98, 0x67, 0xBF, 0x17, // ldr s0, [x8, #0x66c] ; b 0x2c207a8
@@ -696,13 +772,168 @@ constexpr std::array<u8, 92> CLOTH_DT_C{
 constexpr std::array<u8, 92> CLOTH_DT_D{
     0xF0, 0x47, 0xBF, 0xA9, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
     0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
-    0xF0, 0x47, 0xC1, 0xA8, 0xC1, 0x01, 0x00, 0x54, 0xF0, 0x47, 0xBF, 0xA9,
+    0xF0, 0x47, 0xC1, 0xA8, 0x1F, 0x20, 0x03, 0xD5, 0xF0, 0x47, 0xBF, 0xA9,
     0x70, 0x92, 0x00, 0xD0, 0x10, 0x92, 0x45, 0xF9, 0x11, 0x1A, 0x40, 0xB9,
-    0x10, 0x11, 0x91, 0x52, 0x10, 0x91, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
+    0x10, 0x11, 0x91, 0x52, 0x10, 0xB1, 0xA7, 0x72, 0x31, 0x06, 0x00, 0x51,
     0x3F, 0x02, 0x10, 0x6B, 0x31, 0x32, 0x90, 0x1A, 0x31, 0x06, 0x00, 0x11,
     0x22, 0x02, 0x27, 0x1E, 0xF0, 0x47, 0xC1, 0xA8, 0xBC, 0x6D, 0xBF, 0x17,
     0x02, 0x6D, 0x46, 0xBD, 0xBA, 0x6D, 0xBF, 0x17, // ldr s2, [x8, #0x66c] ; b 0x2c22090
 };
+
+// Counters that cut an amount of the step to whole units, with the amount of a 60 fps frame known
+// at the site. HR_WHOLE gives the whole units of that amount for one counter and keeps the rest:
+// in x13 the counter's address, w14 the bits of a 60 fps frame's amount, s0 the amount; out w12.
+// It gives the game's own cut unless the frame step calls the high refresh routine and
+// 0 < amount <= the 60 fps amount, so 60 fps and below, and Dark's mode, get the game's value
+// exactly (at the 60 fps amount the rest, under 1, cannot change the cut). Unlike STEP_TICKS it
+// starts a new counter from 0 and has slots of its own: 8 of {u64 address, f32 rest, pad} at state
+// +0x100 and the next slot to take at +0x180, so the ambient and step rate counters that fill
+// STEP_TICKS's table cannot push these out. Two things let it save nothing: every caller is
+// followed by a call before x12-x17, s16, s17 or the flags are read, and it keeps s0.
+//   w12 = fcvtzs(s0) ; call word is not ours, or bits - 1 >= w14 unsigned (0, negative, NaN and
+//   larger amounts): ret ; find x13's slot, none: take [next], next = (next + 1) & 7, key = x13,
+//   rest = 0 ; rest += s0 ; w12 = fcvtzs(rest) ; rest -= w12 ; ret
+// It sits after the high refresh routine, the one free run this long that no known cheat writes.
+constexpr size_t HR_WHOLE_OFFSET = 0x3C46E8C;
+constexpr std::array<u8, 132> HR_WHOLE{
+    0x0C, 0x00, 0x38, 0x1E, 0x0F, 0x55, 0xFE, 0x90, 0xEF, 0xC5, 0x4C, 0xB9,
+    0xF0, 0x09, 0x90, 0x52, 0xB0, 0x9A, 0xB2, 0x72, 0xFF, 0x01, 0x10, 0x6B,
+    0x41, 0x03, 0x00, 0x54, 0x0F, 0x00, 0x26, 0x1E, 0xEF, 0x05, 0x00, 0x51,
+    0xFF, 0x01, 0x0E, 0x6B, 0xC2, 0x02, 0x00, 0x54, 0xD0, 0x92, 0x00, 0x90,
+    0x10, 0x02, 0x3C, 0x91, 0x0E, 0x06, 0x41, 0xF8, 0xDF, 0x01, 0x0D, 0xEB,
+    0x60, 0x01, 0x00, 0x54, 0x1F, 0x1A, 0x40, 0xF2, 0x81, 0xFF, 0xFF, 0x54,
+    0x0E, 0x02, 0x40, 0xB9, 0xCF, 0x05, 0x00, 0x11, 0xEF, 0x09, 0x00, 0x12,
+    0x0F, 0x02, 0x00, 0xB9, 0x10, 0x02, 0x02, 0xD1, 0x10, 0x12, 0x0E, 0x8B,
+    0x0D, 0x06, 0x01, 0xF8, 0x1F, 0x82, 0x1F, 0xB8, 0x10, 0x82, 0x5F, 0xBC,
+    0x10, 0x2A, 0x20, 0x1E, 0x0C, 0x02, 0x38, 0x1E, 0x91, 0x01, 0x22, 0x1E,
+    0x10, 0x3A, 0x31, 0x1E, 0x10, 0x82, 0x1F, 0xBC, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr size_t HR_WHOLE_SLOTS_OFFSET = HR_FIX_STATE_OFFSET + 0x100;
+// The end-of-slots test is on the address, so the slots must start on a 0x80 boundary.
+static_assert(HR_WHOLE_SLOTS_OFFSET % 0x80 == 0);
+static_assert(AdrpTarget(HR_WHOLE_OFFSET + 0x2C, InstructionAt(HR_WHOLE, 0x2C)) +
+                  ((InstructionAt(HR_WHOLE, 0x30) >> 10) & 0xFFF) ==
+              HR_WHOLE_SLOTS_OFFSET);
+static_assert(HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE <= HR_WHOLE_OFFSET &&
+              HR_WHOLE_OFFSET + HR_WHOLE.size() <= TEXTURE_POOL_ROUTINE_OFFSET);
+
+// Time of day: each frame the clock's update (main+0x3CDF70) stores trunc(2 * step) game seconds
+// to +0x3C, which are then added to the seconds of the day. Above 60 fps the cut loses time: the
+// day runs slow below 120 fps (83% at 100) and stands still above it, with the sun swinging over
+// the frozen hour. The cut stored to +0x3C (fcvtzs w8, s0 at main+0x3CDFC0) goes through HR_WHOLE
+// with the counter x19 + 0x3C. The function's other cut, in the branch that sets the time from
+// another source (main+0x3CE160), stays the game's.
+//   x13 = x19 + 0x3c ; w14 = 2.0 ; bl HR_WHOLE ; w8 = w12 ; b 0x3cdfc4
+constexpr std::array<u8, 20> HR_TIME_STUB{
+    0x6D, 0xF2, 0x00, 0x91, 0x0E, 0x00, 0xA8, 0x52, 0x35, 0x01, 0x00, 0x94,
+    0xE8, 0x03, 0x0C, 0x2A, 0x81, 0x1D, 0x1E, 0x17,
+};
+
+// The Deku Tree's floor web: its update (main+0x632CB0, s8 = the elapsed time) runs
+// trunc(time / (1/60)) simulation steps, clamped to 0..3. Above 60 fps the cut is 0 every frame
+// and the web does not react when Link lands on it. The cut (fcvtzs w22, s0 at main+0x632D00) goes
+// through HR_WHOLE with a rest per web object (the counter x19 + 0x8F8), before the clamp, which
+// stays: a long pause still gives at most 3 steps and leaves no backlog.
+//   x13 = x19 + 0x8f8 ; w14 = 1.0 ; bl HR_WHOLE ; w22 = w12 ; b 0x632d04
+constexpr std::array<u8, 20> HR_WEB_STUB{
+    0x6D, 0xE2, 0x23, 0x91, 0x0E, 0xF0, 0xA7, 0x52, 0x30, 0x01, 0x00, 0x94,
+    0xF6, 0x03, 0x0C, 0x2A, 0xCC, 0xB0, 0x27, 0x17,
+};
+
+// The physics solver's steps: each update the game sets them to trunc(step * the steps of a 60 fps
+// frame + 0.001), stored to the solver's +0x2C8 (main+0x38AEB80 and main+0x38AFC10, the same code
+// in both). Below a step of 1 the count is cut short and changes from frame to frame as the
+// measured step wanders (8 x 0.49 gives 3, 8 x 0.5 gives 4), and it reaches 0 at high enough
+// rates, so moving platforms slide out from under the player. High refresh mode, step under 1:
+// the count is ceil(scaled - 0.1), at least 1, so a solver step never covers more time than at
+// 60 fps (give or take the 0.1 for jitter, which keeps a steady rate at a steady count). That is
+// never below the game's count. A step of 1 or more keeps the game's count, as does Dark's mode.
+// Both sites call it (bl over fcvtzs w1, s0): a blr follows at once, so x16, x17, s16, s17 and
+// x30 are free there. In: s0 = the game's float, s1 = the steps of a 60 fps frame. Out: w1.
+//   w1 = fcvtzs(s0) ; call word is not ours: ret ; s16 = s0 - 0.001 ; s16 <= 0 or s16 >= s1: ret ;
+//   w1 = max(fcvtzs(ceil(s16 - 0.1)), 1) ; ret
+constexpr std::array<u8, 8> HR_SOLVER_CONSTANTS{
+    0x6F, 0x12, 0x83, 0x3A, 0xCD, 0xCC, 0xCC, 0x3D, // 0.001f (the game's own), 0.1f
+};
+constexpr std::array<u8, 80> HR_SOLVER{
+    0x01, 0x00, 0x38, 0x1E, 0x10, 0x55, 0xFE, 0x90, 0x10, 0xC6, 0x4C, 0xB9,
+    0xF1, 0x09, 0x90, 0x52, 0xB1, 0x9A, 0xB2, 0x72, 0x1F, 0x02, 0x11, 0x6B,
+    0xA1, 0x01, 0x00, 0x54, 0x90, 0xF8, 0xFF, 0x1C, 0x10, 0x38, 0x30, 0x1E,
+    0x08, 0x22, 0x20, 0x1E, 0x2D, 0x01, 0x00, 0x54, 0x00, 0x22, 0x21, 0x1E,
+    0xEA, 0x00, 0x00, 0x54, 0xF1, 0xF7, 0xFF, 0x1C, 0x10, 0x3A, 0x31, 0x1E,
+    0x10, 0xC2, 0x24, 0x1E, 0x10, 0x02, 0x38, 0x1E, 0x1F, 0x06, 0x00, 0x71,
+    0x01, 0xC6, 0x9F, 0x1A, 0xC0, 0x03, 0x5F, 0xD6,
+};
+
+// Epona's fence jump: the horse's jump state machine (main+0x2C39EB0, s10 = its step) sets the
+// blend frames into its JumpReady animation so the blend ends at takeoff, except below a step of 1,
+// which at 60 fps means slow motion: then it adds the step to last frame's blend frames instead
+// (fcmp s10, #1.0 ; b.pl at main+0x2C3AE1C). In the high refresh mode every step is under 1, so
+// the blend frames grew each frame, the jump animation never blended in, and Epona galloped
+// through the fence at ground level while her body jumped. Now the b.pl goes to a stub that also
+// skips the slow-motion branch when the high refresh mode is on and the step is the frame's own
+// (within about 0.1% of [T+0x10], compared as bits): real slow motion, a step under the frame's,
+// and every other case keep the game's test. x9, x10 and the flags are dead at both targets.
+//   b.pl skip ; call word is not ours: slow ; w9 = |bits(s10) - bits([T + 0x10])| ;
+//   w9 <= 8192: skip ; slow: b 0x2c3ae24 ; skip: b 0x2c3ae48
+constexpr std::array<u8, 68> HR_HORSE_STUB{
+    0x05, 0x02, 0x00, 0x54, 0x09, 0x55, 0xFE, 0x90, 0x29, 0xC5, 0x4C, 0xB9,
+    0xEA, 0x09, 0x90, 0x52, 0xAA, 0x9A, 0xB2, 0x72, 0x3F, 0x01, 0x0A, 0x6B,
+    0x21, 0x01, 0x00, 0x54, 0x69, 0x92, 0x00, 0xD0, 0x29, 0x91, 0x45, 0xF9,
+    0x2A, 0x11, 0x40, 0xB9, 0x49, 0x01, 0x26, 0x1E, 0x29, 0x01, 0x0A, 0x6B,
+    0x29, 0x55, 0x89, 0x5A, 0x3F, 0x09, 0x40, 0x71, 0x49, 0x00, 0x00, 0x54,
+    0x8E, 0xD0, 0xBF, 0x17, 0x96, 0xD0, 0xBF, 0x17,
+};
+
+// Song notes: after a song is played, its playback (main+0x3292AF0) goes on to the next note on
+// each update it finds the note flag set (f_832b7b50's result, w0), a word the sound engine sets
+// when the melody reaches a note and clears on its next run. SOUND_GATE runs the sound job at
+// 60 Hz above 60 fps, so the playback found the flag set on two or three updates in a row and
+// showed that many notes at once, ahead of the music. The same holds for the ocarina's other
+// melody playback (main+0x3292DC0). HR_SOUND_COUNT counts the sound job's runs (SOUND_FEED's way
+// back now goes through it, in both modes); each playback keeps the count at its last set read,
+// and a flag read set again before another run reads clear. Only in the high refresh mode; at
+// 60 fps and below the job runs every frame, so every once-a-frame read sees a new count and the
+// game's value. The two tbz w0, #0 after the calls (main+0x3292C88, 0x3292ED4) go to small stubs
+// that save x16/x17 and call HR_SONG_CUE with the playback's slot (0 or 4) in w17.
+//   stub: save ; w17 = slot ; bl HR_SONG_CUE ; restore ; tbz w0, #0, clear ; b set ; clear: b ...
+//   HR_SONG_CUE: w0 clear or call word not ours: ret ; runs = [state + 8] ; old = [state + w17] ;
+//                [state + w17] = runs ; old == runs: w0 = 0 ; ret (x14, x15 saved)
+//   HR_SOUND_COUNT: save x16, x17 ; [state + 8] += 1 ; restore ; b 0x415338
+// HR_SONG_B_STUB and HR_SOUND_COUNT sit in two of the 28-byte gaps between the game's functions
+// (main+0x177F364, 0x177F5A4), past the ones mods are known to claim (to main+0x177D1C0).
+constexpr std::array<u8, 28> HR_SONG_A_STUB{
+    0xF0, 0x47, 0xBF, 0xA9, 0x11, 0x00, 0x80, 0x52, 0x73, 0x01, 0x00, 0x94,
+    0xF0, 0x47, 0xC1, 0xA8, 0x40, 0x00, 0x00, 0x36, 0xA6, 0x30, 0xD9, 0x17,
+    0xA7, 0x30, 0xD9, 0x17,
+};
+constexpr std::array<u8, 28> HR_SONG_B_STUB{
+    0xF0, 0x47, 0xBF, 0xA9, 0x91, 0x00, 0x80, 0x52, 0x12, 0x1F, 0x93, 0x94,
+    0xF0, 0x47, 0xC1, 0xA8, 0x40, 0x00, 0x00, 0x36, 0xD8, 0x4E, 0x6C, 0x14,
+    0x32, 0x4F, 0x6C, 0x14,
+};
+constexpr std::array<u8, 72> HR_SONG_CUE{
+    0xEE, 0x3F, 0xBF, 0xA9, 0xE0, 0x01, 0x00, 0x36, 0x0E, 0x55, 0xFE, 0x90,
+    0xCE, 0xC5, 0x4C, 0xB9, 0xEF, 0x09, 0x90, 0x52, 0xAF, 0x9A, 0xB2, 0x72,
+    0xDF, 0x01, 0x0F, 0x6B, 0x21, 0x01, 0x00, 0x54, 0xD0, 0x92, 0x00, 0x90,
+    0x10, 0x42, 0x3E, 0x91, 0x0E, 0x0A, 0x40, 0xB9, 0x0F, 0x6A, 0x71, 0xB8,
+    0x0E, 0x6A, 0x31, 0xB8, 0xFF, 0x01, 0x0E, 0x6B, 0x41, 0x00, 0x00, 0x54,
+    0xE0, 0x03, 0x1F, 0x2A, 0xEE, 0x3F, 0xC1, 0xA8, 0xC0, 0x03, 0x5F, 0xD6,
+};
+constexpr std::array<u8, 28> HR_SOUND_COUNT{
+    0xF0, 0x47, 0xBF, 0xA9, 0xF0, 0xB8, 0x01, 0xF0, 0x11, 0x9A, 0x4F, 0xB9,
+    0x31, 0x06, 0x00, 0x11, 0x11, 0x9A, 0x0F, 0xB9, 0xF0, 0x47, 0xC1, 0xA8,
+    0x5F, 0x57, 0xB2, 0x17,
+};
+constexpr size_t HR_SONG_STATE_OFFSET = HR_FIX_STATE_OFFSET + 0x190; // u32 A, u32 B, u32 runs
+static_assert(AdrpTarget(0x3C46FB4 + 0x20, InstructionAt(HR_SONG_CUE, 0x20)) +
+                  AddImmediate(InstructionAt(HR_SONG_CUE, 0x24)) ==
+              HR_SONG_STATE_OFFSET);
+static_assert(AdrpTarget(0x177F5A4 + 0x4, InstructionAt(HR_SOUND_COUNT, 0x4)) +
+                  ((InstructionAt(HR_SOUND_COUNT, 0x8) >> 10) & 0xFFF) * 4 ==
+              HR_SONG_STATE_OFFSET + 8);
+static_assert(InstructionAt(SOUND_FEED, 0x34) == EncodeBl(0x3C46464, 0x177F5A4) - 0x80000000U &&
+              InstructionAt(HR_SOUND_COUNT, 0x18) == EncodeBl(0x177F5BC, 0x415338) - 0x80000000U);
 
 // The hooks (each checked to hold the game's word), then the stubs in address order.
 constexpr std::array HR_FIX_HOOKS{
@@ -739,6 +970,20 @@ constexpr std::array HR_FIX_HOOKS{
     OotFixHook{0x2AB804, {0x23, 0x6C, 0xE6, 0x14}, 0x1E270100}, // fmov s0, w8 -> b 0x3c46890
     OotFixHook{0x2C207A4, {0x53, 0x98, 0x40, 0x14}, 0xBD466D00}, // ldr s0, [x8, #0x66c] -> b 0x3c468f0
     OotFixHook{0x2C2208C, {0x31, 0x92, 0x40, 0x14}, 0xBD466D02}, // ldr s2, [x8, #0x66c] -> b 0x3c46950
+    OotFixHook{0x3CDFC0, {0x7C, 0xE2, 0xE1, 0x14}, 0x1E380008, // fcvtzs w8, s0 -> b 0x3c469b0
+               "FRITCHII_NO_HR_TIME"},
+    OotFixHook{0x632D00, {0x31, 0x4F, 0xD8, 0x14}, 0x1E380016, // fcvtzs w22, s0 -> b 0x3c469c4
+               "FRITCHII_NO_HR_WEB"},
+    OotFixHook{0x38AEBF4, {0xAE, 0x5F, 0x0E, 0x94}, 0x1E380001, // fcvtzs w1, s0 -> bl 0x3c46aac
+               "FRITCHII_NO_HR_SOLVER"},
+    OotFixHook{0x38AFD20, {0x63, 0x5B, 0x0E, 0x94}, 0x1E380001, // fcvtzs w1, s0 -> bl 0x3c46aac
+               "FRITCHII_NO_HR_SOLVER"},
+    OotFixHook{0x2C3AE20, {0x64, 0x2F, 0x40, 0x14}, 0x54000145, // b.pl 0x2c3ae48 -> b 0x3c46bb0
+               "FRITCHII_NO_HR_HORSE"},
+    OotFixHook{0x3292C88, {0x56, 0xCF, 0x26, 0x14}, 0x36000060, // tbz w0, #0 -> b 0x3c469e0
+               "FRITCHII_NO_HR_SONG"},
+    OotFixHook{0x3292ED4, {0x24, 0xB1, 0x93, 0x17}, 0x36000B80, // tbz w0, #0 -> b 0x177f364
+               "FRITCHII_NO_HR_SONG"},
 };
 constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C463A0, SOUND_GATE},
@@ -758,29 +1003,120 @@ constexpr std::array HR_FIX_STUBS{
     OotFixStub{0x3C46890, CLOTH_DT_B},
     OotFixStub{0x3C468F0, CLOTH_DT_C},
     OotFixStub{0x3C46950, CLOTH_DT_D},
+    OotFixStub{0x3C469B0, HR_TIME_STUB},
+    OotFixStub{0x3C469C4, HR_WEB_STUB},
+    OotFixStub{0x3C469D8, HR_SOLVER_CONSTANTS},
+    OotFixStub{0x3C469E0, HR_SONG_A_STUB},
+    OotFixStub{0x3C46AAC, HR_SOLVER},
 };
-// The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10.
-constexpr size_t HR_FIX_STATE_SIZE = 0x100;
-// The stubs in order, in free padding between the Hyrule Cheat Menu and the pickup stub; their
-// state inside the BSS, clear of Dark's timer state, the ripple and pickup slots and the cheats'
-// flags from main+0x4E9FF80.
+// Stubs in the gaps between the game's functions (the free 28-byte ones past main+0x177D1C0).
+constexpr std::array HR_FIX_SLOT_STUBS{
+    OotFixStub{0x177F364, HR_SONG_B_STUB},
+    OotFixStub{0x177F5A4, HR_SOUND_COUNT},
+};
 static_assert([] {
-    size_t end = HR_FIX_CAVE_START;
-    for (const OotFixStub& stub : HR_FIX_STUBS) {
-        if (stub.offset < end || stub.offset % 4 != 0 || stub.bytes.size() % 4 != 0) {
+    size_t end = 0x177D1C0;
+    for (const OotFixStub& stub : HR_FIX_SLOT_STUBS) {
+        if (stub.offset < end || stub.offset % 4 != 0 || stub.bytes.size() > 28 ||
+            stub.offset + stub.bytes.size() > 0x177F6A8) {
             return false;
         }
         end = stub.offset + stub.bytes.size();
     }
-    return HR_FIX_CAVE_START >= 0x3C46398 && end <= PICKUP_STUB_OFFSET;
+    return true;
+}());
+// Stubs past the pickup stub, also in address order.
+constexpr std::array HR_FIX_LATE_STUBS{
+    OotFixStub{0x3C46BB0, HR_HORSE_STUB},
+    OotFixStub{HR_WHOLE_OFFSET, HR_WHOLE},
+    OotFixStub{0x3C46FB4, HR_SONG_CUE},
+};
+// The sound accumulator and flag at +0, the step slots' index at +8, the 15 slots from +0x10, and
+// from +0x100 HR_WHOLE's 8 slots and its next-slot word, from +0x190 the song notes' two slots and
+// the sound job's run count.
+constexpr size_t HR_FIX_STATE_SIZE = 0x1A0;
+// The stubs in order, in free padding between the Hyrule Cheat Menu and the pickup stub; their
+// state inside the BSS, clear of Dark's timer state, the ripple and pickup slots and the cheats'
+// flags from main+0x4E9FF80. Known cheats write their own code to main+0x3C46A00..0x3C46AAC and
+// main+0x3C46CC0..0x3C46DB0 while the game runs, which no check at load can see: no stub there.
+constexpr bool HrFixStubsInOrder(std::span<const OotFixStub> stubs, size_t start, size_t limit) {
+    size_t end = start;
+    for (const OotFixStub& stub : stubs) {
+        if (stub.offset < end || stub.offset % 4 != 0 || stub.bytes.size() % 4 != 0) {
+            return false;
+        }
+        end = stub.offset + stub.bytes.size();
+        const auto touches = [&](size_t first, size_t last) {
+            return stub.offset < last && first < end;
+        };
+        if (touches(0x3C46A00, 0x3C46AAC) || touches(0x3C46CC0, 0x3C46DB0)) {
+            return false;
+        }
+    }
+    return end <= limit;
+}
+static_assert(HR_FIX_CAVE_START >= 0x3C46398 &&
+              HrFixStubsInOrder(HR_FIX_STUBS, HR_FIX_CAVE_START, PICKUP_STUB_OFFSET));
+// The late stubs: after the pickup stub, to the end of the page, around the words other built-ins
+// write there and the community ultrawide mod's spot (main+0x3C46C00..0x3C46DC0).
+static_assert(HrFixStubsInOrder(HR_FIX_LATE_STUBS, PICKUP_STUB_OFFSET + PICKUP_STUB.size(),
+                                0x3C47000));
+static_assert([] {
+    constexpr std::array<std::pair<size_t, size_t>, 5> taken{{
+        {0x3C46C00, 0x3C46E00}, // the ultrawide mod's spot, the shadow steps, the texture heap gap
+        {HIGH_REFRESH_ROUTINE_OFFSET, HIGH_REFRESH_ROUTINE_OFFSET + OOT_CAVE_SIZE},
+        {TEXTURE_POOL_ROUTINE_OFFSET, TEXTURE_POOL_ROUTINE_OFFSET + TEXTURE_POOL_ROUTINE.size()},
+        {WATER_ROUTINE_OFFSET, WATER_ROUTINE_OFFSET + WATER_ROUTINE.size()},
+        {PICKUP_STUB_OFFSET, PICKUP_STUB_OFFSET + PICKUP_STUB.size()},
+    }};
+    for (const OotFixStub& stub : HR_FIX_LATE_STUBS) {
+        for (const auto& [first, last] : taken) {
+            if (stub.offset < last && first < stub.offset + stub.bytes.size()) {
+                return false;
+            }
+        }
+    }
+    return true;
 }());
 static_assert(HR_FIX_STATE_OFFSET >= 0x4E9B000 &&
               HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= HIGH_REFRESH_STATE_OFFSET &&
-              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET);
+              HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= PICKUP_STATE_OFFSET &&
+              HR_WHOLE_SLOTS_OFFSET + 0x84 <= HR_SONG_STATE_OFFSET &&
+              HR_SONG_STATE_OFFSET + 0xC <= HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE);
+// Stub words with a second form a test switch puts back: the stub's word applies unless the switch
+// is 1, the old word only while it is 1.
+struct OotFixVariant {
+    size_t offset;
+    std::array<u8, 4> old_bytes;
+    const char* env;
+};
+constexpr std::array<u8, 4> CLOTH_OLD_GATE{0xC1, 0x01, 0x00, 0x54};  // b.ne +0x38 (the game's load)
+constexpr std::array<u8, 4> CLOTH_OLD_BOUND{0x10, 0x91, 0xA7, 0x72}; // movk w16, #0x3c88, lsl #16
+constexpr std::array HR_FIX_VARIANTS{
+    OotFixVariant{0x3C46830 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46830 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46890 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46890 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C468F0 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C468F0 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46950 + 0x1C, CLOTH_OLD_GATE, "FRITCHII_NO_CLOTH_SLOW"},
+    OotFixVariant{0x3C46950 + 0x34, CLOTH_OLD_BOUND, "FRITCHII_NO_CLOTH_SLOW"},
+};
+// The cloth stubs' two changed words: a nop over the gate's b.ne, the 4/60 bound's movk.
+static_assert(InstructionAt(CLOTH_DT_A, 0x1C) == 0xD503201F && InstructionAt(CLOTH_DT_B, 0x1C) == 0xD503201F &&
+              InstructionAt(CLOTH_DT_C, 0x1C) == 0xD503201F && InstructionAt(CLOTH_DT_D, 0x1C) == 0xD503201F);
+static_assert(InstructionAt(CLOTH_DT_A, 0x34) == 0x72A7B110 && InstructionAt(CLOTH_DT_B, 0x34) == 0x72A7B110 &&
+              InstructionAt(CLOTH_DT_C, 0x34) == 0x72A7B110 && InstructionAt(CLOTH_DT_D, 0x34) == 0x72A7B110);
 // The hooks over the game's words, then every stub word, each checked to be zero.
-constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + [] {
+constexpr size_t HR_FIX_RECORD_COUNT = HR_FIX_HOOKS.size() + HR_FIX_VARIANTS.size() + [] {
     size_t words = 0;
     for (const OotFixStub& stub : HR_FIX_STUBS) {
+        words += stub.bytes.size() / 4;
+    }
+    for (const OotFixStub& stub : HR_FIX_LATE_STUBS) {
+        words += stub.bytes.size() / 4;
+    }
+    for (const OotFixStub& stub : HR_FIX_SLOT_STUBS) {
         words += stub.bytes.size() / 4;
     }
     return words;
@@ -792,19 +1128,61 @@ constexpr auto HR_FIX_RECORDS = [] {
         records[i++] = BuiltinPatchRecord{.module_offset = hook.offset,
                                           .bytes = hook.bytes,
                                           .checked = true,
-                                          .original = hook.original};
+                                          .original = hook.original,
+                                          .skip_env = hook.skip_env};
     }
-    for (const OotFixStub& stub : HR_FIX_STUBS) {
-        for (size_t offset = 0; offset < stub.bytes.size(); offset += 4) {
-            records[i++] = BuiltinPatchRecord{.module_offset = stub.offset + offset,
-                                              .bytes = stub.bytes.subspan(offset, 4),
-                                              .checked = true,
-                                              .original = 0};
+    const auto add_stubs = [&](std::span<const OotFixStub> stubs) {
+        for (const OotFixStub& stub : stubs) {
+            for (size_t offset = 0; offset < stub.bytes.size(); offset += 4) {
+                const char* skip_env = nullptr;
+                for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
+                    if (variant.offset == stub.offset + offset) {
+                        skip_env = variant.env;
+                    }
+                }
+                records[i++] = BuiltinPatchRecord{.module_offset = stub.offset + offset,
+                                                  .bytes = stub.bytes.subspan(offset, 4),
+                                                  .checked = true,
+                                                  .original = 0,
+                                                  .skip_env = skip_env};
+            }
         }
+    };
+    add_stubs(HR_FIX_STUBS);
+    add_stubs(HR_FIX_LATE_STUBS);
+    add_stubs(HR_FIX_SLOT_STUBS);
+    for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
+        records[i++] = BuiltinPatchRecord{.module_offset = variant.offset,
+                                          .bytes = variant.old_bytes,
+                                          .checked = true,
+                                          .original = 0,
+                                          .need_env = variant.env};
     }
     return records;
 }();
 constexpr std::string_view HR_FIX_NAME = "High refresh fixes (built-in)";
+// Every variant replaces a word some stub writes.
+static_assert([] {
+    for (const OotFixVariant& variant : HR_FIX_VARIANTS) {
+        size_t writers = 0;
+        for (const BuiltinPatchRecord& record : HR_FIX_RECORDS) {
+            writers += record.module_offset == variant.offset && record.skip_env == variant.env;
+        }
+        if (writers != 1) {
+            return false;
+        }
+    }
+    return true;
+}());
+
+bool BuiltinRecordSkipped(const BuiltinPatchRecord& record) {
+    const auto set = [](const char* name) {
+        const char* const value = std::getenv(name);
+        return value != nullptr && std::string_view{value} == "1";
+    };
+    return (record.skip_env != nullptr && set(record.skip_env)) ||
+           (record.need_env != nullptr && !set(record.need_env));
+}
 
 bool HighRefreshSettingOn() {
     // Tests boot either way without touching the player's config: EDEN_NX2_OOT_HIGH_REFRESH=0/1.
@@ -866,6 +1244,59 @@ constexpr std::array SHADOW_STEPS_RECORDS{
     BuiltinPatchRecord{.module_offset = 0x3C46DC8, .bytes = SHADOW_STEPS_AND, .checked = true, .original = 0},
     BuiltinPatchRecord{.module_offset = 0x3C46DCC, .bytes = SHADOW_STEPS_RETURN, .checked = true, .original = 0},
 };
+
+// Texture heap tidy-up at most once a second: the game keeps its textures' storage in one heap and
+// tidies it in rounds on a thread of its own (aglTextureDataMgr::Compaction). The texture data
+// manager's per-frame step (main+0x777240, under its lock) asks for a new round at every frame no
+// round runs: its flags byte (+0x3C0) has bit 1 set once at setup. Every texture a round moves is
+// made again at its new address, which for us is a new image, a new upload and new descriptors: in
+// the market the heap sits at its 5% free line and the rounds never stop (the thread wanted the
+// cores 231-261 ms a second in the 6.0 market profile). Now a round may start at most once a second
+// (the guest's 19.2 MHz counter); the round itself, what it moves and how, is the game's, and a
+// started round always finishes. Not tied to the frame rate: it applies at any fps and in both
+// frame-step modes. The one risk: the heap is more fragmented than the game expects between rounds.
+// tbz w8, #1, 0x777288 at main+0x777278 branches to:
+//   tbz w8, #1, skip ; x9 = cntpct ; x8 = x9 - [last] ; x8 < 19.2 M: skip ;
+// (CNTPCT_EL0, the counter the game itself reads: the JIT has no CNTVCT_EL0 and aborted on it.)
+//   [last] = x9 ; b 0x77727c (ask) ; skip: b 0x777288
+// x8-x11 and the flags are dead at both targets. State: the last ask's counter value.
+constexpr size_t TEX_GAP_HOOK_OFFSET = 0x777278;
+constexpr size_t TEX_GAP_STUB_OFFSET = 0x3C46DD0;
+constexpr std::array<u8, 4> TEX_GAP_HOOK{0xD6, 0x3E, 0xD3, 0x14}; // b 0x3c46dd0
+constexpr std::array<u8, 48> TEX_GAP_STUB{
+    0x68, 0x01, 0x08, 0x36, 0x29, 0xE0, 0x3B, 0xD5, 0xCA, 0x92, 0x00, 0x90,
+    0x48, 0xD1, 0x47, 0xF9, 0x28, 0x01, 0x08, 0xCB, 0x0B, 0x00, 0x9F, 0x52,
+    0x8B, 0x24, 0xA0, 0x72, 0x1F, 0x01, 0x0B, 0xEB, 0x63, 0x00, 0x00, 0x54,
+    0x49, 0xD1, 0x07, 0xF9, 0x21, 0xC1, 0x2C, 0x17, 0x23, 0xC1, 0x2C, 0x17,
+};
+constexpr size_t TEX_GAP_STATE_OFFSET = 0x4E9EFA0;
+constexpr size_t TEX_GAP_STATE_SIZE = 0x8;
+static_assert(InstructionAt(TEX_GAP_HOOK, 0) == EncodeBl(TEX_GAP_HOOK_OFFSET, TEX_GAP_STUB_OFFSET) - 0x80000000U);
+static_assert(AdrpTarget(TEX_GAP_STUB_OFFSET + 0x8, InstructionAt(TEX_GAP_STUB, 0x8)) +
+                  ((InstructionAt(TEX_GAP_STUB, 0xC) >> 10) & 0xFFF) * 8 ==
+              TEX_GAP_STATE_OFFSET);
+// After the shadow steps' four words, before the high refresh routine, clear of the code known
+// cheats write from main+0x3C46CC0 to 0x3C46DB0.
+static_assert(TEX_GAP_STUB_OFFSET >= 0x3C46DD0 &&
+              TEX_GAP_STUB_OFFSET + TEX_GAP_STUB.size() <= HIGH_REFRESH_ROUTINE_OFFSET);
+// Its state after the high refresh fixes' (BSS no mod is known to write below main+0x4E9F000).
+static_assert(HR_FIX_STATE_OFFSET + HR_FIX_STATE_SIZE <= TEX_GAP_STATE_OFFSET &&
+              TEX_GAP_STATE_OFFSET % 8 == 0 &&
+              TEX_GAP_STATE_OFFSET + TEX_GAP_STATE_SIZE <= 0x4E9F000);
+constexpr auto TEX_GAP_RECORDS = [] {
+    std::array<BuiltinPatchRecord, 1 + TEX_GAP_STUB.size() / 4> records{};
+    records[0] = BuiltinPatchRecord{.module_offset = TEX_GAP_HOOK_OFFSET,
+                                    .bytes = TEX_GAP_HOOK,
+                                    .checked = true,
+                                    .original = 0x36080088}; // tbz w8, #1, 0x777288
+    for (size_t i = 1, offset = 0; offset < TEX_GAP_STUB.size(); ++i, offset += 4) {
+        records[i] = BuiltinPatchRecord{.module_offset = TEX_GAP_STUB_OFFSET + offset,
+                                        .bytes = std::span<const u8>{TEX_GAP_STUB}.subspan(offset, 4),
+                                        .checked = true,
+                                        .original = 0};
+    }
+    return records;
+}();
 
 constexpr std::array BUILTIN_PATCHES{
     BuiltinPatch{
@@ -967,27 +1398,137 @@ constexpr std::array BUILTIN_PATCHES{
         // shadows unchanged in the screenshot. FRITCHII_NO_SHADOW_STEPS=1 turns it off.
         .disable_env = "FRITCHII_NO_SHADOW_STEPS",
     },
-    // FRITCHII_DLSS_RENDER_SCALE: the NVIDIA DLSS quality lowers OoT's render resolution under
-    // Max Resolution (listed in Add-Ons only while it applies).
+    // Applies to everyone at any frame rate. FRITCHII_NO_TEX_COMPACT_GAP=1 turns it off (the game
+    // asks for a round at every frame, as before), =0 applies it even when Add-Ons has it off.
     BuiltinPatch{
-        .name = "DLSS Performance render scale (built-in)",
+        .name = "Texture heap tidy-up once a second (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_PERFORMANCE_RECORDS,
-        .setting_enabled = &OcarinaPerformanceScaleOn,
-        .render_scale = Settings::NvidiaDlssQuality::Performance,
+        .records = TEX_GAP_RECORDS,
+        .disable_env = "FRITCHII_NO_TEX_COMPACT_GAP",
+        .state_offset = TEX_GAP_STATE_OFFSET,
+        .state_size = TEX_GAP_STATE_SIZE,
+    },
+    // OoT's render height (oot_render_height, Settings::OcarinaRenderHeight) under Max
+    // Resolution with DLSS or FSR. The picture menu owns it: not in Add-Ons, where unticking one
+    // would leave the menu naming a height the game doesn't draw.
+    BuiltinPatch{
+        .name = "360p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_360_RECORDS,
+        .setting_enabled = &OcarinaRender360On,
+        .render_height = 360,
     },
     BuiltinPatch{
-        .name = "DLSS Ultra Performance render scale (built-in)",
+        .name = "540p render (built-in)",
         .title_id = 0x0400486024DEC000,
         .module = "main",
         .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
-        .records = RENDER_ULTRA_RECORDS,
-        .setting_enabled = &OcarinaUltraScaleOn,
-        .render_scale = Settings::NvidiaDlssQuality::UltraPerformance,
+        .records = RENDER_540_RECORDS,
+        .setting_enabled = &OcarinaRender540On,
+        .render_height = 540,
+    },
+    BuiltinPatch{
+        .name = "720p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_720_RECORDS,
+        .setting_enabled = &OcarinaRender720On,
+        .render_height = 720,
+    },
+    BuiltinPatch{
+        .name = "810p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_810_RECORDS,
+        .setting_enabled = &OcarinaRender810On,
+        .render_height = 810,
+    },
+    BuiltinPatch{
+        .name = "900p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_900_RECORDS,
+        .setting_enabled = &OcarinaRender900On,
+        .render_height = 900,
+    },
+    BuiltinPatch{
+        .name = "1080p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_1080_RECORDS,
+        .setting_enabled = &OcarinaRender1080On,
+        .render_height = 1080,
+    },
+    BuiltinPatch{
+        .name = "1260p render (built-in)",
+        .title_id = 0x0400486024DEC000,
+        .module = "main",
+        .build_id = "E0F3CCFAF50065AE4EA01EB5AEB13B1A45DA3348",
+        .records = RENDER_1260_RECORDS,
+        .setting_enabled = &OcarinaRender1260On,
+        .render_height = 1260,
     },
 };
+
+// The JIT translates only these system registers (dynarmic's A64 impl/system.cpp): an MRS or MSR
+// of any other ends the game with "unreachable" the first time the patched code runs, which no
+// test sees until a game reaches that code (the texture heap stub's CNTVCT_EL0, 2026-11-19). So
+// every word of every built-in patch is checked here, at build time. Words are compared with
+// their register field (Rt) cleared.
+constexpr bool PatchWordRunsOnJit(u32 word) {
+    const u32 no_rt = word & ~u32{0x1F};
+    if ((word & 0xFFF00000U) == 0xD5300000U) { // MRS
+        constexpr std::array<u32, 9> readable{
+            0xD53BE000U, // CNTFRQ_EL0
+            0xD53BE020U, // CNTPCT_EL0
+            0xD53B0020U, // CTR_EL0
+            0xD53B00E0U, // DCZID_EL0
+            0xD53B4400U, // FPCR
+            0xD53B4420U, // FPSR
+            0xD53B4200U, // NZCV
+            0xD53BD040U, // TPIDR_EL0
+            0xD53BD060U, // TPIDRRO_EL0
+        };
+        return std::ranges::find(readable, no_rt) != readable.end();
+    }
+    if ((word & 0xFFF00000U) == 0xD5100000U) { // MSR (register)
+        constexpr std::array<u32, 4> writable{
+            0xD51B4400U, // FPCR
+            0xD51B4420U, // FPSR
+            0xD51B4200U, // NZCV
+            0xD51BD040U, // TPIDR_EL0
+        };
+        return std::ranges::find(writable, no_rt) != writable.end();
+    }
+    return true;
+}
+static_assert(!PatchWordRunsOnJit(0xD53BE049U), "CNTVCT_EL0 must be refused");
+static_assert(PatchWordRunsOnJit(0xD53BE029U), "CNTPCT_EL0 must pass");
+static_assert(std::ranges::all_of(BUILTIN_PATCHES, [](const BuiltinPatch& patch) {
+                  return std::ranges::all_of(patch.records, [](const BuiltinPatchRecord& record) {
+                      if (record.module_offset % 4 != 0 || record.bytes.size() % 4 != 0) {
+                          return true;
+                      }
+                      for (size_t i = 0; i < record.bytes.size(); i += 4) {
+                          const u32 word = u32{record.bytes[i]} | (u32{record.bytes[i + 1]} << 8) |
+                                           (u32{record.bytes[i + 2]} << 16) |
+                                           (u32{record.bytes[i + 3]} << 24);
+                          if (!PatchWordRunsOnJit(word)) {
+                              return false;
+                          }
+                      }
+                      return true;
+                  });
+              }),
+              "a built-in patch reads or writes a system register the JIT does not translate");
 
 // Whether [offset, offset + size) of a module (offsets after its NSO header) lies in its BSS.
 bool InModuleBss(const Loader::NSOHeader& header, u64 offset, u64 size) {
@@ -1559,7 +2100,7 @@ std::vector<VirtualFile> PatchManager::CollectPatches(const std::vector<VirtualD
 
 std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::string& name) const {
     if (name == "main") {
-        Settings::SetAppliedOcarinaRenderScale(std::nullopt);
+        Settings::SetAppliedOcarinaRenderHeight(std::nullopt);
     }
     if (nso.size() < sizeof(Loader::NSOHeader)) {
         return nso;
@@ -1698,7 +2239,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             LOG_INFO(Loader, "    - Skipping \"{}\": {}=1", patch.name, patch.disable_env);
             continue;
         }
-        if (ab != "0" &&
+        // A render height unticked in an earlier build counts for nothing: the row is gone.
+        if (ab != "0" && patch.render_height == 0 &&
             std::find(disabled.cbegin(), disabled.cend(), patch.name) != disabled.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": disabled in Add-Ons", patch.name);
             continue;
@@ -1708,7 +2250,7 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
                      patch.build_id);
             continue;
         }
-        if (patch.render_scale &&
+        if (patch.render_height != 0 &&
             std::find(applied.cbegin(), applied.cend(), MAX_RESOLUTION_NAME) == applied.cend()) {
             LOG_INFO(Loader, "    - Skipping \"{}\": it needs \"{}\"", patch.name,
                      MAX_RESOLUTION_NAME);
@@ -1723,6 +2265,9 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
         // user mod already (the mod's patch is used then, for all records).
         bool apply = true;
         for (const BuiltinPatchRecord& record : patch.records) {
+            if (BuiltinRecordSkipped(record)) {
+                continue;
+            }
             const size_t offset = sizeof(Loader::NSOHeader) + record.module_offset;
             if (nso.size() < offset + record.bytes.size() ||
                 out.size() < offset + record.bytes.size()) {
@@ -1763,6 +2308,14 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             continue;
         }
         for (const BuiltinPatchRecord& record : patch.records) {
+            if (BuiltinRecordSkipped(record)) {
+                // (a word kept for its switch, skipped while the switch is not 1: no line)
+                if (record.skip_env != nullptr) {
+                    LOG_INFO(Loader, "    - \"{}\": leaving {}+{:#x} out, {}=1", patch.name, name,
+                             record.module_offset, record.skip_env);
+                }
+                continue;
+            }
             std::memcpy(out.data() + sizeof(Loader::NSOHeader) + record.module_offset,
                         record.bytes.data(), record.bytes.size());
         }
@@ -1772,8 +2325,8 @@ std::vector<u8> PatchManager::PatchNSO(const std::vector<u8>& nso, const std::st
             replaced.push_back(patch.replaces);
         }
         applied.push_back(patch.name);
-        if (patch.render_scale) {
-            Settings::SetAppliedOcarinaRenderScale(patch.render_scale);
+        if (patch.render_height != 0) {
+            Settings::SetAppliedOcarinaRenderHeight(patch.render_height);
         }
     }
 
@@ -2300,7 +2853,7 @@ std::vector<Patch> PatchManager::GetPatches(VirtualFile update_raw) const {
     }
 
     for (const auto& patch : BUILTIN_PATCHES) {
-        if (patch.title_id != title_id ||
+        if (patch.title_id != title_id || patch.render_height != 0 ||
             (patch.enable_env != nullptr &&
              std::string_view{std::getenv(patch.enable_env) ? std::getenv(patch.enable_env) : ""} !=
                  "1") ||

@@ -66,12 +66,21 @@ sl::DLSSMode ModeFor(Settings::NvidiaDlssQuality mode) {
     return sl::DLSSMode::eOff;
 }
 
-// The model for every mode: Graphics > DLSS preset, K by default (NVIDIA's defaults for
+// FRITCHII_DLSS_LOW_VRAM_CNN (boot, default 0): the Auto preset draws with E on cards under 7 GiB.
+bool LowVramCnnSwitch() {
+    static const bool enabled = EnvInt("FRITCHII_DLSS_LOW_VRAM_CNN", 0) != 0;
+    return enabled;
+}
+
+// The model for every mode: Graphics > DLSS preset, Auto (K) by default (NVIDIA's defaults for
 // Performance/Ultra Performance, M and L, drew thin horizontal lines in Fire Emblem at 2x
-// resolution scale). EDEN_NX2_DLSS_PRESET=J|K|L|M picks another model and
+// resolution scale). EDEN_NX2_DLSS_PRESET=E|J|K|L|M picks another model and
 // EDEN_NX2_DLSS_PRESET=default leaves the choice to NVIDIA, over the setting.
 sl::DLSSPreset PresetFor(Settings::DlssPreset preset) {
     const char* const value = std::getenv("EDEN_NX2_DLSS_PRESET");
+    if (value && value[0] == 'E') {
+        return sl::DLSSPreset::ePresetE;
+    }
     if (value && value[0] >= 'J' && value[0] <= 'M') {
         return static_cast<sl::DLSSPreset>(static_cast<u32>(sl::DLSSPreset::ePresetJ) +
                                            static_cast<u32>(value[0] - 'J'));
@@ -88,7 +97,10 @@ sl::DLSSPreset PresetFor(Settings::DlssPreset preset) {
         return sl::DLSSPreset::ePresetL;
     case Settings::DlssPreset::M:
         return sl::DLSSPreset::ePresetM;
+    case Settings::DlssPreset::E:
+        return sl::DLSSPreset::ePresetE;
     case Settings::DlssPreset::K:
+    case Settings::DlssPreset::Auto:
         break;
     }
     return sl::DLSSPreset::ePresetK;
@@ -156,6 +168,19 @@ StreamlineDlssUpscaler::StreamlineDlssUpscaler(const Device& device_, Scheduler&
     if (!get_optimal_settings) {
         LOG_ERROR(Render_Vulkan, "Streamline's DLSS has no slDLSSGetOptimalSettings");
         throw vk::Exception(VK_ERROR_FEATURE_NOT_PRESENT);
+    }
+    // The main heap's size, with EDEN_NX2_VRAM_LIMIT_MIB's simulated card applied.
+    u64 heap_usage{};
+    u64 heap_budget{};
+    if (!device.MainHeapNumbers(video_memory, heap_usage, heap_budget)) {
+        video_memory = 0;
+    }
+    if (VideoCommon::DlssMode::ResolvePreset(Settings::DlssPreset::Auto, LowVramCnnSwitch(),
+                                             video_memory) == Settings::DlssPreset::E) {
+        LOG_INFO(Render_Vulkan,
+                 "NVIDIA DLSS: {} MiB of video memory: the Automatic model is the CNN preset E "
+                 "(FRITCHII_DLSS_LOW_VRAM_CNN); choosing K in the settings keeps K",
+                 video_memory >> 20);
     }
     VkSamplerCreateInfo sampler_info{
         .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
@@ -262,7 +287,10 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                                 in.render_size.height != render_extent.height ||
                                 in.upscale_size.width != upscale_extent.width ||
                                 in.upscale_size.height != upscale_extent.height;
-    const auto settings = Settings::GetNvidiaDlssRuntimeSettings();
+    auto settings = Settings::GetNvidiaDlssRuntimeSettings();
+    // From here on the model that really draws: the status bar shows it too.
+    settings.preset = VideoCommon::DlssMode::ResolvePreset(settings.preset, LowVramCnnSwitch(),
+                                                           video_memory);
     const bool options_changed = extent_changed || in.hdr != hdr_input ||
                                  quality_mode != settings.quality ||
                                  model_preset != settings.preset;
@@ -490,10 +518,11 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
                 validated.mode = ModeFor(*selection.mode);
                 evaluated_mode = *selection.mode;
                 LOG_INFO(Render_Vulkan,
-                         "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {}, {}",
+                         "NVIDIA DLSS (Streamline): {}x{} -> {}x{}, mode {}, preset {} ({}), {}",
                          in.render_size.width, in.render_size.height, in.upscale_size.width,
                          in.upscale_size.height, Settings::CanonicalizeEnum(*selection.mode),
                          static_cast<int>(validated.dlaaPreset),
+                         Settings::CanonicalizeEnum(preset_setting),
                          validated.colorBuffersHDR == sl::eTrue ? "HDR" : "LDR");
                 const auto set = reinterpret_cast<PFun_slDLSSSetOptions*>(set_options);
                 api_result = set(viewport, validated);
@@ -527,7 +556,8 @@ bool StreamlineDlssUpscaler::Upscale(const Inputs& in) {
             });
         if (result != VideoCommon::DlssEvaluationResult::Succeeded && !failed.exchange(true)) {
             LOG_ERROR(Render_Vulkan,
-                      "NVIDIA DLSS recording failed at stage {} (Streamline result {}); using FSR 3.1",
+                      "NVIDIA DLSS failed at stage {} (Streamline result {}): it is off for the "
+                      "rest of this session",
                       static_cast<int>(result), static_cast<int>(api_result));
         }
         if (result != VideoCommon::DlssEvaluationResult::Succeeded) {

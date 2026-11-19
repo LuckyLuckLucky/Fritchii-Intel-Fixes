@@ -159,6 +159,9 @@ struct Values {
     // The major version ("v6") that showed "Good to know" (yuzu/fritchii/known_issues.cpp).
     Setting<std::string> fritchii_known_issues_shown{linkage, {}, "fritchii_known_issues_shown",
                                                      Category::Ui};
+    // The one-time offer of "OoT occlusion speed-up: Full" (yuzu/fritchii/occlusion_offer.cpp):
+    // empty, "pending" (a game could use it), or the answer. Never asked again once answered.
+    Setting<std::string> fritchii_occl_offer{linkage, {}, "fritchii_occl_offer", Category::Ui};
 
     // Linux/MinGW may support (requires libdl support)
     SwitchableSetting<bool> enable_gamemode{linkage,

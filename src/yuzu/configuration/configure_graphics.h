@@ -92,18 +92,53 @@ private:
     /// scales as heights ("1080p (720p handheld)"). `rows`: every built row by setting id.
     void SetupPlainNames(const std::map<u32, QWidget*>& rows);
     /// Fritchii builds, global settings, docked: while FSR or DLSS upscales OoT, "Resolution" is
-    /// the size the upscaler makes (4K, 1440p, 1080p) and "Quality" reads "input -> output", only
-    /// as OoT's upscale path really runs. The choices set the Max Resolution add-on and the DLSS
-    /// quality (ocarina_upscale.h, Settings::OcarinaMaxResolutionOn).
-    void SetupPictureMenu(const std::map<u32, QWidget*>& rows);
+    /// the size the game draws (oot_render_height: 720p, 1080p, the game's 1440p, or its dynamic
+    /// size with Max Resolution off) and "Upscale to" the size the upscaler makes
+    /// (oot_upscale_output), only as OoT's upscale path really runs. The choices set the Max
+    /// Resolution add-on and the DLSS quality (Native when the two match) (ocarina_upscale.h,
+    /// Settings::OcarinaRenderHeight, Settings::OcarinaMaxResolutionOn).
+    void SetupPictureMenu();
     void UpdatePictureMenu();
-    void ApplyPictureChoice(int choice);
+    /// Fritchii builds: the resolution list's names, as heights for the Max Resolution choice.
+    void UpdateResolutionNames();
+    /// The height of the screen this window is on, in pixels (0 = unknown).
+    [[nodiscard]] u32 ScreenHeight() const;
+    /// OoT's Max Resolution add-on as this page has it now (without a picture menu: as saved).
+    [[nodiscard]] bool MaxResolutionNow() const;
+    /// Fritchii builds: the short status line under the picture rows: what the choices make, why
+    /// a row is locked or ignored, and when a change prepares shaders again.
+    void UpdatePictureNote();
+    /// FSR, or DLSS on a card that runs it, is picked for OoT (per game: the global checkbox).
+    [[nodiscard]] bool OcarinaUpscalerPicked() const;
+    /// The picked card's record (per game: the global choice's), null when there is none.
+    [[nodiscard]] const VkDeviceInfo::Record* PictureRecord() const;
+    /// The name of the upscaler that will run ("FSR 3.1" for a saved FSR 4 this card can't run).
+    [[nodiscard]] QString PictureUpscalerName() const;
+    /// The resolution scale OoT will run at (1x with an upscaler), as a number to compare: the
+    /// prepared shaders depend on it.
+    [[nodiscard]] u32 PictureScaleNow() const;
+    /// A picked "Resolution" (0: the dynamic size, Max Resolution off): the output stays where
+    /// that resolution makes it, else the nearest.
+    void ApplyPictureInput(u32 input);
+    /// `output` if the current choices offer it, else the nearest size they do.
+    [[nodiscard]] u32 OfferedOutput(u32 output) const;
+    /// A picked "Upscale to" height (the scene's own: DLSS Native, FSR at 1x).
+    void ApplyPictureOutput(u32 output);
     /// Fritchii builds: the window filter's pros and cons, and which one suits the picture size
     /// on this screen (bigger: Area, smaller: ScaleForce), under the "Window filter" row.
     void UpdateWindowFilterNote();
-    /// The picture choices for the upscaler now picked (none while it's off).
-    [[nodiscard]] std::vector<int> PictureChoicesNow() const;
-    [[nodiscard]] int CurrentPictureChoice() const;
+    /// The upscaler the picture menu shows choices for (None: off, or no picture menu).
+    enum class PictureUpscaler : u8 { None, Fsr, Dlss };
+    [[nodiscard]] PictureUpscaler PictureUpscalerNow() const;
+    /// The picked card's video memory (0 = unknown), for the outputs above 4K.
+    [[nodiscard]] u64 PictureVram() const;
+    /// The picked "Resolution" (0: the dynamic size) and the output the choices make now.
+    [[nodiscard]] u32 PictureInputNow() const;
+    [[nodiscard]] bool PictureDlssNative() const;
+    [[nodiscard]] u32 PictureOutputNow() const;
+    /// The heights each list offers (while the game runs: what it started with, plus DLSS Native).
+    [[nodiscard]] std::vector<u32> PictureInputsNow() const;
+    [[nodiscard]] std::vector<u32> PictureOutputsNow() const;
     /// Fritchii builds, global settings: one "Upscaler" choice under the resolution (Game, No
     /// sharpening, FSR 3.1, FSR 4, DLSS) that sets OoT's anti-aliasing and the DLSS checkbox,
     /// whose own rows are hidden; AMD's and NVIDIA's download panels and the DLSS options sit
@@ -114,6 +149,8 @@ private:
     /// OoT's "DLSS jitter" row only while DLSS upscales OoT, the LOD bias row only with Custom
     /// texture sharpness. `rows`: the built setting rows by setting id.
     void SetupOcarinaTextureRows(const std::map<u32, QWidget*>& rows);
+    /// Fritchii builds: the texture sharpness rows only while FSR or DLSS is picked.
+    void UpdateOcarinaTextureRows();
 
     void RetrieveVulkanDevices();
 
@@ -166,12 +203,14 @@ private:
     QComboBox* upscaler_combobox{};        ///< Fritchii: the "Upscaler" choice
     // Fritchii's picture menu (SetupPictureMenu).
     QWidget* dlss_quality_widget{};        ///< The nvidia_dlss_quality row (hidden there)
-    QWidget* output_row{};                 ///< "Resolution" while an upscaler is on
+    QWidget* max_res_row{};                ///< "Max Resolution", while no upscaler is on
+    QComboBox* max_res_combobox{};
+    QWidget* render_row{};                 ///< "Resolution": the size the game draws
+    QComboBox* render_combobox{};
+    QWidget* output_row{};                 ///< "Upscale to": the size the upscaler makes
     QComboBox* output_combobox{};
-    QWidget* quality_row{};                ///< "Quality": input -> output
-    QComboBox* quality_combobox{};
-    QLabel* quality_fixed_label{};         ///< In place of the choice when there is one
-    QLabel* upscale_note{};                ///< Where an upscaler starts from, and how to go lower
+    QLabel* upscale_note{};                ///< The status line (UpdatePictureNote)
+    u32 picture_scale_saved{};             ///< PictureScaleNow when the page opened
     QComboBox* scaling_filter_combobox{};  ///< The "Window filter" choice
     QLabel* filter_note{};                 ///< Fritchii: under it, pros, cons and the advice
     QWidget* texture_sharpness_widget{};
@@ -180,6 +219,10 @@ private:
     bool max_resolution_choice{true};      ///< OoT's Max Resolution add-on, saved on Apply
     bool max_resolution_saved{true};       ///< ...as it was when the page opened
     bool max_resolution_when_off{true};    ///< Its value when the upscaler goes back to off
+    bool max_resolution_upscaling{true};   ///< ...and when an upscaler comes back on
     u32 upscale_output_choice{};           ///< oot_upscale_output, saved on Apply (0 = Auto)
     u32 upscale_output_saved{};            ///< ...as it was when the page opened
+    u32 render_height_choice{1440};        ///< oot_render_height, saved on Apply
+    u32 render_height_saved{1440};         ///< ...the height it gave when the page opened
+    u32 render_setting_saved{};            ///< ...its value then (0 = not picked yet)
 };

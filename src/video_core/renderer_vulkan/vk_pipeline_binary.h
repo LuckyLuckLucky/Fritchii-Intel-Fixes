@@ -67,6 +67,12 @@ void Close(std::string_view when);
                                                  const VkComputePipelineCreateInfo& ci,
                                                  VkPipelineCache cache);
 
+/// Told after each CreateComputePipeline: the stage's module, how long the create took (ms) and
+/// whether it made a pipeline. Set once (the pipeline cache's run-time compute counter); kept here
+/// so the files the preparation stamp hashes stay as they are.
+using ComputeBuildObserver = void (*)(VkShaderModule module, double ms, bool made);
+void SetComputeBuildObserver(ComputeBuildObserver observer);
+
 /// One line every 10 s while the counts change (called from the pipeline cache's report).
 void ReportPeriodic();
 

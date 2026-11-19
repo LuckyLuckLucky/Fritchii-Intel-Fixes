@@ -35,6 +35,7 @@
 #include "video_core/host_shaders/ocarina_camera_motion_comp_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_frag_spv.h"
 #include "video_core/host_shaders/ocarina_actor_motion_vert_spv.h"
+#include "video_core/host_shaders/ocarina_motion_view_comp_spv.h"
 #include "video_core/renderer_vulkan/vk_ocarina_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
@@ -272,8 +273,8 @@ public:
                                   static_cast<f32>(extent.width), -static_cast<f32>(extent.height),
                                   0, 1};
         cmd.SetViewport(0, viewport);
-        // Depth matches in the captured replay leveled off at this tolerance.
-        constexpr u32 depth_tolerance = 16;
+        // Depth matches in the captured replay leveled off at 16 (FRITCHII_OOT_ACTOR_TOLERANCE).
+        const u32 depth_tolerance = VideoCommon::OcarinaActorDepthTolerance();
         cmd.PushConstants(*layout, VK_SHADER_STAGE_FRAGMENT_BIT, depth_tolerance);
         cmd.BindVertexBuffer(0, *vertices, 0);
         cmd.BindIndexBuffer(*indices, 0, VK_INDEX_TYPE_UINT16);
@@ -787,6 +788,7 @@ struct OcarinaUpscaler::Impl {
     CameraMotionPass motion_pass;
     OcarinaColorPass color_pass;
     OcarinaColorPass output_pass;
+    std::unique_ptr<OcarinaColorPass> motion_view_pass; ///< FRITCHII_OOT_MOTION_VIEW
     std::array<std::unique_ptr<OcarinaFrameSlot>, 4> slots;
     std::optional<u64> last_frame;
     Matrix last_view_projection{};
@@ -1124,10 +1126,21 @@ bool OcarinaUpscaler::Record(VkImageView color, VkImageView depth, VkImageView t
         const bool same_size = output_extent.width == target_extent.width &&
                                output_extent.height == target_extent.height;
         const auto output_sampler = same_size ? sampler : state.LinearSampler();
-        state.queue.AddSampledImage(state.OutputView(), output_sampler);
-        state.queue.AddImage(target);
-        state.output_pass.RecordOutput(state.scheduler, state.queue.UpdateData(), *this,
-                                        target_extent, frame, reset);
+        if (VideoCommon::OcarinaMotionView()) {
+            if (!state.motion_view_pass) {
+                state.motion_view_pass = std::make_unique<OcarinaColorPass>(
+                    state.device, state.scheduler, state.pool, OCARINA_MOTION_VIEW_COMP_SPV);
+            }
+            state.queue.AddSampledImage(*resources.motion_view, sampler);
+            state.queue.AddImage(target);
+            state.motion_view_pass->RecordOutput(state.scheduler, state.queue.UpdateData(), *this,
+                                                 target_extent, frame, reset);
+        } else {
+            state.queue.AddSampledImage(state.OutputView(), output_sampler);
+            state.queue.AddImage(target);
+            state.output_pass.RecordOutput(state.scheduler, state.queue.UpdateData(), *this,
+                                           target_extent, frame, reset);
+        }
     }
     state.scheduler.InvalidateState();
     state.last_frame = frame;
@@ -1144,11 +1157,10 @@ VideoCommon::OcarinaUpscaleBackend ResolveOcarinaUpscaler(const Device& device) 
     auto backend = VideoCommon::SelectOcarinaUpscaler(
         Settings::values.oot_anti_aliasing.GetValue(), Settings::values.nvidia_dlss.GetValue(),
         dlss_available, value ? value : "");
-    // FRITCHII_DLSS_RENDER_SCALE: the patch is applied at boot, before it is known whether DLSS
-    // runs. When it doesn't, FSR 3.1 rebuilds the smaller scene instead of the game stretching
-    // 720p or 1080p itself.
+    // oot_render_height: the patch is applied at boot, before it is known whether DLSS runs.
+    // When it doesn't, FSR 3.1 rebuilds the smaller scene instead of the game stretching it.
     if (backend == VideoCommon::OcarinaUpscaleBackend::Native &&
-        Settings::AppliedOcarinaRenderScale() && (value == nullptr || std::string_view{value} != "native")) {
+        Settings::AppliedOcarinaRenderHeight() && (value == nullptr || std::string_view{value} != "native")) {
         backend = VideoCommon::OcarinaUpscaleBackend::Fsr;
     }
     if (backend == VideoCommon::OcarinaUpscaleBackend::Fsr && !Fsr3Upscaler::IsSupported(device)) {

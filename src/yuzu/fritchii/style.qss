@@ -167,9 +167,9 @@ QListWidget#selectorList::item:selected { background: #2b2640; color: #ececf1; }
 QLabel#FritchiiDialogTitle { font-size: 24px; font-weight: 500; color: #ececf1; }
 QTextBrowser#FritchiiNotes { background: transparent; border: none; font-size: 15px; }
 
-/* Clear old shader caches? (fritchii/cache_cleanup.cpp) */
-QDialog#FritchiiCachePrompt { background: #111113; }
-QDialog#FritchiiCachePrompt QPushButton {
+/* Clear old shader caches? (fritchii/cache_cleanup.cpp), Use the recommended settings? */
+QDialog#FritchiiCachePrompt, QDialog#FritchiiSettingsPrompt { background: #111113; }
+QDialog#FritchiiCachePrompt QPushButton, QDialog#FritchiiSettingsPrompt QPushButton {
     min-height: 40px;
     padding: 0 28px;
     border-radius: 8px;
@@ -180,6 +180,15 @@ QDialog#FritchiiCachePrompt QPushButton {
 /* Max Resolution on or off (fritchii/max_resolution.cpp) */
 QDialog#FritchiiMaxResPrompt { background: #111113; }
 QDialog#FritchiiMaxResPrompt QPushButton {
+    min-height: 40px;
+    padding: 0 28px;
+    border-radius: 8px;
+    font-size: 15px;
+    font-weight: 500;
+}
+/* Faster mode for AMD (fritchii/occlusion_offer.cpp) */
+QDialog#FritchiiOcclPrompt { background: #111113; }
+QDialog#FritchiiOcclPrompt QPushButton {
     min-height: 40px;
     padding: 0 28px;
     border-radius: 8px;

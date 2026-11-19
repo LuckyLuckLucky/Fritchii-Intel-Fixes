@@ -10,6 +10,7 @@
 #include <immintrin.h>
 #endif
 
+#include "common/lowend_sim.h"
 #include "core/arm/exclusive_monitor.h"
 #include "core/core.h"
 #include "core/hle/kernel/k_address_arbiter.h"
@@ -148,6 +149,7 @@ s64 ArbSpinMicroseconds() {
 }
 
 void SpinPause() {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     _mm_pause();
 #elif defined(__aarch64__)

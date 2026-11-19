@@ -1,0 +1,25 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#version 450
+
+// FRITCHII_OOT_MOTION_VIEW: the motion vectors the upscaler got, in the game's target.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(binding = 0) uniform sampler2D motion;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D guest_color;
+
+void main() {
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 extent = imageSize(guest_color);
+    if (any(greaterThanEqual(pixel, extent))) {
+        return;
+    }
+    ivec2 size = textureSize(motion, 0);
+    ivec2 source = min(ivec2((vec2(pixel) + 0.5) * vec2(size) / vec2(extent)), size - 1);
+    vec2 pixels = texelFetch(motion, source, 0).rg;
+    // A still camera leaves rounding noise far below this.
+    vec3 color = vec3(0.0);
+    if (length(pixels) > 0.01) {
+        color = vec3(clamp(abs(pixels) * 4.0 + 0.2, 0.0, 1.0), 1.0);
+    }
+    imageStore(guest_color, pixel, vec4(color, 1.0));
+}

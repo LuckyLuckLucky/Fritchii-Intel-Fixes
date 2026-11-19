@@ -52,6 +52,8 @@ static const std::map<Settings::DlssPreset, QString> nvidia_dlss_preset_texts_ma
     {Settings::DlssPreset::K, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "K"))},
     {Settings::DlssPreset::L, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "L"))},
     {Settings::DlssPreset::M, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "M"))},
+    {Settings::DlssPreset::E, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "E"))},
+    {Settings::DlssPreset::Auto, QStringLiteral(QT_TRANSLATE_NOOP("MainWindow", "K"))},
 };
 
 static const std::map<Settings::ScalingFilter, QString> scaling_filter_texts_map = {

@@ -47,6 +47,7 @@
 #include "video_core/one_follower_hooks.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2.h"
+#include "video_core/link_stats.h"
 #include "video_core/nx2_cmdpage_diag.h"
 #include "video_core/nx2_list_verify.h"
 #include "video_core/nx2_perf.h"
@@ -7275,12 +7276,9 @@ void BufferCache<P>::UpdateIndexBuffer() {
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         if (slot_buffers[inline_buffer_id].SizeBytes() < buffer_size) [[unlikely]] {
-            ++binding_epoch;
-            MemStageStats::BufferDeleted(slot_buffers[inline_buffer_id].SizeBytes());
-            VideoCommon::BufferChurnStats::BufferDeleted(
-                VideoCommon::BufferChurnStats::Deleted::Inline,
-                slot_buffers[inline_buffer_id].SizeBytes());
-            slot_buffers.erase(inline_buffer_id);
+            // Through DeleteBuffer: it is a registered buffer with an LRU entry, and draws already
+            // recorded may still read it (the delayed destruction ring keeps it for them).
+            DeleteBuffer(inline_buffer_id);
             inline_buffer_id = CreateBuffer(0, buffer_size, false);
         }
         channel_state->index_buffer = Binding{
@@ -9137,6 +9135,14 @@ void BufferCache<P>::MappedUploadMemory([[maybe_unused]] Buffer& buffer,
             }
             MemReadLog::Staged(MemReadLog::Kind::Upload, device_memory, device_addr, src_pointer,
                                copy.size);
+            // FRITCHII_LINK_STATS=2: the same bytes as last time? From guest memory, the staging
+            // mapping is write-combined.
+            if (LinkStats::ChunkCensusOn()) [[unlikely]] {
+                thread_local std::vector<u8> census_bytes;
+                census_bytes.resize(copy.size);
+                device_memory.ReadBlockUnsafe(device_addr, census_bytes.data(), copy.size);
+                LinkStats::NoteUploadChunks(device_addr, census_bytes.data(), copy.size);
+            }
             // Large uploads are mostly geometry the host GPU now has its own copy of: TickFrame
             // marks their guest memory cold (see TextureCache::RefreshContents).
             if (copy.size >= 256_KiB) {
@@ -9400,8 +9406,9 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     }
     // EDEN_NX2_BUFFER_CHURN_STATS: joins pass do_not_mark, the collector does not.
     VideoCommon::BufferChurnStats::BufferDeleted(
-        do_not_mark ? VideoCommon::BufferChurnStats::Deleted::Join
-                    : VideoCommon::BufferChurnStats::Deleted::Collector,
+        buffer_id == inline_buffer_id ? VideoCommon::BufferChurnStats::Deleted::Inline
+        : do_not_mark                 ? VideoCommon::BufferChurnStats::Deleted::Join
+                                      : VideoCommon::BufferChurnStats::Deleted::Collector,
         slot_buffers[buffer_id].SizeBytes());
     if constexpr (requires { runtime.OnBufferDeleted(slot_buffers[buffer_id]); }) {
         runtime.OnBufferDeleted(slot_buffers[buffer_id]);
@@ -9470,6 +9477,10 @@ void BufferCache<P>::DeleteBuffer(BufferId buffer_id, bool do_not_mark) {
     }
 
     Unregister(buffer_id);
+    // The collector can delete the inline index buffer too: the next inline draw makes a new one.
+    if (buffer_id == inline_buffer_id) {
+        inline_buffer_id = NULL_BUFFER_ID;
+    }
 
 #ifdef YUZU_LEGACY
     if (!do_not_mark || !immediately_free)

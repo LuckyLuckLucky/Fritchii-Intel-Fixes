@@ -9,6 +9,7 @@
 #include <chrono>
 
 #include "common/assert.h"
+#include "common/lowend_sim.h"
 #include "common/bit_util.h"
 #include "common/fiber.h"
 #include "common/logging.h"
@@ -92,6 +93,7 @@ bool YieldStampMatches(const KThread& cur, u8 kind) {
 }
 
 void CpuPause() {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     _mm_pause();
 #elif defined(__aarch64__)

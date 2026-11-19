@@ -1,0 +1,30 @@
+// SPDX-FileCopyrightText: Copyright 2026 Fritchii
+// SPDX-License-Identifier: GPL-3.0-or-later
+
+// FRITCHII_SIM_GPU_SLOW: keeps the GPU's queue busy for a measured time. One invocation on purpose:
+// the queue waits for it all the same (the barriers around the dispatch), and the card stays near
+// idle power instead of running every shader core flat out. The loop's result is written so the
+// compiler can't remove it.
+#version 450
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform Constants {
+    uint iterations;
+    uint seed;
+};
+
+layout(std430, binding = 0) writeonly buffer Sink {
+    uint result;
+};
+
+void main() {
+    uint x = seed | 1u;
+    for (uint i = 0u; i < iterations; ++i) {
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        x += i;
+    }
+    result = x;
+}

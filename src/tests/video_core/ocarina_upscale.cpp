@@ -189,6 +189,23 @@ TEST_CASE("OoT upscaler output setting picks the new sizes", "[video_core][ocari
     STATIC_REQUIRE(PlanOcarinaPassOutput(4320, false, 1440, false, false) == OcarinaPassOutput{false, 0});
     STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 1080, false, false) == OcarinaPassOutput{false, 2880});
     STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 720, false, false) == OcarinaPassOutput{false, 2160});
+    // A lowered scene (oot_render_height): 720p -> 1080p at its own size, 1080p -> 1080p native
+    // AA, 1440p still the game's target; DLSS Native keeps the scene's size.
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 720, false, false) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 1080, false, false) == OcarinaPassOutput{true, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 810, false, true) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1440, true, 720, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 720, true, false) == OcarinaPassOutput{true, 0});
+    // Below 720p: Auto is 1080p, and nothing goes over 3x (540p tops out at the 1440p target,
+    // 360p at 1080p), with FRITCHII_FSR_OUTPUT too.
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, true, 540, false, false) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(0, true, 360, false, true) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 540, false, false) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1440, true, 540, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(2160, true, 540, false, false) == OcarinaPassOutput{false, 0});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1440, true, 360, false, false) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(4320, true, 360, false, false) == OcarinaPassOutput{false, 0, 1080});
+    STATIC_REQUIRE(PlanOcarinaPassOutput(1080, true, 360, true, false) == OcarinaPassOutput{true, 0});
 }
 
 TEST_CASE("OoT upscaler output setting checks the card", "[video_core][ocarina]") {

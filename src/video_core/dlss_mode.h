@@ -19,6 +19,17 @@ struct Range {
     Extent max;
 };
 
+/// What the Auto preset draws with: K, or the lighter CNN model E where the switch allows it and
+/// the card has under 7 GiB of video memory (0: unknown, K). Any other choice stays as it is.
+constexpr Settings::DlssPreset ResolvePreset(Settings::DlssPreset chosen, bool low_vram_cnn,
+                                             u64 video_memory) {
+    if (chosen != Settings::DlssPreset::Auto) {
+        return chosen;
+    }
+    const bool small_card = video_memory != 0 && video_memory < (u64{7} << 30);
+    return low_vram_cnn && small_card ? Settings::DlssPreset::E : Settings::DlssPreset::K;
+}
+
 constexpr bool Fits(Extent render, Extent output, Quality mode, Range range) {
     return render.width != 0 && render.height != 0 && output.width != 0 && output.height != 0 &&
            render.width >= range.min.width && render.width <= range.max.width &&

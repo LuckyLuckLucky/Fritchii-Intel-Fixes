@@ -22,11 +22,13 @@
 #include "video_core/buffer_churn_stats.h"
 #include "video_core/churn_counters.h"
 #include "video_core/gpu_split.h"
+#include "video_core/link_stats.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/memstage_stats.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/small_card.h"
 #include "common/logging.h"
+#include "video_core/renderer_vulkan/vk_master_semaphore.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/vulkan_common/vulkan_device.h"
@@ -101,16 +103,127 @@ size_t GetStreamBufferSize(const Device& device) {
     }
     return (std::min)(Common::AlignUp(size, MAX_ALIGNMENT), MAX_STREAM_BUFFER_SIZE);
 }
+
+/// FRITCHII_SIM_BAR_MIB (boot, unset = off, 0 = no room at all): the stream buffers get only this
+/// much device memory the CPU can write; one that doesn't fit lands in host memory, as it does when
+/// the real window is full. The pools ask one after the other while the rasterizer is made.
+[[nodiscard]] bool SimBarFits(VkDeviceSize bytes) {
+    static s64 left = [] {
+        const char* const value = std::getenv("FRITCHII_SIM_BAR_MIB");
+        return value != nullptr ? s64{std::atoi(value)} << 20 : s64{-1};
+    }();
+    if (left < 0) {
+        return true;
+    }
+    if (static_cast<VkDeviceSize>(left) < bytes) {
+        return false;
+    }
+    left -= static_cast<s64>(bytes);
+    return true;
+}
+
+/// FRITCHII_SMALL_BAR_STREAMS (boot, default 0): on a discrete card whose CPU-visible device memory
+/// is a small window, the stream buffers are sized from the room really free in it, the buffer
+/// cache's first: the shaders read its uniforms straight from it, the other pool is only copied
+/// from. FRITCHII_SMALL_BAR_STREAM_MIB=<transfers>,<buffers> sets the two sizes (implies it).
+struct SmallBarPlan {
+    bool active{};
+    VkDeviceSize transfers{};
+    VkDeviceSize buffers{};
+};
+
+[[nodiscard]] const SmallBarPlan& GetSmallBarPlan(const Device& device) {
+    static const SmallBarPlan plan = [&device] {
+        SmallBarPlan result;
+        const char* const sizes = std::getenv("FRITCHII_SMALL_BAR_STREAM_MIB");
+        const char* const mode = std::getenv("FRITCHII_SMALL_BAR_STREAMS");
+        if (sizes == nullptr && (mode == nullptr || std::atoi(mode) == 0)) {
+            return result;
+        }
+        if (device.IsIntegrated() || !device.HasSplitAllocators() ||
+            device.HasDebuggingToolAttached()) {
+            return result;
+        }
+        VkDeviceSize window = 0;
+        u32 window_heap = 0;
+        ForEachDeviceLocalHostVisibleHeap(device, [&](size_t index, VkMemoryHeap& heap) {
+            if (heap.size > window) {
+                window = heap.size;
+                window_heap = static_cast<u32>(index);
+            }
+        });
+        VkDeviceSize used = 0;
+        const char* const sim_bar = std::getenv("FRITCHII_SIM_BAR_MIB");
+        if (sim_bar != nullptr) {
+            window = VkDeviceSize((std::max)(std::atoi(sim_bar), 0)) << 20;
+        } else if (device.CanReportMemoryUsage()) {
+            VkPhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+            budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
+            (void)device.GetPhysical().GetMemoryProperties(&budget);
+            used = budget.heapUsage[window_heap];
+        }
+        if (sim_bar == nullptr && (window == 0 || window > 1_GiB)) {
+            LOG_INFO(Render_Vulkan,
+                     "FRITCHII_SMALL_BAR_STREAMS: {} MiB of CPU-visible device memory, not a "
+                     "small window: stream buffers as usual",
+                     window >> 20);
+            return result;
+        }
+        constexpr VkDeviceSize Reserve = 16_MiB; // the driver's own use of the window
+        constexpr VkDeviceSize Smallest = 16_MiB;
+        const VkDeviceSize free_bytes = window - (std::min)(used, window);
+        const VkDeviceSize room = free_bytes > Reserve ? free_bytes - Reserve : 0;
+        result.active = true;
+        result.buffers = (std::min)(VkDeviceSize{64_MiB}, room);
+        result.transfers = (std::min)(MAX_STREAM_BUFFER_SIZE, room - result.buffers);
+        if (sizes != nullptr) {
+            char* end = nullptr;
+            const u64 transfers_mib = std::strtoull(sizes, &end, 10);
+            const u64 buffers_mib = *end == ',' ? std::strtoull(end + 1, nullptr, 10) : 0;
+            result.transfers = std::clamp<u64>(transfers_mib, 16, 256) << 20;
+            result.buffers = std::clamp<u64>(buffers_mib, 16, 256) << 20;
+        }
+        result.transfers = Common::AlignDown((std::max)(result.transfers, Smallest), MAX_ALIGNMENT);
+        result.buffers = Common::AlignDown((std::max)(result.buffers, Smallest), MAX_ALIGNMENT);
+        LOG_INFO(Render_Vulkan,
+                 "FRITCHII_SMALL_BAR_STREAMS: window {} MiB, {} MiB in use: {} MiB for uniforms "
+                 "and buffer uploads, {} MiB for texture and query uploads",
+                 window >> 20, used >> 20, result.buffers >> 20, result.transfers >> 20);
+        return result;
+    }();
+    return plan;
+}
+
+[[nodiscard]] VkDeviceSize StreamBytes(const Device& device, u32 divisor,
+                                       StagingBufferPool::StreamRole role) {
+    if (const SmallBarPlan& plan = GetSmallBarPlan(device);
+        plan.active && role != StagingBufferPool::StreamRole::Everything) {
+        return role == StagingBufferPool::StreamRole::Buffers ? plan.buffers : plan.transfers;
+    }
+    return Common::AlignDown(GetStreamBufferSize(device) / (std::max)(divisor, 1U), MAX_ALIGNMENT);
+}
+
+[[nodiscard]] const char* StreamRoleName(StagingBufferPool::StreamRole role) {
+    switch (role) {
+    case StagingBufferPool::StreamRole::Transfers:
+        return "texture and query uploads";
+    case StagingBufferPool::StreamRole::Buffers:
+        return "uniforms and buffer uploads";
+    case StagingBufferPool::StreamRole::Everything:
+        break;
+    }
+    return "all uploads";
+}
 } // Anonymous namespace
 
 // stream_divisor: FRITCHII_MEMSTAGE_SPLIT_ALLOC makes two pools (the buffer cache's and the
 // back's), which split one stream buffer's size between them instead of each taking all of it.
 StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& memory_allocator_,
-                                     Scheduler& scheduler_, u32 stream_divisor)
+                                     Scheduler& scheduler_, u32 stream_divisor,
+                                     StreamRole stream_role)
     : device{device_}, memory_allocator{memory_allocator_}, clock{scheduler_},
       recycler{scheduler_},
-      stream_buffer_size{Common::AlignDown(
-          GetStreamBufferSize(device) / (std::max)(stream_divisor, 1U), MAX_ALIGNMENT)},
+      role{stream_role}, stream_buffer_size{StreamBytes(device, stream_divisor, stream_role)},
       region_size{stream_buffer_size / StagingBufferPool::NUM_SYNCS} {
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
@@ -129,7 +242,56 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     if (device.IsBufferDeviceAddressSupported()) {
         stream_ci.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     }
-    stream_buffer = memory_allocator.CreateBuffer(stream_ci, MemoryUsage::Stream);
+    const bool sim_bar_fits = SimBarFits(stream_ci.size);
+    stream_buffer = memory_allocator.CreateBuffer(
+        stream_ci, sim_bar_fits ? MemoryUsage::Stream : MemoryUsage::Upload);
+    {
+        // Where it landed decides who pays for its bytes on a slow link: in device memory the CPU
+        // while writing, in host memory the GPU while reading. It lands in host memory without a
+        // word when the small window is full, so the log says.
+        const auto properties = device.GetPhysical().GetMemoryProperties().memoryProperties;
+        const u32 type = stream_buffer.Location().memory_type;
+        const u32 heap = properties.memoryTypes[type].heapIndex;
+        stream_in_device_memory =
+            (properties.memoryTypes[type].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+        crosses_link = !device.IsIntegrated();
+        const bool plan_active = GetSmallBarPlan(device).active;
+        refresh_before_spill = plan_active;
+        if (plan_active && !stream_in_device_memory && sim_bar_fits) {
+            // The allocator's budget check sent it to host memory. The window's budget is only an
+            // estimate (some drivers report little more than what is free): try past it.
+            try {
+                vk::Buffer retry =
+                    memory_allocator.CreateBufferOverBudget(stream_ci, MemoryUsage::Stream, 1);
+                const u32 retry_type = retry.Location().memory_type;
+                if ((properties.memoryTypes[retry_type].propertyFlags &
+                     VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
+                    stream_buffer = std::move(retry);
+                    stream_in_device_memory = true;
+                }
+            } catch (const vk::Exception&) {
+                // It stays where it is; the warning below says so.
+            }
+        }
+        const u32 final_type = stream_buffer.Location().memory_type;
+        const u32 final_heap = properties.memoryTypes[final_type].heapIndex;
+        bool has_window = false;
+        ForEachDeviceLocalHostVisibleHeap(device,
+                                          [&has_window](size_t, VkMemoryHeap&) { has_window = true; });
+        if (crosses_link && has_window && !stream_in_device_memory) {
+            LOG_WARNING(Render_Vulkan,
+                        "Stream buffer for {}: {} MiB fell out of device memory into host memory "
+                        "type {} (heap {}){}: the GPU reads it across the link",
+                        StreamRoleName(stream_role), stream_ci.size >> 20, final_type, final_heap,
+                        sim_bar_fits ? "" : " (FRITCHII_SIM_BAR_MIB: no room left)");
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "Stream buffer for {}: {} MiB in memory type {} (heap {}, {} MiB), {}",
+                     StreamRoleName(stream_role), stream_ci.size >> 20, final_type, final_heap,
+                     properties.memoryHeaps[final_heap].size >> 20,
+                     stream_in_device_memory ? "device memory" : "host memory");
+        }
+    }
     if (device.HasDebuggingToolAttached()) {
         stream_buffer.SetObjectNameEXT("Stream Buffer");
     }
@@ -269,6 +431,117 @@ StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred,
                                             VideoCommon::BufferChurnStats::StagingCaller caller) {
+    StagingBufferRef ref = RequestBuffer(size, usage, deferred, caller);
+    if (VideoCommon::LinkStats::On()) [[unlikely]] {
+        NoteLink(ref, size, usage, caller);
+    }
+    return ref;
+}
+
+void StagingBufferPool::NoteLink(const StagingBufferRef& ref, size_t size, MemoryUsage usage,
+                                 VideoCommon::BufferChurnStats::StagingCaller caller) const {
+    using Path = VideoCommon::LinkStats::Path;
+    if (!crosses_link || usage == MemoryUsage::DeviceLocal) {
+        return;
+    }
+    Path path = Path::GpuReadsHost;
+    if (usage == MemoryUsage::Download) {
+        path = Path::GpuWritesHost;
+    } else if (ref.buffer == *stream_buffer && stream_in_device_memory) {
+        path = Path::CpuWritesDevice;
+    }
+    VideoCommon::LinkStats::Note(path, caller, size);
+    if (usage != MemoryUsage::Upload) {
+        return;
+    }
+    // What the stream buffer's size decides: its traffic, and what is too big for a region.
+    StreamUse& use = stream_use;
+    if (ref.buffer == *stream_buffer) {
+        use.bytes.fetch_add(size, std::memory_order_relaxed);
+        use.requests.fetch_add(1, std::memory_order_relaxed);
+        use.frame_bytes.fetch_add(size, std::memory_order_relaxed);
+    } else if (size > region_size) {
+        use.too_big.fetch_add(1, std::memory_order_relaxed);
+        use.too_big_bytes.fetch_add(size, std::memory_order_relaxed);
+    }
+}
+
+bool StagingBufferPool::StreamRegionsBusy(size_t region_begin, size_t region_end, size_t size) {
+    if (!AreRegionsActive(region_begin, region_end)) {
+        return false;
+    }
+    // The answer used the last GPU tick someone read, which can be old: with the small BAR plan
+    // it is read again before a request leaves device memory. With the counter on it is read
+    // again too, to count the spills that were not needed (they still spill then).
+    const bool stats = VideoCommon::LinkStats::On();
+    bool was_free = false;
+    if (refresh_before_spill || stats) {
+        clock.GetScheduler().GetMasterSemaphore().Refresh();
+        was_free = !AreRegionsActive(region_begin, region_end);
+    }
+    const bool spill = !(refresh_before_spill && was_free);
+    if (stats) [[unlikely]] {
+        if (spill) {
+            stream_use.full.fetch_add(1, std::memory_order_relaxed);
+            stream_use.full_bytes.fetch_add(size, std::memory_order_relaxed);
+        }
+        if (was_free) {
+            stream_use.full_was_free.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    return spill;
+}
+
+void StagingBufferPool::LogStreamUse() {
+    StreamUse& use = stream_use;
+    const u64 frame = use.frame_bytes.exchange(0, std::memory_order_relaxed);
+    if (frame > use.peak_frame_bytes.load(std::memory_order_relaxed)) {
+        use.peak_frame_bytes.store(frame, std::memory_order_relaxed);
+    }
+    size_t busy = 0;
+    const u64 gpu_tick = clock.KnownGpu();
+    for (const u64 tick : sync_ticks) {
+        busy += clock.IsKnownFree(tick, gpu_tick) ? 0 : 1;
+    }
+    use.peak_busy_regions = (std::max)(use.peak_busy_regions, busy);
+    const auto now = std::chrono::steady_clock::now();
+    if (use.window_start == std::chrono::steady_clock::time_point{}) {
+        use.window_start = now;
+        return;
+    }
+    const double seconds = std::chrono::duration<double>(now - use.window_start).count();
+    if (seconds < 10.0) {
+        return;
+    }
+    const auto rate = [seconds](std::atomic<u64>& counter) {
+        return static_cast<double>(counter.exchange(0, std::memory_order_relaxed)) / seconds;
+    };
+    const double requests = rate(use.requests);
+    const double mb = rate(use.bytes) / 1e6;
+    const double wraps = rate(use.wraps);
+    const double full = rate(use.full);
+    const double full_mb = rate(use.full_bytes) / 1e6;
+    const double was_free = rate(use.full_was_free);
+    const double too_big = rate(use.too_big);
+    const double too_big_mb = rate(use.too_big_bytes) / 1e6;
+    const u64 peak = use.peak_frame_bytes.exchange(0, std::memory_order_relaxed);
+    LOG_INFO(Render_Vulkan,
+             "Stream use for {} ({} MiB, {}, regions of {} MiB): {:.1f} MB/s in {:.0f} requests/s, "
+             "worst frame {:.1f} MiB, {:.2f} wraps/s, at most {} of {} regions busy at a frame end "
+             "({} MiB); full {:.1f}/s ({:.1f} MB/s went to host staging; {:.1f}/s were free at a "
+             "fresh look at the GPU); {:.1f}/s over a region ({:.1f} MB/s to host staging)",
+             StreamRoleName(role), stream_buffer_size >> 20,
+             stream_in_device_memory ? "device memory" : "host memory", region_size >> 20, mb,
+             requests, static_cast<double>(peak) / 1048576.0, wraps, use.peak_busy_regions,
+             NUM_SYNCS, (use.peak_busy_regions * region_size) >> 20, full, full_mb, was_free,
+             too_big, too_big_mb);
+    use.peak_busy_regions = 0;
+    use.window_start = now;
+}
+
+StagingBufferRef StagingBufferPool::RequestBuffer(
+    size_t size, MemoryUsage usage, bool deferred,
+    VideoCommon::BufferChurnStats::StagingCaller caller) {
     if (cache_side) {
         VideoCommon::MemoryStageLink::CheckCacheUser(VideoCommon::MemoryStageLink::Check::StagingUser);
     }
@@ -299,14 +572,20 @@ void StagingBufferPool::TickFrame() {
     if (upload_ring) {
         LogUploadRing();
     }
+    if (crosses_link && VideoCommon::LinkStats::On()) [[unlikely]] {
+        LogStreamUse();
+    }
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(
     size_t size, VideoCommon::BufferChurnStats::StagingCaller caller) {
-    if (AreRegionsActive(Region(free_iterator) + 1,
-                         (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
+    if (StreamRegionsBusy(Region(free_iterator) + 1,
+                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS), size)) {
         // EDEN_NX2_MEMSTAGE_STATS: the stream ring is busy (the memory stage's join 3).
         VideoCommon::MemStageStats::StreamFull();
+        if (VideoCommon::LinkStats::On()) [[unlikely]] {
+            VideoCommon::LinkStats::NoteStreamFull();
+        }
         // Memory stage step 7: on GPUMem with the window open the busy regions may be stamped
         // with packets not played yet; they are never waited for, a new buffer is taken (counted).
         VideoCommon::MemoryStageLink::NoteStagingFallback();
@@ -333,6 +612,9 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
     }
 
     if (iterator + size >= stream_buffer_size) {
+        if (VideoCommon::LinkStats::On()) [[unlikely]] {
+            stream_use.wraps.fetch_add(1, std::memory_order_relaxed);
+        }
         std::fill(sync_ticks.begin() + Region(used_iterator), sync_ticks.begin() + NUM_SYNCS,
                   current_tick);
         if (!wrap_guard) {
@@ -341,8 +623,11 @@ StagingBufferRef StagingBufferPool::GetStreamBuffer(
             free_iterator = size;
         }
 
-        if (AreRegionsActive(0, Region(size) + 1)) {
+        if (StreamRegionsBusy(0, Region(size) + 1, size)) {
             VideoCommon::MemStageStats::StreamFull();
+            if (VideoCommon::LinkStats::On()) [[unlikely]] {
+                VideoCommon::LinkStats::NoteStreamFull();
+            }
             VideoCommon::MemoryStageLink::NoteStagingFallback();
             // Avoid waiting for the previous usages to be free
             return GetStagingBuffer(size, MemoryUsage::Upload, false, caller, true);
@@ -471,19 +756,7 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         } catch (const vk::Exception& e) {
             // Out of memory: free every idle staging buffer (and EXP104's pooled ones) and try
             // once more.
-            size_t freed = recycler.DropAll();
-            for (StagingBuffersCache* cache :
-                 {&device_local_cache, &upload_cache, &download_cache}) {
-                for (StagingBuffers& level : *cache) {
-                    const size_t before = level.entries.size();
-                    std::erase_if(level.entries, [this](const StagingBuffer& entry) {
-                        return clock.IsFree(entry.tick);
-                    });
-                    freed += before - level.entries.size();
-                    level.iterate_index = 0;
-                    level.delete_index = 0;
-                }
-            }
+            const size_t freed = ReleaseIdleBuffers();
             LOG_WARNING(Render_Vulkan,
                         "Staging buffer of {} MiB could not be made ({}); freed {} idle "
                         "staging buffers and retrying",
@@ -519,6 +792,21 @@ StagingBufferRef StagingBufferPool::CreateStagingBuffer(
         cache_level.entries.push_back(std::move(entry));
     }
     return ref;
+}
+
+size_t StagingBufferPool::ReleaseIdleBuffers() {
+    size_t freed = recycler.DropAll();
+    for (StagingBuffersCache* cache : {&device_local_cache, &upload_cache, &download_cache}) {
+        for (StagingBuffers& level : *cache) {
+            const size_t before = level.entries.size();
+            std::erase_if(level.entries,
+                          [this](const StagingBuffer& entry) { return clock.IsFree(entry.tick); });
+            freed += before - level.entries.size();
+            level.iterate_index = 0;
+            level.delete_index = 0;
+        }
+    }
+    return freed;
 }
 
 StagingBufferPool::StagingBuffersCache& StagingBufferPool::GetCache(MemoryUsage usage) {

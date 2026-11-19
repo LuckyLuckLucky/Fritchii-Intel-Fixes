@@ -28,6 +28,10 @@ inline std::atomic<u32> g_watch{0};
 
 void OnUse(Use use, const std::source_location& location);
 
+/// This thread holds a filled draw or dispatch packet (SEAM = 2/3) whose plays have not run yet:
+/// a submit now lands between the fill and its PlayRest (Memory seam 5.5).
+[[nodiscard]] bool Holding() noexcept;
+
 inline void Watch(Use use,
                   const std::source_location& location = std::source_location::current()) {
     if (g_watch.load(std::memory_order_relaxed) != 0) [[unlikely]] {

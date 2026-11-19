@@ -1669,9 +1669,26 @@ vk::Pipeline CreateGraphicsPipeline(const Device& device, const VkGraphicsPipeli
     return Create(device, ci, cache, Kind::Graphics);
 }
 
+namespace {
+std::atomic<ComputeBuildObserver> compute_build_observer{nullptr};
+} // Anonymous namespace
+
+void SetComputeBuildObserver(ComputeBuildObserver observer) {
+    compute_build_observer.store(observer, std::memory_order_release);
+}
+
 vk::Pipeline CreateComputePipeline(const Device& device, const VkComputePipelineCreateInfo& ci,
                                    VkPipelineCache cache) {
-    return Create(device, ci, cache, Kind::Compute);
+    const ComputeBuildObserver observer = compute_build_observer.load(std::memory_order_acquire);
+    if (!observer) {
+        return Create(device, ci, cache, Kind::Compute);
+    }
+    const auto begin = Clock::now();
+    vk::Pipeline made = Create(device, ci, cache, Kind::Compute);
+    observer(ci.stage.module,
+             std::chrono::duration<double, std::milli>(Clock::now() - begin).count(),
+             static_cast<bool>(made));
+    return made;
 }
 
 void ReportPeriodic() {

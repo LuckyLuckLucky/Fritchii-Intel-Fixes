@@ -350,7 +350,7 @@ void SlowGpu::End(vk::CommandBuffer cmdbuf, u64 tick, const Origin& origin) {
         ++stamp_next;
     }
     std::scoped_lock lock{crumb_mutex};
-    Crumb& crumb = crumbs[crumb_next % Crumbs];
+    Crumb& crumb = crumbs[crumb_next % History];
     crumb.entry.tick = tick;
     crumb.entry.submit_ns = 0;
     crumb.entry.submit_call_us = 0;
@@ -378,7 +378,7 @@ void SlowGpu::Submitted(u64 tick, u64 call_ns) {
     if (crumb_next == 0) {
         return;
     }
-    Crumb& crumb = crumbs[(crumb_next - 1) % Crumbs];
+    Crumb& crumb = crumbs[(crumb_next - 1) % History];
     if (crumb.entry.tick == tick) {
         crumb.entry.submit_ns = call_ns;
         crumb.entry.submit_call_us = call_us;
@@ -540,7 +540,7 @@ void SlowGpu::Summary(u64 now, bool verbose) {
     offset_min = 1e300;
 }
 
-int SlowGpu::Started(u32 slot, u64 tick) const {
+int SlowGpu::StampWritten(u32 slot, u64 tick, u32 which) const {
     if (slot >= Slots || slot_tick[slot].load(std::memory_order_acquire) != tick || !pool) {
         return -1;
     }
@@ -550,7 +550,7 @@ int SlowGpu::Started(u32 slot, u64 tick) const {
     };
     Result result{};
     const VkResult status = device->GetLogical().GetQueryResults(
-        *pool, slot * 2, 1, sizeof(result), &result, sizeof(Result),
+        *pool, slot * 2 + which, 1, sizeof(result), &result, sizeof(Result),
         VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
     if ((status != VK_SUCCESS && status != VK_NOT_READY) ||
         slot_tick[slot].load(std::memory_order_acquire) != tick) {
@@ -560,7 +560,21 @@ int SlowGpu::Started(u32 slot, u64 tick) const {
 }
 
 void SlowGpu::LogBreadcrumbs(const char* prefix, MasterSemaphore& master) const {
+    // Read directly: this runs inside the device loss report, and MasterSemaphore::Refresh would
+    // call the report again on a lost device, which never returns to the thread already in it.
+    u64 reported = master.KnownGpuTick();
+    u64 read = 0;
+    const bool readable =
+        VideoCore::Nx2Debug::g_test_device_loss.load(std::memory_order_relaxed) != 2 &&
+        master.TryReadGpuTick(read);
+    if (readable) {
+        reported = (std::max)(reported, read);
+    }
+
     std::array<Crumb, Crumbs> copy{};
+    std::array<Crumb, OldestChecked> oldest{};
+    u32 oldest_count = 0;
+    bool older_lost = false;
     u64 next = 0;
     {
         // The worker holds it for a copy; a report never waits on a stuck thread for long.
@@ -574,8 +588,23 @@ void SlowGpu::LogBreadcrumbs(const char* prefix, MasterSemaphore& master) const 
             }
             std::this_thread::yield();
         }
-        copy = crumbs;
         next = crumb_next;
+        const u64 newest = (std::min)(next, u64{Crumbs});
+        for (u64 i = next - newest; i < next; ++i) {
+            copy[i % Crumbs] = crumbs[i % History];
+        }
+        // Ticks rise with the index: the first kept one past what the GPU reported.
+        for (u64 i = next - (std::min)(next, u64{History}); i < next; ++i) {
+            const Crumb& crumb = crumbs[i % History];
+            if (crumb.entry.tick <= reported) {
+                continue;
+            }
+            older_lost = crumb.entry.tick != reported + 1;
+            for (; i < next && oldest_count < OldestChecked; ++i) {
+                oldest[oldest_count++] = crumbs[i % History];
+            }
+            break;
+        }
     }
     if (next == 0) {
         LOG_CRITICAL(Render_Vulkan,
@@ -583,51 +612,76 @@ void SlowGpu::LogBreadcrumbs(const char* prefix, MasterSemaphore& master) const 
                      prefix);
         return;
     }
-    std::string refresh_note;
-    try {
-        master.Refresh();
-    } catch (const std::exception& e) {
-        refresh_note = fmt::format(" (its semaphore could not be read: {})", e.what());
-    } catch (...) {
-        refresh_note = " (its semaphore could not be read)";
-    }
-    const u64 reported = master.KnownGpuTick();
-    const u64 count = (std::min)(next, u64{Crumbs});
+    const std::string read_note =
+        readable ? std::string{}
+                 : std::string{" (its semaphore can't be read now: the last value read)"};
+    const u64 submitted_tick = master.QueueSubmittedTick();
     const u64 now = NowNs();
+    const auto submitted_text = [now](const Entry& entry) {
+        return entry.submit_ns == 0
+                   ? std::string{"not through vkQueueSubmit yet"}
+                   : fmt::format("submitted {:.1f} ms ago (vkQueueSubmit {} us)",
+                                 now > entry.submit_ns
+                                     ? static_cast<double>(now - entry.submit_ns) / 1e6
+                                     : 0.0,
+                                 entry.submit_call_us);
+    };
+    const auto started_text = [this](const Crumb& crumb) {
+        switch (Started(crumb.slot, crumb.entry.tick)) {
+        case 1:
+            return "NOT done, started on the GPU";
+        case 0:
+            return "NOT done, not started on the GPU";
+        default:
+            return "NOT done";
+        }
+    };
+
+    // The submission holding the queue up: the first not reported done whose end stamp isn't
+    // written either (the semaphore's last read can lag behind the stamps).
+    u32 stuck = 0;
+    while (stuck < oldest_count &&
+           Ended(oldest[stuck].slot, oldest[stuck].entry.tick) == 1) {
+        ++stuck;
+    }
+    if (stuck < oldest_count) {
+        const Crumb& crumb = oldest[stuck];
+        LOG_CRITICAL(Render_Vulkan,
+                     "{}: GPU oldest unfinished submission: tick {}: {}; {} more submitted behind "
+                     "it; the GPU reported tick {} done{}{}; {}; from {}; {}",
+                     prefix, crumb.entry.tick, started_text(crumb),
+                     submitted_tick > crumb.entry.tick ? submitted_tick - crumb.entry.tick : 0,
+                     reported, read_note,
+                     older_lost && stuck == 0
+                         ? "; older unfinished ones are not kept (over 256 behind, or FRITCHII_"
+                           "SLOW_GPU was off)"
+                         : "",
+                     submitted_text(crumb.entry), OriginText(crumb.entry.origin),
+                     Describe(crumb.entry.stats));
+    } else if (oldest_count == 0) {
+        LOG_CRITICAL(Render_Vulkan,
+                     "{}: GPU oldest unfinished submission: none kept; the GPU reported tick {} "
+                     "done{}, newest submitted {}",
+                     prefix, reported, read_note, submitted_tick);
+    } else {
+        LOG_CRITICAL(Render_Vulkan,
+                     "{}: GPU oldest unfinished submission: past tick {}: the {} after the GPU's "
+                     "report (tick {}{}) all have their end stamps",
+                     prefix, oldest[oldest_count - 1].entry.tick, oldest_count, reported,
+                     read_note);
+    }
+
+    const u64 count = (std::min)(next, u64{Crumbs});
     LOG_CRITICAL(Render_Vulkan,
                  "{}: GPU breadcrumbs: the main queue's last {} submissions, oldest first; the GPU "
                  "reported tick {} done{}; newest submitted {}",
-                 prefix, count, reported, refresh_note, master.QueueSubmittedTick());
+                 prefix, count, reported, read_note, submitted_tick);
     for (u64 i = next - count; i < next; ++i) {
         const Crumb& crumb = copy[i % Crumbs];
         const Entry& entry = crumb.entry;
-        std::string state;
-        if (entry.tick <= reported) {
-            state = "done";
-        } else {
-            switch (Started(crumb.slot, entry.tick)) {
-            case 1:
-                state = "NOT done, started on the GPU";
-                break;
-            case 0:
-                state = "NOT done, not started on the GPU";
-                break;
-            default:
-                state = "NOT done";
-                break;
-            }
-        }
-        const std::string submitted =
-            entry.submit_ns == 0
-                ? std::string{"not through vkQueueSubmit yet"}
-                : fmt::format("submitted {:.1f} ms ago (vkQueueSubmit {} us)",
-                              now > entry.submit_ns
-                                  ? static_cast<double>(now - entry.submit_ns) / 1e6
-                                  : 0.0,
-                              entry.submit_call_us);
         LOG_CRITICAL(Render_Vulkan, "{}: GPU breadcrumb tick {}: {}; {}; from {}; {}", prefix,
-                     entry.tick, state, submitted, OriginText(entry.origin),
-                     Describe(entry.stats));
+                     entry.tick, entry.tick <= reported ? "done" : started_text(crumb),
+                     submitted_text(entry), OriginText(entry.origin), Describe(entry.stats));
     }
 }
 

@@ -40,8 +40,12 @@ enum Part : u32 {
     RefuseScale = 1U << 3,
     /// Stream buffer 64 MiB instead of 128 (boot). Not in the default set.
     Stream = 1U << 4,
+    /// The buffer cache's device-local pool in 4 MiB blocks instead of 16 (boot;
+    /// FRITCHII_BUFFER_POOL_BLOCK_MB overrides, 0 keeps 16): at Castle Town ~140 MiB of small
+    /// buffers held 50 blocks, 800 MiB, a block staying while any buffer in it lives.
+    BufferPoolBlocks = 1U << 5,
 };
-inline constexpr u32 DefaultParts = Fit | Pool | BufferBlocks | RefuseScale;
+inline constexpr u32 DefaultParts = Fit | Pool | BufferBlocks | RefuseScale | BufferPoolBlocks;
 
 /// Auto mode's limits.
 inline constexpr u64 AutoHeapBytes = u64{9} << 30;
@@ -93,12 +97,12 @@ inline void Decide(u64 heap_size, u64 budget, bool integrated) {
     LOG_INFO(Render_Vulkan,
              "Small card profile (FRITCHII_SMALL_CARD={}): main heap {} MiB, budget {} MiB, {} "
              "card{}; profile {} (parts {:#x}: fit {}, pool {}, buffer blocks {}, refuse scale "
-             "{}, stream {})",
+             "{}, stream {}, buffer pool blocks {})",
              Mode(), heap_size >> 20, budget >> 20, is_small ? "a small" : "not a small",
              integrated ? " (integrated GPU)" : "", Active() ? "on" : "off", Parts(),
              (Parts() & Fit) != 0 ? 1 : 0, (Parts() & Pool) != 0 ? 1 : 0,
              (Parts() & BufferBlocks) != 0 ? 1 : 0, (Parts() & RefuseScale) != 0 ? 1 : 0,
-             (Parts() & Stream) != 0 ? 1 : 0);
+             (Parts() & Stream) != 0 ? 1 : 0, (Parts() & BufferPoolBlocks) != 0 ? 1 : 0);
 }
 
 /// Part RefuseScale (boot): a resolution scale over 1x turned down to 1x for this session. OoT

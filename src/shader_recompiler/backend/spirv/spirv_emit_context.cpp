@@ -509,6 +509,7 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
     DefineMeshDrawBase();
+    DefineOcclFlag();
 }
 
 EmitContext::~EmitContext() = default;
@@ -1454,9 +1455,19 @@ void EmitContext::DefineRescalingInputPushConstant() {
         members.push_back(U32[1]);
         mesh_draw_base_member_index = member_index++;
     }
+    const bool occl_flag{UsesOcclFlagStore()};
+    if (occl_flag) {
+        members.push_back(TypeInt(64, false));
+        occl_flag_member_index = member_index++;
+    }
     const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
     Decorate(push_constant_struct, spv::Decoration::Block);
     Name(push_constant_struct, "ResolutionInfo");
+    if (occl_flag) {
+        MemberDecorate(push_constant_struct, occl_flag_member_index, spv::Decoration::Offset,
+                       OCCL_FLAG_PUSH_OFFSET);
+        MemberName(push_constant_struct, occl_flag_member_index, "occl_flag_slot");
+    }
     if (UsesMeshDrawBase()) {
         MemberDecorate(push_constant_struct, mesh_draw_base_member_index, spv::Decoration::Offset,
                        MeshDrawBaseOffset());
@@ -1482,6 +1493,9 @@ void EmitContext::DefineRescalingInputPushConstant() {
     Name(rescaling_push_constants, "rescaling_push_constants");
     if (UsesMeshDrawBase()) {
         mesh_draw_base_push_constant = rescaling_push_constants;
+    }
+    if (occl_flag) {
+        occl_flag_push_constant = rescaling_push_constants;
     }
 
     if (profile.supported_spirv >= 0x00010400) {
@@ -1530,21 +1544,85 @@ void EmitContext::DefineMeshDrawBase() {
     }
 }
 
+void EmitContext::DefineOcclFlag() {
+    if (!UsesOcclFlagStore()) {
+        return;
+    }
+    // The slot is written through a physical storage buffer pointer (buffer device address).
+    AddCapability(spv::Capability::PhysicalStorageBufferAddresses);
+    AddCapability(spv::Capability::Int64);
+    if (profile.supported_spirv < 0x00010500) {
+        AddExtension("SPV_KHR_physical_storage_buffer");
+    }
+    SetMemoryModel(spv::AddressingModel::PhysicalStorageBuffer64, spv::MemoryModel::GLSL450);
+    occl_flag_u64 = TypeInt(64, false);
+    // The slot: a uvec2 behind a physical storage buffer pointer (no struct: see the header).
+    occl_flag_slot_pointer = TypePointer(spv::StorageClass::PhysicalStorageBuffer, U32[2]);
+    if (!Sirit::ValidId(occl_flag_push_constant)) {
+        // No rescaling or render area block: one of its own.
+        const Id push_constant_struct{TypeStruct(occl_flag_u64)};
+        Decorate(push_constant_struct, spv::Decoration::Block);
+        Name(push_constant_struct, "OcclFlagInfo");
+        MemberDecorate(push_constant_struct, 0, spv::Decoration::Offset, OCCL_FLAG_PUSH_OFFSET);
+        MemberName(push_constant_struct, 0, "occl_flag_slot");
+        occl_flag_member_index = 0;
+        const Id pointer_type{TypePointer(spv::StorageClass::PushConstant, push_constant_struct)};
+        occl_flag_push_constant =
+            AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
+        Name(occl_flag_push_constant, "occl_flag_push_constants");
+        if (profile.supported_spirv >= 0x00010400) {
+            interfaces.push_back(occl_flag_push_constant);
+        }
+    }
+    // void occl_flag_store(): the slot gets uvec2(4096, 0) while it still reads 0 (a large
+    // draw's fragments would otherwise all write the same 8 bytes; a stale 0 only repeats it).
+    occl_flag_store_function =
+        OpFunction(void_id, spv::FunctionControlMask::MaskNone, TypeFunction(void_id));
+    AddLabel();
+    const Id push_pointer{TypePointer(spv::StorageClass::PushConstant, occl_flag_u64)};
+    const Id address{OpLoad(occl_flag_u64, OpAccessChain(push_pointer, occl_flag_push_constant,
+                                                         Const(occl_flag_member_index)))};
+    const Id slot{OpConvertUToPtr(occl_flag_slot_pointer, address)};
+    const Id current{OpLoad(U32[2], slot, spv::MemoryAccessMask::Aligned, 8u)};
+    const Id unset{OpIEqual(U1, OpCompositeExtract(U32[1], current, 0u), u32_zero_value)};
+    const Id store_label{OpLabel()};
+    const Id merge_label{OpLabel()};
+    OpSelectionMerge(merge_label, spv::SelectionControlMask::MaskNone);
+    OpBranchConditional(unset, store_label, merge_label);
+    AddLabel(store_label);
+    OpStore(slot, Const(4096u, 0u), spv::MemoryAccessMask::Aligned, 8u);
+    OpBranch(merge_label);
+    AddLabel(merge_label);
+    OpReturn();
+    OpFunctionEnd();
+    Name(occl_flag_store_function, "occl_flag_store");
+}
+
 void EmitContext::DefineRenderArea(const Info& info) {
     if (!info.uses_render_area) {
         return;
     }
 
     if (profile.unified_descriptor_binding) {
-        boost::container::static_vector<Id, 1> members{};
+        boost::container::static_vector<Id, 2> members{};
         u32 member_index{0};
 
         members.push_back(F32[4]);
         render_are_member_index = member_index++;
+        const bool occl_flag{UsesOcclFlagStore() && !Sirit::ValidId(occl_flag_push_constant)};
+        if (occl_flag) {
+            members.push_back(TypeInt(64, false));
+            occl_flag_member_index = member_index++;
+        }
 
         const Id push_constant_struct{TypeStruct(std::span(members.data(), members.size()))};
         Decorate(push_constant_struct, spv::Decoration::Block);
         Name(push_constant_struct, "RenderAreaInfo");
+        if (occl_flag) {
+            MemberDecorate(push_constant_struct, occl_flag_member_index, spv::Decoration::Offset,
+                           OCCL_FLAG_PUSH_OFFSET);
+            MemberName(push_constant_struct, occl_flag_member_index, "occl_flag_slot");
+        }
 
         MemberDecorate(push_constant_struct, render_are_member_index, spv::Decoration::Offset, 0);
         MemberName(push_constant_struct, render_are_member_index, "render_area");
@@ -1553,6 +1631,9 @@ void EmitContext::DefineRenderArea(const Info& info) {
         render_area_push_constant =
             AddGlobalVariable(pointer_type, spv::StorageClass::PushConstant);
         Name(render_area_push_constant, "render_area_push_constants");
+        if (occl_flag) {
+            occl_flag_push_constant = render_area_push_constant;
+        }
 
         if (profile.supported_spirv >= 0x00010400) {
             interfaces.push_back(render_area_push_constant);

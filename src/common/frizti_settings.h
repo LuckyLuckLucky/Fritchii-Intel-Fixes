@@ -15,7 +15,8 @@
 namespace Settings::Frizti {
 
 // Bump when the tuned values change, so every player gets them once more.
-inline constexpr u32 Revision = 13; // 13: Fritchii v6.0 (window filter Auto); 12: v5.8.4 (8: v5.8, own data folder, DLSS modes)
+// 13: v6.0 (window filter Auto); 12: v5.8.4 (8: v5.8, own data folder, DLSS modes)
+inline constexpr u32 Revision = 14; // 14: Fritchii v6.2 (asked first: recommended settings prompt)
 inline constexpr u64 OcarinaOfTimeProgramId = 0x0400486024DEC000ULL;
 
 // The tuned settings. Frizti's value is each setting's default in settings.h.
@@ -68,6 +69,17 @@ std::vector<Change> FixDockedController(Values& values);
 
 std::map<std::string, std::string> GlobalValues(std::span<BasicSetting* const> settings);
 std::map<std::string, std::string> PerGameValues(std::span<BasicSetting* const> settings);
+
+// What a start does with the tuned settings.
+enum class StartupApply {
+    Reconcile, ///< this revision was applied already: only another build's changes are undone
+    Full,      ///< sets the tuned values without asking (fresh install, another build's config)
+    Ask,       ///< an earlier Fritchii version's settings are there: ask before replacing them
+};
+
+// `stored`: qt-config.ini's revision; `recorded`: config/frizti.ini's. `prompt` is the
+// FRITCHII_SETTINGS_PROMPT value: "ask" asks in any case, "0" never asks (keeps the settings).
+StartupApply DecideStartup(u32 stored, u32 recorded, std::string_view prompt);
 
 // "label: from -> to, ..."
 std::string FormatChanges(std::span<const Change> changes);

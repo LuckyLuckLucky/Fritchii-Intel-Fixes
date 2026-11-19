@@ -52,6 +52,10 @@ public:
     /// Refresh the known GPU tick
     void Refresh();
 
+    /// The card's own count read now, for reports. Never throws and never reports a device loss
+    /// (the loss report itself calls it). False when it can't be read or isn't a real tick.
+    [[nodiscard]] bool TryReadGpuTick(u64& tick) const noexcept;
+
     /// Waits for a tick to be hit on the GPU
     void Wait(u64 tick);
 

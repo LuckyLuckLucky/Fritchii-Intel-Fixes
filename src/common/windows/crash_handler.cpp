@@ -21,6 +21,7 @@
 #include <tlhelp32.h>
 
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/windows/crash_handler.h"
 
 #define LOG_CRASH(...) ::Common::Log::FmtCrashMessage(__FILE__, __LINE__, __func__, __VA_ARGS__)
@@ -122,6 +123,11 @@ void Report(EXCEPTION_POINTERS* pointers) {
         LOG_CRASH("Host crash: abort() on thread {} \"{}\"; stack:{}", GetCurrentThreadId(),
                   thread_name, stack);
     }
+    if (const u64 refusals = Common::CommitRefusals(); refusals != 0) {
+        LOG_CRASH("Windows' commit limit (RAM plus the page file) refused memory {} times after "
+                  "5 s of waiting: this crash is most likely running out of memory",
+                  refusals);
+    }
 
     if (!write_dump) {
         return;
@@ -132,9 +138,11 @@ void Report(EXCEPTION_POINTERS* pointers) {
         return;
     }
     MINIDUMP_EXCEPTION_INFORMATION information{GetCurrentThreadId(), pointers, FALSE};
-    const BOOL written =
-        write_dump(GetCurrentProcess(), GetCurrentProcessId(), file, MiniDumpWithThreadInfo,
-                   pointers ? &information : nullptr, nullptr, nullptr);
+    // The unloaded modules name what a call through a stale pointer went to.
+    const BOOL written = write_dump(
+        GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
+        pointers ? &information : nullptr, nullptr, nullptr);
     const DWORD error = written ? 0 : GetLastError();
     CloseHandle(file);
     LOG_CRASH("Host crash: minidump of process {} {} ({:#x})", GetCurrentProcessId(),
@@ -714,6 +722,128 @@ std::vector<std::string> ThreadStackLines(unsigned long main_thread_id) {
         lines.push_back(std::to_string(unreadable) + " threads could not be opened");
     }
     return lines;
+}
+
+namespace {
+
+constexpr const wchar_t* DumpProcessVariable = L"FRITCHII_DUMP_PROCESS";
+constexpr const wchar_t* DumpPathVariable = L"FRITCHII_DUMP_PATH";
+/// How long the helper may take: while it writes, every thread of the process it dumps is stopped,
+/// so only the helper can end that process if the write gets stuck.
+constexpr DWORD DumpHelperLimitMs = 15000;
+
+HANDLE dump_target{};
+
+DWORD WINAPI DumpHelperLimit(void*) {
+    Sleep(DumpHelperLimitMs);
+    TerminateProcess(dump_target, 2);
+    ExitProcess(5);
+}
+
+} // Anonymous namespace
+
+bool RunDumpHelper(int& exit_code) {
+    wchar_t process_text[16]{};
+    const DWORD length = GetEnvironmentVariableW(DumpProcessVariable, process_text, 16);
+    if (length == 0 || length >= 16) {
+        return false;
+    }
+    exit_code = 1;
+    wchar_t path[MAX_PATH]{};
+    const DWORD path_length = GetEnvironmentVariableW(DumpPathVariable, path, MAX_PATH);
+    if (path_length == 0 || path_length >= MAX_PATH) {
+        return true;
+    }
+    const DWORD process_id = std::wcstoul(process_text, nullptr, 10);
+    dump_target = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_DUP_HANDLE |
+                                  PROCESS_TERMINATE,
+                              FALSE, process_id);
+    if (dump_target == nullptr) {
+        exit_code = 2;
+        return true;
+    }
+    if (const HANDLE limit = CreateThread(nullptr, 0, DumpHelperLimit, nullptr, 0, nullptr)) {
+        CloseHandle(limit);
+    }
+    const HMODULE dbghelp = LoadLibraryW(L"dbghelp.dll");
+    const auto writer = dbghelp != nullptr
+                            ? reinterpret_cast<MiniDumpWriteDumpFn>(reinterpret_cast<void*>(
+                                  GetProcAddress(dbghelp, "MiniDumpWriteDump")))
+                            : nullptr;
+    if (writer == nullptr) {
+        exit_code = 3;
+        return true;
+    }
+    const HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                                    FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        exit_code = 4;
+        return true;
+    }
+    const BOOL written =
+        writer(dump_target, process_id, file,
+               static_cast<MINIDUMP_TYPE>(MiniDumpWithThreadInfo | MiniDumpWithUnloadedModules),
+               nullptr, nullptr, nullptr);
+    CloseHandle(file);
+    if (!written) {
+        DeleteFileW(path);
+    }
+    exit_code = written ? 0 : 6;
+    return true;
+}
+
+void ReportFatalError(const char* what) {
+    void* frames[40];
+    const USHORT count = RtlCaptureStackBackTrace(1, 40, frames, nullptr);
+    DWORD64 addresses[40]{};
+    for (USHORT i = 0; i < count; ++i) {
+        addresses[i] = reinterpret_cast<std::uintptr_t>(frames[i]);
+    }
+    char stack[1024] = "";
+    AppendFrames(stack, sizeof(stack), addresses, count);
+    LOG_CRASH("Host crash: {} on thread {} \"{}\"; stack:{}", what, GetCurrentThreadId(),
+              ThreadName(GetCurrentThread()), stack);
+
+    if (dump_path[0] == L'\0') {
+        LOG_CRASH("Host crash: no minidump (the crash handler has no place for it)");
+        return;
+    }
+    std::wstring exe(32768, L'\0');
+    const DWORD exe_length = GetModuleFileNameW(nullptr, exe.data(), static_cast<DWORD>(exe.size()));
+    if (exe_length == 0 || exe_length >= exe.size()) {
+        LOG_CRASH("Host crash: no minidump (the program's path is unknown, error {})",
+                  GetLastError());
+        return;
+    }
+    exe.resize(exe_length);
+    std::wstring command = L"\"" + exe + L"\"";
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION helper{};
+    if (!SetEnvironmentVariableW(DumpProcessVariable,
+                                 std::to_wstring(GetCurrentProcessId()).c_str()) ||
+        !SetEnvironmentVariableW(DumpPathVariable, dump_path) ||
+        !CreateProcessW(exe.c_str(), command.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW,
+                        nullptr, nullptr, &startup, &helper)) {
+        LOG_CRASH("Host crash: no minidump (its helper process did not start, error {})",
+                  GetLastError());
+        return;
+    }
+    CloseHandle(helper.hThread);
+    // Never ended from here: it may have this process's threads stopped, and only it resumes them.
+    const DWORD waited = WaitForSingleObject(helper.hProcess, DumpHelperLimitMs + 5000);
+    DWORD helper_code = 0;
+    GetExitCodeProcess(helper.hProcess, &helper_code);
+    CloseHandle(helper.hProcess);
+    if (waited == WAIT_OBJECT_0 && helper_code == 0) {
+        LOG_CRASH("Host crash: minidump of process {} written next to the log as eden_crash.dmp "
+                  "by a helper process",
+                  GetCurrentProcessId());
+    } else {
+        LOG_CRASH("Host crash: no minidump of process {} (helper {}, code {})",
+                  GetCurrentProcessId(), waited == WAIT_OBJECT_0 ? "failed" : "still running",
+                  helper_code);
+    }
 }
 
 } // namespace Common::Windows

@@ -7,9 +7,26 @@
 namespace Mode = VideoCommon::DlssMode;
 using Quality = Settings::NvidiaDlssQuality;
 
-TEST_CASE("DLSS settings keep K by default and round-trip saved values", "[dlss_mode]") {
+TEST_CASE("The Auto DLSS preset is K unless a small card opts in to E", "[dlss_mode]") {
     using Preset = Settings::DlssPreset;
-    REQUIRE(Settings::values.nvidia_dlss_preset.GetDefault() == Preset::K);
+    constexpr u64 GiB = u64{1} << 30;
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, false, 6 * GiB) == Preset::K);
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 6 * GiB) == Preset::E);
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 7 * GiB - 1) == Preset::E);
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 7 * GiB) == Preset::K);
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Auto, true, 0) == Preset::K);
+    // A preset the player chose is never replaced.
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::K, true, 6 * GiB) == Preset::K);
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::M, true, 6 * GiB) == Preset::M);
+    STATIC_REQUIRE(Mode::ResolvePreset(Preset::Default, true, 6 * GiB) == Preset::Default);
+}
+
+TEST_CASE("DLSS settings default to Auto and round-trip saved values", "[dlss_mode]") {
+    using Preset = Settings::DlssPreset;
+    REQUIRE(Settings::values.nvidia_dlss_preset.GetDefault() == Preset::Auto);
+    // The numbers saved configs hold.
+    STATIC_REQUIRE(static_cast<u32>(Preset::K) == 2);
+    STATIC_REQUIRE(static_cast<u32>(Preset::M) == 4);
     REQUIRE(Settings::values.nvidia_dlss_quality.GetDefault() == Quality::Automatic);
     Settings::Linkage linkage;
     Settings::Setting<Preset> preset{linkage, Preset::K, "preset", Settings::Category::Renderer};

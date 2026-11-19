@@ -26,6 +26,10 @@ struct RescalingLayout {
     alignas(16) std::array<u32, NUM_IMAGE_SCALING_WORDS> rescaling_images;
     u32 down_factor;
 };
+/// FRITCHII_OCCL_FLAG: push constant bytes 40..47 hold the open occlusion query's flag slot
+/// address (written by the rasterizer for flag variants; unused by the layouts above and below).
+constexpr u32 OCCL_FLAG_PUSH_OFFSET = 40;
+
 struct RenderAreaLayout {
     std::array<f32, 4> render_area;
 };

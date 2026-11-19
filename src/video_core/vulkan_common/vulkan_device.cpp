@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bitset>
 #include <chrono>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include "video_core/fritchii_occl_flag.h"
 #include "common/container/unordered_map.h"
 #include "common/container/unordered_set.h"
 #include <utility>
@@ -31,6 +33,12 @@
 #include <ranges>
 #include "common/settings.h"
 #include "common/settings_enums.h"
+#include "common/shutdown_watch.h"
+#ifdef _WIN32
+#include "common/windows/crash_handler.h"
+#elif defined(__linux__) && !defined(__ANDROID__)
+#include "common/linux/crash_handler.h"
+#endif
 #include "video_core/churn_counters.h"
 #include "video_core/memory_stage_link.h"
 #include "video_core/nx2_debug_control.h"
@@ -39,6 +47,7 @@
 #include "video_core/renderer_vulkan/vk_pipeline_binary.h"
 #include "video_core/vulkan_common/nsight_aftermath_tracker.h"
 #include "video_core/vulkan_common/vma.h"
+#include "video_core/vulkan_common/vulkan_debug_callback.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 #include "video_core/vulkan_common/vulkan_kept_blocks.h"
 #include "video_core/nx2_perf.h"
@@ -491,7 +500,8 @@ void GetHeapBudgets(const Device& device, std::array<VmaBudget, VK_MAX_MEMORY_HE
     case 0x163F: // Van Gogh (Steam Deck)
     case 0x1435: // Sephiroth (Steam Deck OLED)
     case 0x1681: // Rembrandt
-    case 0x164E: // Raphael and Granite Ridge graphics
+    case 0x164E: // Raphael graphics
+    case 0x13C0: // Granite Ridge graphics
     case 0x1506: // Mendocino
         return true;
     default:
@@ -1017,6 +1027,10 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         RemoveExtensionFeature(extensions.descriptor_buffer, features.descriptor_buffer,
                                VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
     }
+    // FRITCHII_OCCL_FLAG: the session's value (a switch, else the Occlusion speed-up setting),
+    // read once per game boot.
+    const bool occl_flag_wanted = VideoCommon::OcclFlag::ReadAtBoot(
+        VideoCommon::OcclFlag::FromSetting(Settings::values.occlusion_speedup.GetValue()));
 #ifdef EGLANTINE_STREAMLINE
     // NVIDIA's DLSS needs buffer device addresses: keep the feature enabled for
     // it, but leave the emulator's own buffers as they are without descriptor buffers.
@@ -1026,9 +1040,27 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         extensions.buffer_device_address = false;
     } else
 #endif
-    if (!extensions.descriptor_buffer) {
+    if (!extensions.descriptor_buffer && occl_flag_wanted &&
+        instance_version >= VK_API_VERSION_1_2 &&
+        features.buffer_device_address.bufferDeviceAddress) {
+        // FRITCHII_OCCL_FLAG: the flag pipelines store through buffer device addresses. As for
+        // DLSS above, the feature stays enabled while the emulator's own buffers and VMA stay
+        // as they are without descriptor buffers.
+        extensions.buffer_device_address = false;
+        occl_flag_device_address = true;
+    } else if (!extensions.descriptor_buffer) {
         RemoveExtensionFeature(extensions.buffer_device_address, features.buffer_device_address,
                                VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+    }
+    // FRITCHII_OCCL_FLAG: whichever branch ran, the feature is still enabled when it was not
+    // removed (the DLSS branch keeps it too).
+    if (occl_flag_wanted) {
+        occl_flag_device_address = instance_version >= VK_API_VERSION_1_2 &&
+                                   features.buffer_device_address.bufferDeviceAddress != 0;
+        LOG_INFO(Render_Vulkan,
+                 "Occlusion flags (FRITCHII_OCCL_FLAG): buffer device address {} (instance {}.{})",
+                 occl_flag_device_address ? "enabled for the flag area" : "not available",
+                 VK_API_VERSION_MAJOR(instance_version), VK_API_VERSION_MINOR(instance_version));
     }
 
     // The float16 workarounds above keep shaders from doing float16 arithmetic. Cooperative
@@ -1103,6 +1135,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
 
     graphics_queue = logical.GetQueue(graphics_family);
     present_queue = logical.GetQueue(present_family);
+    if (const std::optional<u32> family = LinkHogFamily()) {
+        link_hog_queue = logical.GetQueue(*family);
+        link_hog_family = *family;
+        has_link_hog_queue = true;
+    }
     if (WantsSideQueue()) {
         side_queue = logical.GetQueue(graphics_family, 1);
         has_side_queue = true;
@@ -1443,9 +1480,16 @@ VkDeviceSize Device::DeviceBufferBlockSize() noexcept {
     // buffer cache's device-local pool, buffers over half a block take the default blocks.
     // 4 = small blocks with a 2 MiB cut-off: a 16 MiB block holds a few buffers and stays
     // pinned while any of them lives, mostly empty ("buffer pool" slack in VRAM_OWNERS).
+    // FRITCHII_SMALL_CARD (part BufferPoolBlocks): 4 unless the switch says otherwise. The first
+    // call comes with the first buffer, after the device decided the profile.
     static const VkDeviceSize size = [] {
         const char* value = std::getenv("FRITCHII_BUFFER_POOL_BLOCK_MB");
         if (value == nullptr || value[0] == '\0') {
+            if (VideoCore::SmallCard::On(VideoCore::SmallCard::BufferPoolBlocks)) {
+                LOG_INFO(Render_Vulkan, "Small card profile: device buffer pool blocks of 4 MiB, "
+                                        "buffers over 2048 KiB take the default blocks");
+                return VkDeviceSize{4} << 20;
+            }
             return SeparatePoolBlockSize;
         }
         const long mib = std::strtol(value, nullptr, 10);
@@ -1637,15 +1681,49 @@ VkFormat Device::GetSupportedFormat(VkFormat wanted_format, VkFormatFeatureFlags
     return wanted_format;
 }
 
-void Device::ReportLoss() const {
-    LOG_CRITICAL(Render_Vulkan, "Device loss occurred!");
+void Device::ReportLoss(std::source_location where) const {
+    // The first thread to see the loss reports it and ends the process; the others wait for that.
+    static std::atomic_flag reported;
+    if (reported.test_and_set()) {
+        for (;;) {
+            std::this_thread::sleep_for(std::chrono::hours{1});
+        }
+    }
+    // The report touches the driver, the log and every thread's stack, on a process in an unknown
+    // state: whatever gets stuck, the process still ends and the player gets no frozen window.
+    Common::ShutdownWatch::EndProcessAfter(std::chrono::seconds{nsight_aftermath_tracker ? 50 : 35});
+    u64 heap_size{};
+    u64 heap_usage{};
+    u64 heap_budget{};
+    const bool has_heap = MainHeapNumbers(heap_size, heap_usage, heap_budget);
+    LOG_CRITICAL(Render_Vulkan,
+                 "Device loss occurred! Seen at {}:{}; GPU {}, driver {} ({:#x}); video memory {}",
+                 where.file_name(), where.line(), GetModelName(), GetDriverName(),
+                 GetDriverVersion(),
+                 has_heap ? fmt::format("{} MiB used of {} MiB, budget {} MiB", heap_usage >> 20,
+                                        heap_size >> 20, heap_budget >> 20)
+                          : std::string{"unknown"});
     PipelineBinary::NoteDeviceLoss();
     ReportDeviceFault();
     // FRITCHII_SLOW_GPU: what the GPU was last given (NVIDIA's fault info has no addresses).
     Common::Nx2Hitch::LogGpuBreadcrumbs("Device loss");
+    // What every thread was doing, as a hang report gives it.
+    Common::Nx2Hitch::LogThreadReport("Device loss", false, 0);
 
-    // Wait for the log to flush and for Nsight Aftermath to dump the results
-    std::this_thread::sleep_for(std::chrono::seconds{15});
+    if (nsight_aftermath_tracker) {
+        // Give Nsight Aftermath time to write its dump.
+        std::this_thread::sleep_for(std::chrono::seconds{15});
+    }
+    static constexpr const char* FatalError = "the GPU driver lost the Vulkan device";
+#ifdef _WIN32
+    Common::Windows::ReportFatalError(FatalError);
+#elif defined(__linux__) && !defined(__ANDROID__)
+    Common::Linux::LogFatalError(FatalError);
+#endif
+    LOG_CRITICAL(Render_Vulkan, "Closing Fritchii: {}", FatalError);
+    // Flushes the log and skips DLL detach, which would run the driver's teardown on the lost
+    // device. An exception from here would only reach std::terminate on a worker thread.
+    Common::ShutdownWatch::EndProcessNow();
 }
 
 void Device::ReportDeviceFault() const {
@@ -1708,6 +1786,8 @@ void Device::ReportDeviceFault() const {
         const VkDeviceSize lower = address.reportedAddress & ~(precision - 1);
         LOG_CRITICAL(Render_Vulkan, "Device fault address {}: {} at {:#x} (range [{:#x}, {:#x}))",
                      i, type, address.reportedAddress, lower, lower + precision);
+        // FRITCHII_VA_REPORT=1: what held that page, and whether it was still bound.
+        VaReport::LogOwners(address.reportedAddress, precision);
     }
     for (u32 i = 0; i < counts.vendorInfoCount; ++i) {
         const VkDeviceFaultVendorInfoEXT& vendor = vendor_infos[i];
@@ -2051,10 +2131,38 @@ bool Device::GetSuitability(bool requires_swapchain) {
         device_fault_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT;
         SetNext(next, device_fault_features);
     }
+    // FRITCHII_VA_REPORT=1 (boot, test tool): the driver reports each GPU address range it binds
+    // or unbinds, so a device loss can name what held the faulting page. It reports through
+    // VK_EXT_debug_utils, which the instance enabled for it (VaReport::InstanceReady).
+    const bool has_address_binding_report =
+        VaReport::Requested() && VaReport::InstanceReady() &&
+        supported_extensions.contains(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+    if (VaReport::Requested() && !has_address_binding_report) {
+        LOG_WARNING(Render_Vulkan, "GPU address report (FRITCHII_VA_REPORT=1): off, the driver "
+                                   "has no VK_EXT_device_address_binding_report or the instance "
+                                   "no VK_EXT_debug_utils");
+    }
+    if (has_address_binding_report) {
+        address_binding_report_features.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT;
+        SetNext(next, address_binding_report_features);
+    }
 
     // Perform the feature test.
     physical.GetFeatures2(features2);
 
+    if (has_address_binding_report) {
+        // Its features struct is in the creation chain: the extension is enabled either way.
+        loaded_extensions.insert(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        if (address_binding_report_features.reportAddressBinding) {
+            VaReport::NoteDeviceReady();
+            LOG_INFO(Render_Vulkan, "GPU address report (FRITCHII_VA_REPORT=1): the driver reports "
+                                    "its GPU address binds");
+        } else {
+            LOG_WARNING(Render_Vulkan, "GPU address report (FRITCHII_VA_REPORT=1): off, the "
+                                       "driver lists the extension without reportAddressBinding");
+        }
+    }
     if (has_device_fault_extension) {
         loaded_extensions.insert(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
         // No vendor binary dumps: only the description, addresses and vendor codes are logged.
@@ -3185,6 +3293,69 @@ bool Device::WantsSideQueue() const {
     return wanted;
 }
 
+std::optional<u32> Device::LinkHogFamily() const {
+    // Read where the device is made: after main() applied nx2_switches.txt.
+    static const std::optional<u32> family = [this]() -> std::optional<u32> {
+        // The mode alone is enough: a live test can then start the copies at rate 0.
+        const char* const value = std::getenv("FRITCHII_SIM_LINK_HOG");
+        if ((value == nullptr || std::atoi(value) <= 0) &&
+            std::getenv("FRITCHII_SIM_LINK_HOG_MODE") == nullptr) {
+            return std::nullopt;
+        }
+        // A family of its own: copy-only if there is one (a copy engine), else compute-only.
+        const auto families = physical.GetQueueFamilyProperties();
+        std::optional<u32> compute_only;
+        for (u32 index = 0; index < families.size(); ++index) {
+            const VkQueueFlags flags = families[index].queueFlags;
+            if (index == graphics_family || index == present_family ||
+                families[index].queueCount == 0 || (flags & VK_QUEUE_GRAPHICS_BIT) != 0) {
+                continue;
+            }
+            if ((flags & VK_QUEUE_COMPUTE_BIT) == 0 && (flags & VK_QUEUE_TRANSFER_BIT) != 0) {
+                return index;
+            }
+            if ((flags & VK_QUEUE_COMPUTE_BIT) != 0 && !compute_only) {
+                compute_only = index;
+            }
+        }
+        if (!compute_only) {
+            LOG_WARNING(Render_Vulkan, "FRITCHII_SIM_LINK_HOG: no queue family for it, off");
+        }
+        return compute_only;
+    }();
+    return family;
+}
+
+bool Device::PrefersDescriptorSets() const {
+    static const bool prefers = [this] {
+        const char* const value = std::getenv("FRITCHII_DESCRIPTOR_SETS");
+        const int mode = value != nullptr ? std::atoi(value) : 0;
+        VkDeviceSize window = 0;
+        const auto memory = physical.GetMemoryProperties().memoryProperties;
+        for (u32 type = 0; type < memory.memoryTypeCount; ++type) {
+            const VkMemoryPropertyFlags flags = memory.memoryTypes[type].propertyFlags;
+            if ((flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0 &&
+                (flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0) {
+                window = (std::max)(window, memory.memoryHeaps[memory.memoryTypes[type].heapIndex].size);
+            }
+        }
+        // =2: where AMD's driver keeps command buffers and push descriptors in host memory: a
+        // discrete card whose CPU-visible window is 7 GiB or less (no resizable BAR).
+        const bool amd = GetDriverID() == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                         GetDriverID() == VK_DRIVER_ID_AMD_OPEN_SOURCE;
+        const bool on = mode == 1 || (mode == 2 && amd && !IsIntegrated() &&
+                                      window <= VkDeviceSize{7} << 30);
+        LOG_INFO(Render_Vulkan,
+                 "Descriptors: {} (FRITCHII_DESCRIPTOR_SETS={}; push descriptors {}, descriptor "
+                 "buffer {}; CPU-visible device memory {} MiB)",
+                 on ? "sets from pools" : "as the driver's features allow", mode,
+                 IsKhrPushDescriptorSupported() ? "supported" : "not supported",
+                 IsExtDescriptorBufferSupported() ? "supported" : "off", window >> 20);
+        return on;
+    }();
+    return prefers;
+}
+
 std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
     static constexpr float QUEUE_PRIORITY = 1.0f;
     static constexpr std::array<float, 2> QUEUE_PRIORITIES{1.0f, 1.0f};
@@ -3208,6 +3379,16 @@ std::vector<VkDeviceQueueCreateInfo> Device::GetDeviceQueueCreateInfos() const {
             ci.queueCount = 2;
             ci.pQueuePriorities = QUEUE_PRIORITIES.data();
         }
+    }
+    if (const std::optional<u32> family = LinkHogFamily()) {
+        queue_cis.push_back(VkDeviceQueueCreateInfo{
+            .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .queueFamilyIndex = *family,
+            .queueCount = 1,
+            .pQueuePriorities = &QUEUE_PRIORITY,
+        });
     }
 
     return queue_cis;

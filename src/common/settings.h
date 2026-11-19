@@ -276,6 +276,11 @@ struct Values {
                                                     Category::Cpu};
     SwitchableSetting<CpuAccuracy, true> cpu_accuracy{linkage, CpuAccuracy::Auto,
                                                       "cpu_accuracy", Category::Cpu};
+    // Intel CPUs with P- and E-cores: Automatic leaves the GPU emulation threads to Windows, PinGpu
+    // holds them on the P-cores (common/thread.cpp). Global only, read when a game starts;
+    // EDEN_HYBRID_CORES wins when it is set.
+    Setting<HybridCpuPlacement> hybrid_cpu_placement{linkage, HybridCpuPlacement::Automatic,
+                                                     "hybrid_cpu_placement", Category::Cpu};
     SwitchableSetting<CpuClock> cpu_clock{linkage,
                                               CpuClock::Normal,
                                               "fast_cpu_time",
@@ -401,12 +406,13 @@ struct Values {
     // value (left in some players' OoT configs) silently overrode the checkbox, which then showed
     // unchecked and greyed once the game ran (2026-11-09, an RTX 5080 player).
     Setting<bool> nvidia_dlss{linkage, false, "nvidia_dlss", Category::Renderer};
-    // The DLSS model (preset) for every mode: K by default (NVIDIA's defaults for Performance and
-    // Ultra Performance drew thin lines); Default leaves the choice to NVIDIA. EDEN_NX2_DLSS_PRESET
-    // still overrides it. Applies live (Apply/OK while playing).
+    // The DLSS model (preset) for every mode. Auto, the default, is K (NVIDIA's defaults for
+    // Performance and Ultra Performance drew thin lines), or E on small cards with
+    // FRITCHII_DLSS_LOW_VRAM_CNN; a player who picks K gets K. Default leaves the choice to
+    // NVIDIA. EDEN_NX2_DLSS_PRESET still overrides it. Applies live (Apply/OK while playing).
     // v5.8.4: per game as well (the owner: "in game settings and not just global").
     SwitchableSetting<DlssPreset> nvidia_dlss_preset{linkage,
-                                           DlssPreset::K,
+                                           DlssPreset::Auto,
                                            "nvidia_dlss_preset",
                                            Category::Renderer,
                                            Specialization::Default,
@@ -460,6 +466,12 @@ struct Values {
     // (VideoCommon::OcarinaUpscaleOutputs; above 4K only where the card's memory allows it).
     // Global only; takes effect when the game starts.
     Setting<u32> oot_upscale_output{linkage, 0, "oot_upscale_output", Category::Renderer};
+    // OoT's render height with DLSS or FSR (docked, Max Resolution on), set by the picture menu's
+    // "Resolution": 0 = not chosen (the game's 1440p, or FRITCHII_DLSS_RENDER_SCALE's DLSS
+    // qualities), 1440 = the game's 1440p, else 720 or 1080 (360, 540, 810, 900, 1260 with
+    // FRITCHII_OOT_RENDER_STEPS). A built-in patch of the game's render scale: every pass of the
+    // game, compute ones too, runs at that size. Global only; takes effect when the game starts.
+    Setting<u32> oot_render_height{linkage, 0, "oot_render_height", Category::Renderer};
     // The title screen's and cutscenes' videos (AV1 1080p60): the game's own upscaler (removes
     // banding, 1080p -> 1440p; tensor operations) or a bilinear copy. Automatic: the game's where
     // the GPU runs tensor operations natively (RTX), the copy elsewhere (its emulated matrices
@@ -663,6 +675,13 @@ struct Values {
                                                           true,
                                                           true,
                                                           &oot_high_refresh};
+    // Ocarina of Time's occlusion tests without host queries (video_core/fritchii_occl_flag.h):
+    // Standard is the core (FRITCHII_OCCL_FLAG=3), Full adds the colour variants and pre-passes
+    // (=9; offered once to AMD players, fritchii/occlusion_offer.cpp). Acts only where one
+    // follower is off (AMD's Windows driver by default). FRITCHII_OCCL_FLAG, when a switch sets
+    // it, wins. Global only; takes effect when the game starts.
+    Setting<OcclusionSpeedup> occlusion_speedup{linkage, OcclusionSpeedup::Standard,
+                                                "occlusion_speedup", Category::RendererAdvanced};
     // Which revision of the Frizti tuned settings (common/frizti_settings.h) this config has had
     // applied once (MainWindow::MigrateFriztiSettings; config/frizti.ini keeps it too).
     Setting<u32> frizti_settings_revision{linkage, 0, "frizti_settings_revision",
@@ -1038,19 +1057,38 @@ struct NvidiaDlssRuntimeSettings {
 void RefreshNvidiaDlssRuntimeSettings();
 NvidiaDlssRuntimeSettings GetNvidiaDlssRuntimeSettings();
 
-/// FRITCHII_DLSS_RENDER_SCALE (boot, 0 = off): Ocarina of Time's own render resolution follows
-/// the NVIDIA DLSS quality (a built-in patch of its fixed render scale under Max Resolution), so
-/// Performance renders 1920x1080 and Ultra Performance 1280x720 before DLSS makes 4K. Off, every
-/// quality but Native takes the game's 2560x1440.
+/// FRITCHII_DLSS_RENDER_SCALE (boot, 0 = off): while oot_render_height is not set (0), Ocarina of
+/// Time's own render resolution follows the NVIDIA DLSS quality, so Performance renders
+/// 1920x1080 and Ultra Performance 1280x720 before DLSS makes 4K. Off, every quality but Native
+/// takes the game's 2560x1440.
 [[nodiscard]] bool OcarinaDlssRenderScaleSwitch();
-/// The quality whose render scale the patch applies when the game starts: Performance or Ultra
-/// Performance, with the switch on, NVIDIA DLSS on, docked and no FSR choice for OoT.
-[[nodiscard]] std::optional<NvidiaDlssQuality> OcarinaDlssRenderScale();
-/// The quality whose render-scale patch the running game's main module got (none: unpatched).
-void SetAppliedOcarinaRenderScale(std::optional<NvidiaDlssQuality> quality);
-[[nodiscard]] std::optional<NvidiaDlssQuality> AppliedOcarinaRenderScale();
-/// OoT's render height at a quality with the patch (2560x1440 scaled by 1, 0.75 or 0.5).
-[[nodiscard]] u32 OcarinaRenderHeightFor(std::optional<NvidiaDlssQuality> scale);
+/// FRITCHII_OOT_RENDER_STEPS (boot, 0 = off): also offer 360p, 540p, 810p, 900p and 1260p as OoT's
+/// render height (their scene sizes are not checked yet; see OcarinaRenderHeightOffered).
+[[nodiscard]] bool OcarinaRenderStepsSwitch();
+/// The heights OoT can draw its scene at under Max Resolution with DLSS or FSR: a built-in patch
+/// of the game's fixed render scale (main+0x806420) to height / 1440 of 2560x1440. Each scale is
+/// exact in the instruction's 16 bits (0.25, 0.375, 0.5, 0.5625, 0.625, 0.75, 0.875, 1).
+inline constexpr std::array<u32, 8> OcarinaRenderHeights{360, 540, 720, 810, 900, 1080, 1260, 1440};
+/// Whether the picture menu offers a render height: 720, 1080 and 1440 always, the others only
+/// with FRITCHII_OOT_RENDER_STEPS.
+[[nodiscard]] bool OcarinaRenderHeightOffered(u32 height);
+/// The render height the patch applies when the game starts (none: the game's 1440p): the
+/// oot_render_height setting below 1440 with DLSS or FSR picked for OoT, docked, Max Resolution
+/// on; while the setting is 0, FRITCHII_DLSS_RENDER_SCALE's Performance / Ultra Performance.
+[[nodiscard]] std::optional<u32> OcarinaRenderHeight();
+/// The frontend, before a game boots: whether the card it will run on can run DLSS (the patch is
+/// applied before the renderer exists). Default true, for frontends that don't know.
+void SetOcarinaCardRunsDlss(bool runs);
+/// The render height whose patch the running game's main module got (none: unpatched).
+void SetAppliedOcarinaRenderHeight(std::optional<u32> height);
+[[nodiscard]] std::optional<u32> AppliedOcarinaRenderHeight();
+/// The same under its 6.1 name: vk_compute_pipeline.cpp calls it, and that file's bytes are part of
+/// the Preparing shaders stamp (CMakeModules/Nx2ShaderStamp.cmake), so it can't be renamed there.
+[[nodiscard]] inline std::optional<u32> AppliedOcarinaRenderScale() {
+    return AppliedOcarinaRenderHeight();
+}
+/// OoT's render height under Max Resolution with that patch (1440 without one).
+[[nodiscard]] u32 OcarinaRenderHeightFor(std::optional<u32> height);
 /// Whether OoT's built-in Max Resolution patch will apply at the next start (as PatchNSO decides
 /// it: EDEN_NX2_NO_MAX_RES=1 skips it, =0 forces it, else it is off when disabled in Add-Ons).
 /// With it, docked OoT renders a fixed 2560x1440; without it the game's dynamic resolution

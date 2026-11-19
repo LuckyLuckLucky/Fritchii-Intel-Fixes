@@ -71,6 +71,7 @@
 #include "common/div_ceil.h"
 #include "common/free_region_manager.h"
 #include "common/host_memory.h"
+#include "common/memory_detect.h"
 #include "common/logging.h"
 
 #if defined(__ANDROID__) && __ANDROID_API__ < 30
@@ -230,8 +231,8 @@ LONG CALLBACK ReservedPageHandler(PEXCEPTION_POINTERS info) {
     u8* const region_begin = static_cast<u8*>(region.BaseAddress);
     u8* const begin = (std::max)(granule, region_begin);
     u8* const end = (std::min)(granule + Granule, region_begin + region.RegionSize);
-    if (VirtualAlloc(begin, static_cast<size_t>(end - begin), MEM_COMMIT, PAGE_READWRITE) ==
-        nullptr) {
+    // Quiet: an exception handler must not allocate for a log line.
+    if (!Common::CommitPagesWaiting(begin, static_cast<u64>(end - begin), true)) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
     if (g_net_commits.fetch_add(1, std::memory_order_relaxed) == 0) {
@@ -346,8 +347,7 @@ public:
         if (offset >= end) {
             return true;
         }
-        if (VirtualAlloc(backing_base + offset, end - offset, MEM_COMMIT, PAGE_READWRITE) ==
-            nullptr) {
+        if (!Common::CommitPagesWaiting(backing_base + offset, end - offset)) {
             LOG_CRITICAL(HW_Memory,
                          "EDEN_NX2_SEC_RESERVE: committing {:#x} bytes of guest memory at {:#x} "
                          "failed, error {}",

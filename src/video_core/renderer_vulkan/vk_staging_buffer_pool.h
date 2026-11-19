@@ -5,6 +5,8 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <climits>
 #include <optional>
 #include <span>
@@ -38,9 +40,17 @@ class StagingBufferPool {
 public:
     static constexpr size_t NUM_SYNCS = 16;
 
+    /// What this pool's stream buffer carries, for its boot log line.
+    enum class StreamRole {
+        Everything, ///< one pool for everything (no split allocators)
+        Transfers,  ///< the texture cache's and the back's uploads: only ever copied from
+        Buffers,    ///< the buffer cache's: uniforms the shaders read straight from it, uploads
+    };
+
     /// `stream_divisor`: the stream buffer is its usual size divided by this.
     explicit StagingBufferPool(const Device& device, MemoryAllocator& memory_allocator,
-                               Scheduler& scheduler, u32 stream_divisor = 1);
+                               Scheduler& scheduler, u32 stream_divisor = 1,
+                               StreamRole stream_role = StreamRole::Everything);
     ~StagingBufferPool();
 
     /// `caller`: who asks, counted when a buffer has to be created (EDEN_NX2_BUFFER_CHURN_STATS).
@@ -55,6 +65,10 @@ public:
     }
 
     void TickFrame();
+
+    /// Out of memory: frees every staging buffer the GPU is done with and the recycler's pooled
+    /// buffers. Returns how many went.
+    size_t ReleaseIdleBuffers();
 
     /// Bytes of the cached staging buffers of a kind, idle or in use (EDEN_NX2_MEM_TRACE).
     [[nodiscard]] u64 CachedBytes(MemoryUsage usage);
@@ -129,6 +143,19 @@ private:
     static constexpr size_t NUM_LEVELS = sizeof(size_t) * CHAR_BIT;
     using StagingBuffersCache = std::array<StagingBuffers, NUM_LEVELS>;
 
+    /// The two ends of the stream's busy check: true when the request must spill to a staging
+    /// buffer. With the small BAR plan the GPU's tick is read again first.
+    bool StreamRegionsBusy(size_t region_begin, size_t region_end, size_t size);
+    /// FRITCHII_LINK_STATS: this pool's stream use, one line every 10 s.
+    void LogStreamUse();
+
+    /// Request without the link accounting.
+    StagingBufferRef RequestBuffer(size_t size, MemoryUsage usage, bool deferred,
+                                   VideoCommon::BufferChurnStats::StagingCaller caller);
+    /// FRITCHII_LINK_STATS / FRITCHII_SIM_LINK: how this request's bytes cross the link.
+    void NoteLink(const StagingBufferRef& ref, size_t size, MemoryUsage usage,
+                  VideoCommon::BufferChurnStats::StagingCaller caller) const;
+
     StagingBufferRef GetStreamBuffer(size_t size,
                                      VideoCommon::BufferChurnStats::StagingCaller caller);
 
@@ -182,6 +209,27 @@ private:
     BufferRecycler recycler;
 
     vk::Buffer stream_buffer;
+    bool stream_in_device_memory{}; ///< the CPU's writes into it cross the link
+    bool crosses_link{};            ///< a discrete GPU: host and device memory are apart
+    bool refresh_before_spill{};    ///< FRITCHII_SMALL_BAR_STREAMS
+    StreamRole role{};
+
+    /// FRITCHII_LINK_STATS. Requests may come from another thread than TickFrame's.
+    struct StreamUse {
+        std::atomic<u64> bytes{};
+        std::atomic<u64> requests{};
+        std::atomic<u64> frame_bytes{};
+        std::atomic<u64> peak_frame_bytes{};
+        std::atomic<u64> wraps{};
+        std::atomic<u64> full{};
+        std::atomic<u64> full_bytes{};
+        std::atomic<u64> full_was_free{};
+        std::atomic<u64> too_big{};
+        std::atomic<u64> too_big_bytes{};
+        size_t peak_busy_regions{};
+        std::chrono::steady_clock::time_point window_start{};
+    };
+    mutable StreamUse stream_use;
     VkDeviceAddress stream_buffer_address{};
     std::span<u8> stream_pointer;
     VkDeviceSize stream_buffer_size;

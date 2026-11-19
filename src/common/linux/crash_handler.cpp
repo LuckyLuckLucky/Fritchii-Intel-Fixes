@@ -116,6 +116,27 @@ void OnCrash(int sig, siginfo_t* info, void*) {
 
 } // namespace
 
+void LogFatalError(const char* what) {
+    Line line;
+    line.Add("\n[crash] Host crash: ");
+    line.Add(what);
+    char name[17]{};
+    if (::prctl(PR_GET_NAME, name, 0, 0, 0) == 0) {
+        line.Add(" on thread \"");
+        line.Add(name);
+        line.Add("\"");
+    }
+    line.Add("; stack (binary+offset, resolve with the unstripped build):\n");
+    void* frames[64];
+    const int count = ::backtrace(frames, 64);
+    for (const int fd : {g_log_fd, STDERR_FILENO}) {
+        if (fd >= 0) {
+            WriteAll(fd, line.text, line.size);
+            ::backtrace_symbols_fd(frames, count, fd);
+        }
+    }
+}
+
 void InstallCrashHandler() {
     if (const auto path = Common::Log::FilePath(); !path.empty()) {
         g_log_fd = ::open(path.c_str(), O_WRONLY | O_APPEND | O_CLOEXEC);

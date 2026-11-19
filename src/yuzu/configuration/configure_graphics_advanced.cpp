@@ -13,6 +13,7 @@
 #include "yuzu/configuration/configuration_shared.h"
 #include "yuzu/configuration/configure_graphics_advanced.h"
 #include "yuzu/configuration/shared_widget.h"
+#include "yuzu/fritchii/occlusion_offer.h"
 
 ConfigureGraphicsAdvanced::ConfigureGraphicsAdvanced(
     const Core::System& system_, std::shared_ptr<std::vector<ConfigurationShared::Tab*>> group_,
@@ -57,6 +58,10 @@ void ConfigureGraphicsAdvanced::Setup(const ConfigurationShared::Builder& builde
         // Keep track of enable_compute_pipelines so we can display it when needed
         if (setting->Id() == Settings::values.enable_compute_pipelines.Id()) {
             checkbox_enable_compute_pipelines = widget;
+        }
+        // Fritchii: Full only where it can act.
+        if (setting->Id() == Settings::values.occlusion_speedup.Id()) {
+            FritchiiOcclusionOffer::LimitRow(widget);
         }
     }
 

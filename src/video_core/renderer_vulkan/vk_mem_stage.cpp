@@ -216,6 +216,7 @@
 #include "video_core/ocarina_upscale.h"
 #include "video_core/renderer_vulkan/vk_buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_compute_pass.h"
+#include "video_core/link_stats.h"
 #include "video_core/renderer_vulkan/vk_mem_stage.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
@@ -487,6 +488,10 @@ bool IsRecord(SeamHook::Use use) {
 
 // ---------------------------------------------------------------------------------------------
 // The hook
+
+bool SeamHook::Holding() noexcept {
+    return t_holding;
+}
 
 void SeamHook::OnUse(Use use, const std::source_location& location) {
     if (Link::OnStageThread()) [[unlikely]] {
@@ -5388,20 +5393,43 @@ void MemPlayer::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool me
             .queueFamilyIndexCount = 0,
             .pQueueFamilyIndices = nullptr,
         };
-        list_draw_buffer = memory_allocator.CreateBuffer(create_info, MemoryUsage::Upload);
+        // FRITCHII_LIST_ARGS_LOCAL (boot, default 0): in host memory the GPU writes the two words
+        // across the link and its command processor reads them back, a round trip per list draw
+        // on a slow link. In device memory neither leaves the card.
+        static const bool args_local = [] {
+            const char* const value = std::getenv("FRITCHII_LIST_ARGS_LOCAL");
+            return value != nullptr && value[0] != '0';
+        }();
+        list_draw_args_local = args_local;
+        if (args_local) {
+            VkBufferCreateInfo template_info = create_info;
+            template_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+            list_draw_template = memory_allocator.CreateBuffer(template_info, MemoryUsage::Upload);
+            list_draw_buffer = memory_allocator.CreateBuffer(create_info, MemoryUsage::DeviceLocal);
+            list_draw_fill_pending = true;
+        } else {
+            list_draw_buffer = memory_allocator.CreateBuffer(create_info, MemoryUsage::Upload);
+        }
+        vk::Buffer& words_buffer = args_local ? list_draw_template : list_draw_buffer;
         if (device.HasDebuggingToolAttached()) {
             list_draw_buffer.SetObjectNameEXT("List draw arguments");
         }
         // Written once: the host GPU only ever copies over words 0 and 2 of the vertex command
         // and word 0 of the task/mesh command.
-        const std::span<u8> mapped = list_draw_buffer.Mapped();
+        const std::span<u8> mapped = words_buffer.Mapped();
         constexpr std::array<u32, LIST_DRAW_SLOT_BYTES / sizeof(u32)> slot{0, 1, 0, 0, 0, 1, 1, 0};
         for (u32 i = 0; i < LIST_DRAW_SLOTS; ++i) {
             std::memcpy(mapped.data() + size_t{i} * LIST_DRAW_SLOT_BYTES, slot.data(),
                         LIST_DRAW_SLOT_BYTES);
         }
-        list_draw_buffer.Flush();
+        words_buffer.Flush();
     }
+    if (VideoCommon::LinkStats::On()) [[unlikely]] {
+        VideoCommon::LinkStats::NoteListDraw(!list_draw_args_local);
+    }
+    const VkBuffer fill_source = std::exchange(list_draw_fill_pending, false)
+                                     ? *list_draw_template
+                                     : VkBuffer{VK_NULL_HANDLE};
     // The copies and the draws that read them run in the order they are recorded: a slot is
     // free again as soon as the next copy into it is recorded after its draw.
     const VkDeviceSize slot = VkDeviceSize{list_draw_cursor} * LIST_DRAW_SLOT_BYTES;
@@ -5419,7 +5447,7 @@ void MemPlayer::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool me
         list_keeps[keep_slot] = {keep_id, scheduler.CurrentTick(), true, 2, {}};
     }
     scheduler.Record([source, offset, destination = *list_draw_buffer, args, mesh, keep_buffer,
-                      keep_offset](vk::CommandBuffer cmdbuf) {
+                      keep_offset, fill_source](vk::CommandBuffer cmdbuf) {
         static constexpr VkMemoryBarrier READ_BARRIER{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -5440,6 +5468,23 @@ void MemPlayer::RecordListDrawArgs(VkBuffer source, VkDeviceSize offset, bool me
         }};
         cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
                                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+        if (fill_source != VK_NULL_HANDLE) {
+            // FRITCHII_LIST_ARGS_LOCAL: the fixed words, before the first draw's two.
+            static constexpr VkMemoryBarrier FILLED_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+            };
+            const VkBufferCopy fill{
+                .srcOffset = 0,
+                .dstOffset = 0,
+                .size = VkDeviceSize{LIST_DRAW_SLOTS} * LIST_DRAW_SLOT_BYTES,
+            };
+            cmdbuf.CopyBuffer(fill_source, destination, fill);
+            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                   0, FILLED_BARRIER);
+        }
         cmdbuf.CopyBuffer(source, destination,
                           std::span<const VkBufferCopy>{copies.data(), mesh ? 1U : 2U});
         if (keep_buffer != VK_NULL_HANDLE) {

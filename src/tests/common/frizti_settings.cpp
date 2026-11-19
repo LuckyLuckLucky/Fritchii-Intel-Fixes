@@ -170,3 +170,26 @@ TEST_CASE("OoT's per-game settings move to the main ones", "[frizti_settings]") 
     CHECK(values->players.GetValue()[0].profile_name.empty());
     CHECK_FALSE(values->players.UsingGlobal());
 }
+
+TEST_CASE("A start asks only a player with an earlier Fritchii's settings", "[frizti_settings]") {
+    using Frizti::StartupApply;
+    constexpr u32 now = Frizti::Revision;
+    constexpr u32 earlier = Frizti::Revision - 1;
+    // Fresh install, or another build's config (no revision, no frizti.ini): set without asking.
+    CHECK(Frizti::DecideStartup(0, 0, "") == StartupApply::Full);
+    // An earlier Fritchii: revision in qt-config.ini and frizti.ini.
+    CHECK(Frizti::DecideStartup(earlier, earlier, "") == StartupApply::Ask);
+    // Only one of them from an earlier Fritchii (frizti.ini deleted, or qt-config.ini lost it).
+    CHECK(Frizti::DecideStartup(earlier, 0, "") == StartupApply::Ask);
+    CHECK(Frizti::DecideStartup(0, earlier, "") == StartupApply::Ask);
+    // This revision handled already: no question, only another build's changes are undone.
+    CHECK(Frizti::DecideStartup(now, now, "") == StartupApply::Reconcile);
+    CHECK(Frizti::DecideStartup(now + 1, now, "") == StartupApply::Reconcile);
+    // Answered for this revision, but qt-config.ini lost the key: the tuned set as before.
+    CHECK(Frizti::DecideStartup(0, now, "") == StartupApply::Full);
+    // FRITCHII_SETTINGS_PROMPT: "ask" always asks, "0" keeps without asking.
+    CHECK(Frizti::DecideStartup(now, now, "ask") == StartupApply::Ask);
+    CHECK(Frizti::DecideStartup(0, 0, "ask") == StartupApply::Ask);
+    CHECK(Frizti::DecideStartup(earlier, earlier, "0") == StartupApply::Reconcile);
+    CHECK(Frizti::DecideStartup(0, 0, "0") == StartupApply::Full);
+}

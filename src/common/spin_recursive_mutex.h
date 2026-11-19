@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "common/fritchii_lock_census.h"
+#include "common/lowend_sim.h"
 #include "common/nx2_hitch.h"
 
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
@@ -131,6 +132,7 @@ private:
     static constexpr int SpinCount = 1024;
 
     static void Pause() {
+        LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
         _mm_pause();
 #elif defined(__aarch64__)

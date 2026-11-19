@@ -64,6 +64,7 @@ public:
     u32 size_banks{};
     size_t start_slot{};
     size_t size_slots{};
+    u32 flag_epoch{}; ///< FRITCHII_OCCL_FLAG: its banks' reuse epochs when it was made
 };
 
 } // namespace VideoCommon

@@ -10,6 +10,7 @@
 
 #include "common/assert.h"
 #include "common/logging.h"
+#include "common/memory_detect.h"
 #include "common/multi_level_page_table.h"
 #include "common/sparse_large_vector.h"
 
@@ -119,8 +120,9 @@ template <typename BaseAddr>
 void MultiLevelPageTable<BaseAddr>::AllocateLevel(u64 index) {
     void* ptr = reinterpret_cast<char *>(base_ptr) + index * first_level_chunk_size;
 #ifdef _WIN32
-    void* base = VirtualAlloc(ptr, first_level_chunk_size, MEM_COMMIT, PAGE_READWRITE);
-    ASSERT(base);
+    const bool committed = CommitPagesWaiting(ptr, first_level_chunk_size);
+    ASSERT(committed);
+    void* base = ptr;
 #else
     void* base = ptr;
 #endif

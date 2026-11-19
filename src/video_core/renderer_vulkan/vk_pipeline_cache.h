@@ -164,6 +164,14 @@ public:
     [[nodiscard]] GraphicsPipeline* OcclLeanPipeline(GraphicsPipeline* full, const Maxwell& regs,
                                                      int mode, VideoCommon::OcclLean::DrawNote& note);
 
+    /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h; the recording thread, right after the draw's
+    /// pipeline is known, one follower off): for a counted draw that writes no colour and whose
+    /// pixel program can change nothing (OCCL_LEAN's Lean class), `pipeline`'s flag variant once
+    /// made and built; else `pipeline`. A flag variant passed in (a kept pipeline) is first
+    /// turned back into its own pipeline, so a flag variant never draws another draw.
+    [[nodiscard]] GraphicsPipeline* OcclFlagPipeline(GraphicsPipeline* pipeline,
+                                                     const Maxwell& regs, bool allow_make);
+
     /// One follower (fable_b 18.4, E, right after a lookup): the key parts the lookup kept
     /// because their flag was clear, computed fresh from the registers and compared: bit 0 the
     /// programs (with `shaders_clear`), 1 the blend (`blending_clear`), 2 the vertex input
@@ -438,6 +446,11 @@ private:
     /// translated now (one a frame) from the draw's environments; null when not available yet.
     /// Sets full.occl_class to Failed when it cannot be made.
     GraphicsPipeline* FindOrMakeOcclSibling(GraphicsPipeline& full);
+    /// FRITCHII_OCCL_FLAG: full's flag variant, translated now (one a frame, shared with the
+    /// lean siblings) from the draw's environments; null when not available yet. Sets
+    /// full.occl_flag_state to 2 when it cannot be made.
+    /// `kind`: 1 host flag program, 2 colour, 3 pre-pass (GraphicsPipeline::occl_flag_kind).
+    GraphicsPipeline* FindOrMakeOcclFlag(GraphicsPipeline& full, u8 kind = 1);
     /// FRITCHII_OCCL_LEAN: frame_count of the last sibling translation (one a frame).
     u64 occl_made_frame{~u64{0}};
 
@@ -529,6 +542,11 @@ private:
     /// spread over the index) translated again from their recorded environments with this build
     /// and its settings, and compared with the kept SPIR-V and infos. True when all are equal.
     bool CheckKeptSample(const PrecompiledKept::Index& index, std::string_view file_name);
+    /// FRITCHII_PREP_COMPUTE_CHECK: builds a few of the biggest kept compute pipelines the way a
+    /// dispatch builds them (kept info and SPIR-V, same layout and flags) and times them. True
+    /// when most took over the miss threshold: the driver's cache lost the prepared compute
+    /// pipelines. `summary` gets the log text.
+    bool PreparedComputeLost(const PrecompiledKept::Index& index, std::string& summary);
     [[nodiscard]] std::shared_ptr<const PrecompiledKept::Index> KeptIndex() const;
     /// What a kept file must have been written for, beyond the prepared stamp (which holds the
     /// release, driver and GPU): the cache version, the settings SPIR-V depends on, the library
@@ -839,6 +857,8 @@ private:
     size_t pipelines_since_flush{};
     std::chrono::steady_clock::time_point last_flush{};
     std::atomic<size_t> last_cache_size{};
+    /// Data size of our cache file as last read or written; ~0: none (FRITCHII_PCACHE_SAVE).
+    std::atomic<size_t> saved_cache_size{~size_t{0}};
     /// When MemoryOwners last asked the driver for the cache data size.
     std::chrono::steady_clock::time_point last_cache_size_query{};
     std::atomic_bool flush_in_flight{};

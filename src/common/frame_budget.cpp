@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include "common/lowend_sim.h"
 #include "common/frame_budget.h"
 
 #include <algorithm>
@@ -257,7 +258,7 @@ Sample Take() {
     if (gpu_state == 1 && now.gpu_ns >= last.gpu_ns) {
         sample.gpu = (std::min)(static_cast<double>(now.gpu_ns - last.gpu_ns) / wall_ns, 1.0);
     }
-    const unsigned cpus = std::thread::hardware_concurrency();
+    const unsigned cpus = Common::LowEndSim::LogicalProcessors();
     if (now.process_ns != 0 && now.process_ns >= last.process_ns && cpus != 0) {
         sample.cpu = (std::min)(
             static_cast<double>(now.process_ns - last.process_ns) / (wall_ns * cpus), 1.0);

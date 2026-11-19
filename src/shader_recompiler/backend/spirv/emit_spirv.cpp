@@ -384,7 +384,7 @@ void DefineEntryPoint(const IR::Program& program, EmitContext& ctx, Id main) {
         if (program.info.stores_frag_depth) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
         }
-        if (ctx.runtime_info.force_early_z) {
+        if (ctx.runtime_info.force_early_z || ctx.UsesOcclFlagStore()) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
         }
         if (ctx.profile.support_shader_quad_control && program.info.uses_quad_shuffles) {

@@ -50,6 +50,8 @@ add_library(
     jit_symbols.h
     frame_budget.cpp
     frame_budget.h
+    lowend_sim.cpp
+    lowend_sim.h
     nx2_hitch.cpp
     nx2_hitch.h
     nx2_sampler.cpp

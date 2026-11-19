@@ -1,10 +1,54 @@
-## ⬇️ Download this file: **`Fritchii-v6.1-Windows-x64.zip`**
+## ⬇️ Download this file: **`Fritchii-v6.2-Windows-x64.zip`**
 
-Linux: **`Fritchii-v6.1-Linux-x86_64.AppImage`** (or the `.tar.gz` of the same build).
+Linux: **`Fritchii-v6.2-Linux-x86_64.AppImage`** (or the `.tar.gz` of the same build).
 
-On Fritchii v4 to v6.0 you don't need to download anything: it offers this update when you open it. Otherwise unzip it anywhere and run `Fritchii-v6.1\fritchii.exe` (a small `lichii.exe` stays next to it, so old shortcuts keep working). Don't download "Source code (zip)" or "Source code (tar.gz)": they contain no emulator.
+On Fritchii v4 to v6.1 you don't need to download anything: it offers this update when you open it. Otherwise unzip it anywhere and run `Fritchii-v6.2\fritchii.exe` (a small `lichii.exe` stays next to it, so old shortcuts keep working). Don't download "Source code (zip)" or "Source code (tar.gz)": they contain no emulator.
 
 ---
+
+Fritchii v6.2: smaller graphics cards, slower PCs and above 60 fps.
+
+### Good to know
+- **Intel 12th to 14th gen (P-cores and E-cores): you shouldn't need `EDEN_HYBRID_CORES=0` any more.** v6.1 tied the GPU threads tightly to the P-cores, which halved fps on some of these CPUs. v6.2 lets Windows place them by default. If you added it, Fritchii turns it off for you on the first start (the line stays in Tools > Switches as a comment). If fps is still about half of what you expect, remove the # in front of it and tell us on the Discord.
+- **First start asks once: "Use the recommended settings?"** Use recommended applies the settings tuned for OoT and saves your old ones first. Keep my settings changes nothing. You can switch later in Settings > General.
+- No new shader preparation: v6.2 keeps v6.1's prepared shaders.
+
+### Graphics cards with 4 to 6 GB
+- **No more texture churn when video memory runs short.** On small cards Fritchii kept deleting textures the game was about to use again and making them over, dozens of times a frame. Now it keeps the ones the game keeps coming back to. On a simulated 4 GB card in Castle Town: **43 → 75 fps**, 1% lows **20 → 57**. A real 4 GB card also has to swap memory over PCIe, so expect less than that, but a big step either way.
+- Less video memory lost to half-empty buffer blocks on small cards.
+
+### Picture
+- **The OoT Picture menu sets the render size and the upscaled output separately**, so you can draw at 720p and let DLSS or FSR bring it up to 1080p or more.
+- DLSS has an **Automatic** model, now the default. It uses K, the tested one, and the status bar shows the model actually in use.
+
+### Loading and busy areas
+- **Area loads unpack the game's files natively** instead of through the emulated CPU, so loading screens should be a bit shorter.
+- The game no longer starts tidying its texture memory every frame, only once a second. Every texture it moved used to be set up again by Fritchii.
+
+### AMD
+- **New setting: OoT occlusion speed-up** (Graphics > Advanced). On AMD cards OoT's visibility checks are answered without the slow GPU queries: about **+9% fps** in the market on an RX 9070 XT. Standard is on by default. AMD players get a one-time offer of Full, which goes further. NVIDIA and Intel already use another fast path, so nothing changes there.
+
+### Intel CPUs
+- **CPU settings > Intel P-cores:** on Intel CPUs with P-cores and E-cores, try the pinned choice and tell us on the Discord whether it helps your PC.
+
+### Above 60 fps (High refresh rate)
+- The time of day no longer slows down or freezes above 60 fps.
+- Epona jumps fences instead of galloping through them.
+- A song's notes show one at a time with the music.
+- The Deku Tree's web reacts when Link lands on it, and moving platforms carry Link.
+
+### Below 60 fps
+- Link's cap and other cloth settle as they should when the game runs slow, instead of flaring out for a second.
+
+### Stability
+- When Windows runs out of memory for a moment, Fritchii waits and tries again instead of closing.
+- A crash report now names the GPU work that hung, and a few rare GPU limits no longer end the game.
+
+Some fixes in this release are ports from the Longshot and HeyListen projects, with thanks.
+
+---
+
+## What came in v6.1
 
 Fritchii v6.1: the pot room fix.
 

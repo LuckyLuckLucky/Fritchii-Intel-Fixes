@@ -486,6 +486,55 @@ public:
     u8 occl_class{};
     GraphicsPipeline* occl_sibling{};
 
+    // FRITCHII_STAMP_SKIP_BEGIN: left out of the Preparing shaders stamp (CMakeModules/Nx2ShaderStamp.cmake).
+    // Only what can't change a pipeline the driver compiles belongs here.
+    /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): this pipeline's flag variant (the same key with
+    /// the host flag pixel program), owned here and never in the cache; on a flag variant, the
+    /// pipeline it was made from. occl_flag_state: 0 not tried, 1 made, 2 refused for good.
+    std::unique_ptr<GraphicsPipeline> occl_flag;
+    GraphicsPipeline* occl_flag_parent{};
+    u8 occl_flag_state{};
+    /// FRITCHII_OCCL_FLAG: the colour flag variant, for colour-writing draws (the same key with
+    /// the guest pixel program translated with RuntimeInfo::occl_flag_store). One pipeline can
+    /// draw with colour on and off (dynamic write masks), so it has a slot of its own.
+    /// occl_flag_colour_state: 0 not tried, 1 made, 2 refused for good.
+    std::unique_ptr<GraphicsPipeline> occl_flag_colour;
+    u8 occl_flag_colour_state{};
+    /// FRITCHII_OCCL_FLAG: the pre-pass variant, for counted colour-off draws whose program
+    /// discards (the guest pixel program with early fragment tests and the flag store at its
+    /// end, drawn first with depth writes off; the real draw follows with this pipeline).
+    std::unique_ptr<GraphicsPipeline> occl_flag_prepass;
+    u8 occl_flag_prepass_state{};
+    /// FRITCHII_OCCL_FLAG colour pre-pass without dynamic colour write masks: the host flag
+    /// variant built from this key with every attachment's write mask and blend cleared.
+    std::unique_ptr<GraphicsPipeline> occl_flag_nocolour;
+    u8 occl_flag_nocolour_state{};
+    /// On a flag variant, its kind: 1 host flag program, 2 colour, 3 pre-pass, 4 host flag
+    /// program with colour writes off in its key.
+    static constexpr u8 OCCL_KIND_PREPASS = 3;
+    u8 occl_flag_kind{};
+    /// On a flag variant: 1 its translation's descriptors equal its parent's (the parent can
+    /// bind them for a real draw after a pre-pass), 2 they differ.
+    u8 occl_same_descriptors{};
+    /// On a flag variant: its last Configure's rescaling words and render area, which the
+    /// parent pushes again when it is bound for the real draw after a pre-pass
+    /// (ConfigureAfterOcclPrepass).
+    std::remove_cvref_t<decltype(std::declval<const RescalingPushConstant&>().Data())>
+        occl_prepass_rescaling{};
+    RenderAreaPushConstant occl_prepass_render_area{};
+
+    /// FRITCHII_OCCL_FLAG pre-pass: binds this pipeline (the parent) for the real draw that
+    /// follows `variant`'s pre-pass draw, with the descriptors `variant`'s Configure acquired for
+    /// this draw (the same stage infos: the same entries) and its push constants. False when the
+    /// draw cannot be configured (the real draw is not recorded then).
+    bool ConfigureAfterOcclPrepass(const GraphicsPipeline& variant);
+
+    /// FRITCHII_OCCL_FLAG: the layout the flag slot address is pushed with.
+    [[nodiscard]] VkPipelineLayout Layout() const noexcept {
+        return *pipeline_layout;
+    }
+
+    // FRITCHII_STAMP_SKIP_END
     [[nodiscard]] bool IsBuilt() const noexcept {
         return build->IsBuilt();
     }

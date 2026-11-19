@@ -30,6 +30,7 @@
 #include <fmt/format.h>
 
 #include "common/dkb_cpu_trace.h"
+#include "common/lowend_sim.h"
 #include "common/fs/path_util.h"
 #include "common/spin_recursive_mutex.h"
 #include "common/logging.h"
@@ -59,6 +60,7 @@ namespace VideoCommon::OneFollower {
 namespace {
 
 void Pause() {
+    Common::LowEndSim::CpuPauseNote();
 #if defined(_M_X64) || defined(_M_IX86) || defined(__x86_64__) || defined(__i386__)
     _mm_pause();
 #elif defined(__aarch64__)
@@ -578,6 +580,7 @@ u64 EngineWait(Ready&& ready, EWait kind = EWait::Room, u64 number = 0) {
     SCOPE_EXIT {
         g.e_wait.store(static_cast<u8>(EWait::None), std::memory_order_relaxed);
     };
+    const Common::LowEndSim::CpuWaitScope sim_wait;
     const bool timing = Stats::Timing();
     const u64 begin = timing ? Stats::Now() : 0;
     // FRITCHII_ONEF_E_SPIN (live): pauses before E sleeps (default SpinLimit, as before).
@@ -1276,7 +1279,10 @@ void RenderMain(std::stop_token stop) {
         g.r_op.store(header.op, std::memory_order_relaxed);
         g.r_packet.store(header.number, std::memory_order_relaxed);
         const u64 trace_start = g_trace ? Common::Nx2Hitch::NowNs() : 0;
+        // FRITCHII_SIM_CPU_SLOW: playing one packet is R's work.
+        Common::LowEndSim::CpuWorkBegin(Common::LowEndSim::CpuClass::Render);
         const Stats::RenderTime where = Play(header, at + sizeof(PacketHeader));
+        Common::LowEndSim::CpuWorkEnd();
         if (g_trace) [[unlikely]] {
             const u64 trace_end = Common::Nx2Hitch::NowNs();
             if (header.kind == PacketKind::Lent || header.kind == PacketKind::Op) {

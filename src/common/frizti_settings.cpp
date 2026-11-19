@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+#include <algorithm>
 #include <fmt/format.h>
 #include "common/frizti_settings.h"
 
@@ -205,6 +206,25 @@ std::map<std::string, std::string> PerGameValues(std::span<BasicSetting* const> 
                        setting->UsingGlobal() ? std::string{UseGlobal} : setting->ToString());
     }
     return values;
+}
+
+StartupApply DecideStartup(u32 stored, u32 recorded, std::string_view prompt) {
+    if (prompt == "ask") {
+        return StartupApply::Ask;
+    }
+    if ((std::min)(stored, recorded) >= Revision) {
+        return StartupApply::Reconcile;
+    }
+    // frizti.ini says this revision was handled (answered) already, only qt-config.ini lost it:
+    // as before the prompt, the tuned values again.
+    if (recorded >= Revision) {
+        return StartupApply::Full;
+    }
+    // Nothing from an earlier Fritchii: a fresh install or another build's config.
+    if (stored == 0 && recorded == 0) {
+        return StartupApply::Full;
+    }
+    return prompt == "0" ? StartupApply::Reconcile : StartupApply::Ask;
 }
 
 std::string FormatChanges(std::span<const Change> changes) {

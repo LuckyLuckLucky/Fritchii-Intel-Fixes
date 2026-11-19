@@ -224,6 +224,7 @@ void MaybeLogTimerStats(s64 now) {
              s.slow_callbacks, s.most_in_pass, s.late_1ms, static_cast<double>(s.worst_late) / 1e6,
              s.worst_late_name.empty() ? "none" : s.worst_late_name.c_str(),
              TimerPriorityMode());
+    Common::NoteHostTimingWindow(seconds, s.late_1ms);
     s = TimerStats{};
     s.window_start = now;
 }

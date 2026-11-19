@@ -93,6 +93,8 @@ private:
     vk::Instance instance;
 
     vk::DebugUtilsMessenger debug_messenger;
+    /// FRITCHII_VA_REPORT=1: the driver's GPU address binds and unbinds (device loss reports).
+    vk::DebugUtilsMessenger va_report_messenger;
 
     vk::SurfaceKHR surface;
 

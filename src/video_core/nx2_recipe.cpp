@@ -14,6 +14,7 @@
 
 #include <fmt/format.h>
 
+#include "common/lowend_sim.h"
 #include "common/cityhash.h"
 #include "common/zstd_compression.h"
 #include "shader_recompiler/frontend/ampere/instruction.h"
@@ -97,7 +98,7 @@ struct Reader {
 
 template <typename F>
 void ParallelFor(size_t count, unsigned threads, F&& body) {
-    const unsigned n = threads ? threads : std::max(1u, std::thread::hardware_concurrency());
+    const unsigned n = threads ? threads : std::max(1u, Common::LowEndSim::LogicalProcessors());
     std::atomic<size_t> next{0};
     std::vector<std::jthread> pool;
     for (unsigned t = 0; t < n; ++t) {

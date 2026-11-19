@@ -214,6 +214,8 @@ add_executable(yuzu
     fritchii/known_issues.h
     fritchii/max_resolution.cpp
     fritchii/max_resolution.h
+    fritchii/occlusion_offer.cpp
+    fritchii/occlusion_offer.h
     fritchii/fritchii.qrc
     fritchii/fritchii_ui.cpp
     fritchii/fritchii_ui.h

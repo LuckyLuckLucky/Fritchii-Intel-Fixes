@@ -211,6 +211,9 @@ class TextureCache : public VideoCommon::ChannelSetupCaches<TextureCacheChannelI
     } create_enforce_stats;
     u64 create_enforce_frame{~0ULL};
     u32 create_enforce_frame_deletes{};
+    /// FRITCHII_TC_THRASH_GUARD: the frame a pass walked every idle image and found none to
+    /// delete; none turns up for the rest of that frame.
+    u64 create_enforce_empty_frame{~0ULL};
     std::vector<ImageId> create_enforce_candidates;
     std::chrono::steady_clock::time_point vram_owners_time{};
     u64 astc_opaque_images{};
@@ -863,6 +866,43 @@ private:
     std::array<u64, static_cast<size_t>(DeleteReason::Count)> nx2_deletes{};
     std::array<u64, static_cast<size_t>(DeleteReason::Count) * 2> nx2_remade_after{};
     u64 nx2_remade_unknown = 0;
+    /// FRITCHII_TC_THRASH_GUARD: what a deleted image left behind, to recognise it when the game
+    /// asks for it again. Direct-mapped by address and shape; a collision forgets the older one.
+    struct ThrashGhost {
+        GPUVAddr gpu_addr{}; ///< 0 = empty
+        u64 shape{};         ///< RelocationShapeKey
+        u64 last_use{};      ///< Frame of its last use
+        u32 kib{};           ///< Its device memory
+        u8 cause{};          ///< ThrashCause
+        bool costly{};       ///< CostlyLoad: ASTC or BCn that is decoded again
+    };
+    static constexpr size_t ThrashGhostSlots = 8192;
+    /// DeleteReason's values, then the collector under pressure on its own: the one the floor
+    /// answers.
+    static constexpr size_t ThrashCausePressured = static_cast<size_t>(DeleteReason::Count);
+    static constexpr size_t ThrashCauses = ThrashCausePressured + 1;
+    /// Reuse intervals by size: up to 4, 8, 16 ... 1024 frames.
+    static constexpr size_t ThrashBuckets = 9;
+    static constexpr u64 ThrashMaxFloor = 600; ///< Frames; ~10 s at 60 fps
+    std::vector<ThrashGhost> thrash_ghosts; ///< Empty until the first delete with the guard on
+    std::array<u32, ThrashBuckets> thrash_window{}; ///< Pressured remakes since the last check
+    u64 thrash_floor{};       ///< The collector leaves images used this recently alone
+    u64 thrash_calm_frames{}; ///< Frames without pressure, for the floor's decay
+    u64 thrash_image_bytes{}; ///< The live images at the last check with a floor
+    struct ThrashStats {
+        u64 made{};
+        std::array<u64, ThrashCauses> remade{};
+        u64 remade_kib{};
+        u64 remade_costly{};
+        u64 interval_sum{};
+        u32 raised{};
+        u32 capped{};
+    } thrash_stats;
+    /// The ghost slot of an address and shape.
+    [[nodiscard]] static size_t ThrashSlot(GPUVAddr gpu_addr, u64 shape) noexcept {
+        const u64 mixed = ((gpu_addr >> 8) ^ shape) * 0x9E3779B97F4A7C15ULL;
+        return static_cast<size_t>(mixed >> 51); // 13 bits: ThrashGhostSlots
+    }
     /// EXP76: images flagged Remapped (UnmapGPUMemory), kept after a remap (& 1), whole uploads
     /// skipped because the guest bytes hashed the same as at the last upload (& 2), and checked.
     u64 nx2_flagged_remapped = 0;
@@ -1472,6 +1512,11 @@ private:
     /// FRITCHII_TC_CRITICAL_ENFORCE (live): before an image of about `incoming` bytes is made
     /// past the critical memory, clean images idle 10+ frames are deleted (no downloads).
     void EnforceCriticalAtCreate(u64 incoming);
+    /// FRITCHII_TC_THRASH_GUARD (live): notes a deleted image, recognises one made again, and
+    /// once a second sets how recently used an image the collector must leave alone.
+    void NoteThrashDelete(const Image& image);
+    void NoteThrashMade(const ImageInfo& info, GPUVAddr gpu_addr);
+    void TickThrashGuard();
     /// FRITCHII_VRAM_OWNERS (live, seconds, default 10): one line with who holds device memory.
     void LogVramOwners();
 

@@ -20,6 +20,7 @@
 #include <openssl/evp.h>
 #include <zstd.h>
 
+#include "common/lowend_sim.h"
 #include "core/file_sys/vfs/vfs.h"
 
 namespace FileSys::Nx2ShaderExtract {
@@ -864,7 +865,7 @@ Result Extract(std::span<const VirtualDir> roots, unsigned threads, Progress* pr
     std::unordered_map<std::string, size_t> variation_index;
 
     const unsigned count =
-        threads ? threads : std::max(1u, std::thread::hardware_concurrency());
+        threads ? threads : std::max(1u, Common::LowEndSim::LogicalProcessors());
     std::atomic<size_t> next{0};
     std::vector<std::vector<std::string>> errors(count);
     std::vector<Stats> stats(count);

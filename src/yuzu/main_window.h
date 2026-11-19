@@ -265,6 +265,15 @@ public slots:
     void OnTasStateChanged();
 
 private:
+    /// Applies the Frizti tuned settings once per revision and undoes other builds' changes to
+    /// them (common/frizti_settings.h).
+    enum class FriztiStart {
+        Silent,   ///< sets the tuned values when the revision is new (fresh config, Reset)
+        AskFirst, ///< app start: a player with an earlier version's settings is asked first
+        Keep,     ///< after Restore Settings: the restored settings stay, this revision handled
+    };
+    void MigrateFriztiSettings(FriztiStart start = FriztiStart::Silent);
+
     /// Updates an action's shortcut and text to reflect an updated hotkey from the hotkey registry.
     void LinkActionShortcut(QAction* action, const QString& action_name,
                             const bool tas_allowed = false);
@@ -390,9 +399,6 @@ private slots:
     void OnConfigure();
     /// Asks whether Ocarina of Time runs at 60 or 30 FPS (Settings::values.oot_30fps).
     void AskOotFrameRate();
-    /// Applies the Frizti tuned settings once per revision and undoes other builds' changes to
-    /// them (common/frizti_settings.h).
-    void MigrateFriztiSettings();
     void OnConfigureTas();
     void OnDecreaseVolume();
     void OnIncreaseVolume();

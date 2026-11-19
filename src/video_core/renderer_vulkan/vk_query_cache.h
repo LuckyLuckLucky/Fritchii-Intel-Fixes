@@ -55,6 +55,18 @@ public:
 
     void Barriers(bool is_prebarrier);
 
+    /// FRITCHII_OCCL_FLAG (fritchii_occl_flag.h): the open query slot's flag address for a draw
+    /// drawn with a flag pipeline (0: no flag area), and a counted draw drawn without one.
+    u64 OcclFlagAddress();
+    void NoteOtherCountedDraw(bool blocks = true);
+    /// FRITCHII_OCCL_FLAG pre-pass: a slot with a host query is open (the pre-pass must not be
+    /// counted by it: pause before it, resume after it, a new slot of the same window).
+    bool OcclQuerySlotOpen();
+    void OcclPrepassPause();
+    void OcclPrepassResume();
+    bool OcclFlagReady();
+    void SetNextFlagDraw(bool flag);
+
     void EndHostConditionalRendering();
 
     void PauseHostConditionalRendering();

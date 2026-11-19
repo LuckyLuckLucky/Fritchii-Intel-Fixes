@@ -10,6 +10,7 @@
 
 #include "common/fritchii_lock_census.h"
 #include "common/host_memory.h"
+#include "common/lowend_sim.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/small_card.h"
 #include "video_core/texture_cache/lost_contents.h"
@@ -344,6 +345,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_OCCL_LEAN") {
         return &g_occl_lean;
     }
+    if (name == "FRITCHII_OCCL_FLAG") {
+        return &g_occl_flag;
+    }
     if (name == "FRITCHII_LOCK_CENSUS") {
         // Lives in common (the cache locks' contended path); -1 until its first read.
         return &Common::LockCensus::g_mode;
@@ -499,6 +503,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     if (name == "FRITCHII_VRAM_POOL_FIT") {
         return &g_vram_pool_fit;
     }
+    if (name == "FRITCHII_VRAM_POOL_FLOOR") {
+        return &g_vram_pool_floor;
+    }
     if (name == "FRITCHII_VRAM_CRITICAL_FIT") {
         return &g_vram_critical_fit;
     }
@@ -513,6 +520,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_TC_CRITICAL_ENFORCE") {
         return &g_tc_critical_enforce;
+    }
+    if (name == "FRITCHII_TC_THRASH_GUARD") {
+        return &g_tc_thrash_guard;
     }
     if (name == "FRITCHII_VRAM_OWNERS") {
         return &g_vram_owners;
@@ -531,6 +541,27 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_SMALL_CARD") {
         return &SmallCard::g_small_card;
+    }
+    if (name == "FRITCHII_TEST_DEVICE_LOSS") {
+        return &g_test_device_loss;
+    }
+    if (name == "FRITCHII_SIM_GPU_SLOW") {
+        return &Common::LowEndSim::g_gpu_slow;
+    }
+    if (name == "FRITCHII_SIM_LINK") {
+        return &Common::LowEndSim::g_link_mbps;
+    }
+    if (name == "FRITCHII_SIM_LINK_LOAD") {
+        return &Common::LowEndSim::g_link_load_mbps;
+    }
+    if (name == "FRITCHII_SIM_LINK_US") {
+        return &Common::LowEndSim::g_link_us;
+    }
+    if (name == "FRITCHII_SIM_LINK_HOG") {
+        return &Common::LowEndSim::g_link_hog_mibs;
+    }
+    if (name == "FRITCHII_SIM_CPU_SLOW") {
+        return &Common::LowEndSim::g_cpu_slow;
     }
     if (name == "FRITCHII_E2C_ON_E") {
         return &g_e2c_on_e;
@@ -627,6 +658,9 @@ std::atomic<int>* FindSwitch(std::string_view name) {
     }
     if (name == "FRITCHII_STAGING_RING") {
         return &g_staging_ring;
+    }
+    if (name == "FRITCHII_LINK_STATS") {
+        return &g_link_stats;
     }
     if (name == "FRITCHII_ZERO_UPLOAD") {
         return &g_zero_upload;

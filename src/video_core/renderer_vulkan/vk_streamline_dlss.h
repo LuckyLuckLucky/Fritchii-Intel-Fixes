@@ -90,7 +90,8 @@ private:
     VkExtent2D upscale_extent{};
     bool hdr_input = true;
     Settings::NvidiaDlssQuality quality_mode{};
-    Settings::DlssPreset model_preset{};
+    Settings::DlssPreset model_preset{}; ///< The model that draws (Auto resolved)
+    u64 video_memory{}; ///< The main heap's size, 0 if unknown
     Settings::NvidiaDlssQuality evaluated_mode{}; ///< Recorded on the scheduler's worker
     u32 frame_index{};
     vk::Image output_image;
