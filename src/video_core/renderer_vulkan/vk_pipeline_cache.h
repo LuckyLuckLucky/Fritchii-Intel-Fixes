@@ -725,6 +725,8 @@ private:
         bool operator==(const IntelStaticLayout&) const = default;
     };
     void AddIntelStaticLayout(const GraphicsPipelineCacheKey& key);
+    /// Intel fork D3: imports intel_layouts*.bin beside the cache, writes intel_layouts.bin.
+    void SyncIntelLayoutFiles(const std::filesystem::path& base_dir);
     std::string IntelForkPrepStamp() const;
     std::vector<GraphicsPipelineCacheKey> IntelStaticKeys(
         const GraphicsPipelineCacheKey& record) const;

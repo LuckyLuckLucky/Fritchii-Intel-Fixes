@@ -6156,6 +6156,11 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     if (VideoCommon::Nx2Precompile::Mode() == 0) {
         return;
     }
+    // Intel fork D3: layouts other players' sessions learned open up more records (and the stamp
+    // below counts them).
+    if (IntelForkStaticPrep() && !device.IsExtVertexInputDynamicStateSupported()) {
+        SyncIntelLayoutFiles(base_dir);
+    }
     // Layout (tools/nx2-precompile/README.md): "NX2PREP1", u32 cache version, u32 environment
     // count, u32 record count, u32 reserved; per environment u64 offset and u64 size of a
     // GenericEnvironment::Serialize blob; per record u8 kind (0 graphics, 1 compute), u8
@@ -7233,6 +7238,94 @@ void PipelineCache::AddIntelStaticLayout(const GraphicsPipelineCacheKey& key) {
     if (list.size() < 8 && std::ranges::find(list, layout) == list.end()) {
         list.push_back(layout);
     }
+}
+
+/// Intel fork phase D3 (2026-11-19): the static vertex layouts learned from the disk cache, per
+/// vertex program pair, in a file of their own: intel_layouts.bin (written at each preparation,
+/// everything known) and any intel_layouts*.bin beside it (other players' files, read first).
+/// They hold program hashes and attribute words only (no shader code, no game data), so players
+/// can share them; each new layout lets the preparation convert more of the recipe's records.
+/// Format: "IFLAYOUT", u32 version 1, u32 entry count, then per entry u64 vertex program pair and
+/// the IntelStaticLayout as stored. INTEL_FORK_LAYOUT_FILES=0 turns it off.
+void PipelineCache::SyncIntelLayoutFiles(const std::filesystem::path& base_dir) {
+    static const bool off = [] {
+        const char* const v = std::getenv("INTEL_FORK_LAYOUT_FILES");
+        return v != nullptr && v[0] == '0';
+    }();
+    if (off) {
+        return;
+    }
+    static constexpr std::array<char, 8> Magic{'I', 'F', 'L', 'A', 'Y', 'O', 'U', 'T'};
+    static constexpr u32 Version = 1;
+    static_assert(std::is_trivially_copyable_v<IntelStaticLayout>);
+    size_t files = 0;
+    size_t read = 0;
+    size_t added = 0;
+    size_t new_pairs = 0;
+    std::error_code error;
+    std::scoped_lock lock{intel_layouts_mutex};
+    for (const auto& entry : std::filesystem::directory_iterator(base_dir, error)) {
+        const auto name = entry.path().filename().string();
+        if (!entry.is_regular_file(error) || !name.starts_with("intel_layouts") ||
+            !name.ends_with(".bin")) {
+            continue;
+        }
+        std::ifstream in(entry.path(), std::ios::binary);
+        std::array<char, 8> magic{};
+        u32 version = 0;
+        u32 count = 0;
+        in.read(magic.data(), magic.size());
+        in.read(reinterpret_cast<char*>(&version), sizeof(version));
+        in.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!in || magic != Magic || version != Version || count > (1U << 22)) {
+            LOG_WARNING(Render_Vulkan, "Intel fork layouts: {} is not a layout file, skipped", name);
+            continue;
+        }
+        ++files;
+        for (u32 i = 0; i < count; ++i) {
+            u64 pair = 0;
+            IntelStaticLayout layout;
+            in.read(reinterpret_cast<char*>(&pair), sizeof(pair));
+            in.read(reinterpret_cast<char*>(&layout), sizeof(layout));
+            if (!in) {
+                break;
+            }
+            ++read;
+            const auto [it, inserted] = intel_static_layouts.try_emplace(pair);
+            new_pairs += inserted ? 1 : 0;
+            auto& list = it->second;
+            if (list.size() < 8 && std::ranges::find(list, layout) == list.end()) {
+                list.push_back(layout);
+                ++added;
+            }
+        }
+    }
+    size_t entries = 0;
+    for (const auto& [pair, list] : intel_static_layouts) {
+        entries += list.size();
+    }
+    const auto path = base_dir / "intel_layouts.bin";
+    auto temporary = path;
+    temporary += ".tmp";
+    {
+        std::ofstream out(temporary, std::ios::binary | std::ios::trunc);
+        const u32 count = static_cast<u32>(entries);
+        out.write(Magic.data(), Magic.size());
+        out.write(reinterpret_cast<const char*>(&Version), sizeof(Version));
+        out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+        for (const auto& [pair, list] : intel_static_layouts) {
+            for (const auto& layout : list) {
+                out.write(reinterpret_cast<const char*>(&pair), sizeof(pair));
+                out.write(reinterpret_cast<const char*>(&layout), sizeof(layout));
+            }
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
+    LOG_INFO(Render_Vulkan,
+             "Intel fork layouts (D3): {} file(s) read, {} layouts in them, {} new ({} new vertex "
+             "program pairs); intel_layouts.bin now holds {} pairs, {} layouts{}",
+             files, read, added, new_pairs, intel_static_layouts.size(), entries,
+             error ? " (write failed: " + error.message() + ")" : std::string{});
 }
 
 /// Intel fork (2026-11-19): without dynamic vertex input the recipe's records (recorded with it)
