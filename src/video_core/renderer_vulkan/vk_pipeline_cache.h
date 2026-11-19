@@ -696,6 +696,23 @@ private:
     /// FRITCHII_PREP_ORDER: the preparation takes what recent sessions drew first.
     std::shared_ptr<const std::unordered_map<u64, u8>> precompile_used_keys;
 
+    /// Intel fork (phase D2, INTEL_FORK_STATIC_PREP): vertex layouts that draws keyed without
+    /// dynamic vertex input, per vertex program pair (unique_hashes[0..1]), harvested from the
+    /// disk cache at boot. The preparation turns recipe records recorded with dynamic vertex input
+    /// into the keys a draw gives on a device without it.
+    struct IntelStaticLayout {
+        std::array<u32, Maxwell::NumVertexAttributes> attributes{};
+        std::array<u32, Maxwell::NumVertexArrays> binding_divisors{};
+        u64 enabled_divisors{};
+        bool operator==(const IntelStaticLayout&) const = default;
+    };
+    void AddIntelStaticLayout(const GraphicsPipelineCacheKey& key);
+    std::string IntelForkPrepStamp() const;
+    std::vector<GraphicsPipelineCacheKey> IntelStaticKeys(
+        const GraphicsPipelineCacheKey& record) const;
+    mutable std::mutex intel_layouts_mutex;
+    std::unordered_map<u64, std::vector<IntelStaticLayout>> intel_static_layouts;
+
     /// The pipeline cache warm-up builds go through: none by default, so the tens of thousands
     /// of warm-up programs stay in the driver's disk cache and out of vulkan_pipelines.bin (which
     /// is loaded into memory at every boot). EDEN_NX2_WARM_APP_CACHE=1 uses ours.

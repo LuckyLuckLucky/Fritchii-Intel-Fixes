@@ -985,6 +985,8 @@ int NanGuardMode() {
 /// Intel fork (2026-11-19, user-verified on the B580): asynchronous shaders off on Intel's Windows
 /// driver (draw skips while building showed as flashing smoke/objects; the game "runs and feels
 /// better"). INTEL_FORK_ASYNC_SHADERS=1 keeps the user's setting.
+bool IntelForkStaticPrep(); // Intel fork phase D2, defined further down
+
 bool IntelForkSyncShaders(const Device& device) {
     if (device.GetDriverID() != VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
         return false;
@@ -3408,6 +3410,16 @@ u32 PipelineCache::OneFollowerLookupCheck(bool shaders_clear, bool blending_clea
     return differ;
 }
 
+namespace {
+bool IntelForkViKeyCheck() {
+    static const bool on = [] {
+        const char* const v = std::getenv("INTEL_FORK_VI_KEY_CHECK");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+} // namespace
+
 GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
     // One follower: the pipeline cache is R's, or E's with rule 3 (then R looks up only inside a
     // lent call: "owner on R" otherwise).
@@ -3417,6 +3429,37 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipeline() {
         VideoCommon::OneFollower::RenderOwned("PipelineCache::CurrentGraphicsPipeline");
     }
     ++lookup_serial;
+    // Intel fork test switch (2026-11-19, phase D1: VI-on bug hunt): INTEL_FORK_VI_KEY_CHECK=1
+    // compares the key's vertex attribute types with the ones the registers give now. A
+    // difference with Dirty::VertexInput down means the key (and the pipeline) went stale while
+    // the dynamic vertex input state followed the registers: the flag is raised so this lookup
+    // refreshes, and the count is logged every 5 s.
+    if (dynamic_features.has_dynamic_vertex_input && IntelForkViKeyCheck()) {
+        auto& flags = maxwell3d->dirty.flags;
+        if (!flags[Dirty::VertexInput] && !flags[VideoCommon::Dirty::Shaders]) {
+            const u64 keyed = VideoCommon::KeyedAttributeTypes(
+                FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs),
+                graphics_key.unique_hashes, vertex_attribute_masks);
+            static u64 checked{};
+            static u64 stale{};
+            static auto since = std::chrono::steady_clock::now();
+            ++checked;
+            if (keyed != graphics_key.state.attribute_types) {
+                ++stale;
+                flags[Dirty::VertexInput] = true;
+            }
+            if (const auto now = std::chrono::steady_clock::now();
+                now - since >= std::chrono::seconds{5}) {
+                LOG_INFO(Render_Vulkan,
+                         "Intel fork VI key check: {} stale attribute-type keys in {} lookups "
+                         "(flag down) in the last 5 s",
+                         stale, checked);
+                stale = 0;
+                checked = 0;
+                since = now;
+            }
+        }
+    }
     if (const int clean_mode = PipelineCleanMode(); clean_mode != 0) {
         return CurrentGraphicsPipelineClean(clean_mode == 2);
     }
@@ -4411,6 +4454,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     const auto queue_graphics{[&](const GraphicsPipelineCacheKey& key, DiskRecords records) {
         const u64 hash = key.Hash();
         disk_pipelines.insert(hash);
+        if (IntelForkStaticPrep()) {
+            AddIntelStaticLayout(key);
+        }
         if (!build_at_boot) {
             ++skipped_pipelines; // the boot marker (above): no boot or background build
             return;
@@ -5432,7 +5478,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const std::string stamp = fmt::format("{} {} {:#x} shaders-{} {}{}{}\n", file_size, modified,
                                           device.GetDriverVersion(), NX2_SHADER_STAMP,
                                           device.GetModelName(), PipelineBinary::StampSuffix(),
-                                          scale_part);
+                                          scale_part) +
+                            IntelForkPrepStamp();
     // EDEN_NX2_PRECOMPILED_FAST: the preparation keeps each pipeline's infos and SPIR-V too
     // (vk_precompiled_kept.h), for this release, its settings and GPU. Whether this build
     // translates them the same is checked on a sample at boot (CheckKeptSample), not stamped.
@@ -5474,6 +5521,9 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     constexpr u8 RankRest = 34;
     std::vector<u8> record_rank;
     const auto used_keys = precompile_used_keys;
+    size_t intel_static_dynamic_records = 0;
+    size_t intel_static_convertible = 0;
+    size_t intel_static_convertible_keys = 0;
     try {
         std::ifstream in(path, std::ios::binary);
         in.exceptions(std::ifstream::failbit);
@@ -5537,6 +5587,16 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             GraphicsPipelineCacheKey key{};
             in.read(reinterpret_cast<char*>(&key), sizeof(key));
             RecordedKeyForThisDevice(key);
+            // INTEL_FORK_STATIC_PREP: ranked by the key it is built as here (and counted).
+            if (IntelForkStaticPrep() && key.state.dynamic_vertex_input != 0 &&
+                !dynamic_features.has_dynamic_vertex_input) {
+                ++intel_static_dynamic_records;
+                if (const auto converted = IntelStaticKeys(key); !converted.empty()) {
+                    ++intel_static_convertible;
+                    intel_static_convertible_keys += converted.size();
+                    key = converted.front();
+                }
+            }
             const u64 hash = key.Hash();
             u8 rank = RankRest;
             if (used_keys) {
@@ -5555,6 +5615,15 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         return;
     }
 
+    if (IntelForkStaticPrep()) {
+        std::scoped_lock lock{intel_layouts_mutex};
+        LOG_INFO(Render_Vulkan,
+                 "Intel fork static prep: {} of {} dynamic-vertex-input records convertible with "
+                 "the layouts of {} vertex program pairs ({} keys to build); the rest wait for "
+                 "layouts learned in play",
+                 intel_static_convertible, intel_static_dynamic_records,
+                 intel_static_layouts.size(), intel_static_convertible_keys);
+    }
     const size_t total = record_offsets.size();
     // A checkpoint lets an interrupted step (closed, or a crash) continue where it stopped. A boot
     // that starts twice from the same record without getting further skips past it.
@@ -5722,6 +5791,12 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         std::atomic<size_t> fast{};      ///< built in under FastBuild: most likely a driver cache hit
         std::atomic<size_t> failed{};
         std::atomic<size_t> other_device{};
+        /// INTEL_FORK_STATIC_PREP: records turned into static keys, extra layouts built, converted
+        /// keys a draw already made (disk cache) or recent sessions drew (used list).
+        std::atomic<size_t> static_records{};
+        std::atomic<size_t> static_extra{};
+        std::atomic<size_t> static_known{};
+        std::atomic<size_t> static_used{};
         /// Of other_device, per dynamic state the record and this device disagree on (recorded
         /// dynamic / this device dynamic): EDS, EDS2, EDS2 logic op, EDS3 blend, EDS3 enables,
         /// color write enable, vertex input, provoking vertex last.
@@ -5821,6 +5896,15 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          static_cast<double>(state.yielded_ms.exchange(0)) / 1000.0,
                          rate > 0.0 ? DurationText(static_cast<double>(total - finished) / rate)
                                     : std::string{"no estimate"});
+                // Intel fork: what the walk did so far (a killed run writes no end summary).
+                LOG_INFO(Render_Vulkan,
+                         "Precompiled pipelines so far: {} built ({} under 20 ms), {} failed, "
+                         "{} for another device; static prep: {} records converted, {} extra "
+                         "layouts, {} keys in the disk cache, {} in the used list",
+                         state.built.load(), state.fast.load(), state.failed.load(),
+                         state.other_device.load(), state.static_records.load(),
+                         state.static_extra.load(), state.static_known.load(),
+                         state.static_used.load());
                 state.rate_since = now;
                 state.rate_finished = finished;
             }
@@ -5902,11 +5986,29 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                 const bool compute = kind == 1;
                 ComputePipelineCacheKey compute_key{};
                 GraphicsPipelineCacheKey record_key{};
+                std::vector<GraphicsPipelineCacheKey> static_keys;
                 if (compute) {
                     in.read(reinterpret_cast<char*>(&compute_key), sizeof(compute_key));
                 } else {
                     in.read(reinterpret_cast<char*>(&record_key), sizeof(record_key));
                     RecordedKeyForThisDevice(record_key);
+                    if (IntelForkStaticPrep() && record_key.state.dynamic_vertex_input != 0 &&
+                        !dynamic_features.has_dynamic_vertex_input) {
+                        static_keys = IntelStaticKeys(record_key);
+                        if (!static_keys.empty()) {
+                            ++state.static_records;
+                            for (const auto& static_key : static_keys) {
+                                const u64 h = static_key.Hash();
+                                if (disk_keys && disk_keys->contains(h)) {
+                                    ++state.static_known;
+                                }
+                                if (used_keys && used_keys->contains(h)) {
+                                    ++state.static_used;
+                                }
+                            }
+                            record_key = static_keys.front();
+                        }
+                    }
                     const auto& key_state = record_key.state;
                     const bool other_device =
                         (key_state.extended_dynamic_state != 0) !=
@@ -6011,6 +6113,20 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                             pools, record_key, MakeSpan(env_ptrs), nullptr, false, nullptr,
                             nullptr, false, keeping ? &kept : nullptr)};
                         ok = pipeline && !pipeline->Failed();
+                        // INTEL_FORK_STATIC_PREP: the other layouts draws gave this record's
+                        // vertex programs (the first one is record_key itself).
+                        for (size_t extra = 1; ok && extra < static_keys.size(); ++extra) {
+                            if (disk_keys && disk_keys->contains(static_keys[extra].Hash())) {
+                                continue;
+                            }
+                            ShaderPools extra_pools;
+                            const auto more{CreateGraphicsPipeline(
+                                extra_pools, static_keys[extra], MakeSpan(env_ptrs), nullptr,
+                                false, nullptr, nullptr, false, nullptr)};
+                            if (more && !more->Failed()) {
+                                ++state.static_extra;
+                            }
+                        }
                         // A pipeline drawn through the task/mesh compute fallback is not kept:
                         // it needs the fallback's setup besides its SPIR-V, so the normal path
                         // builds it (CreatePrecompiledGraphicsPipeline declines task/mesh
@@ -6075,6 +6191,23 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     }
     LogDriverCacheFolder(device, "after the preparation");
     PipelineBinary::LogCounts("after the preparation");
+    if (IntelForkStaticPrep()) {
+        std::size_t vertex_pairs = 0;
+        std::size_t layouts = 0;
+        {
+            std::scoped_lock lock{intel_layouts_mutex};
+            vertex_pairs = intel_static_layouts.size();
+            for (const auto& [pair, list] : intel_static_layouts) {
+                layouts += list.size();
+            }
+        }
+        LOG_INFO(Render_Vulkan,
+                 "Intel fork static prep (INTEL_FORK_STATIC_PREP=1): {} vertex program pairs with "
+                 "{} layouts from the disk cache; {} records turned into static keys, {} extra "
+                 "layouts built; of their keys {} are in the disk cache and {} in the used list",
+                 vertex_pairs, layouts, state.static_records.load(), state.static_extra.load(),
+                 state.static_known.load(), state.static_used.load());
+    }
     if (state.other_device.load() != 0) {
         // Which dynamic states made records "for another device" (recorded on a GPU that has
         // them dynamic and this one static, or the reverse): AMD players skipped most of the
@@ -6135,6 +6268,110 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
             LoadKept(kept_path, kept_part, path, kept_stamp, false);
         }
     }
+}
+
+namespace {
+/// Intel fork (phase D2): INTEL_FORK_STATIC_PREP=1 prepares the recipe's dynamic-vertex-input
+/// records as static vertex input keys (layouts harvested from the disk cache).
+bool IntelForkStaticPrep() {
+    static const bool on = [] {
+        const char* const v = std::getenv("INTEL_FORK_STATIC_PREP");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on;
+}
+
+u64 IntelVertexPair(const GraphicsPipelineCacheKey& key) {
+    return (key.unique_hashes[0] * 0x9E3779B97F4A7C15ULL) ^ key.unique_hashes[1];
+}
+
+/// The dynamic attribute types (FixedPipelineState::DynamicAttributeTypes) of a static layout.
+u64 IntelLayoutTypes(const std::array<u32, Maxwell::NumVertexAttributes>& attributes) {
+    static constexpr std::array<u32, 8> LUT{0u, 1u, 1u, 2u, 3u, 1u, 1u, 1u};
+    u64 types = 0;
+    for (size_t i = 0; i < attributes.size(); ++i) {
+        FixedPipelineState::VertexAttribute attribute{};
+        attribute.raw = attributes[i];
+        const u32 mask = attribute.enabled != 0 ? 3 : 0;
+        types |= static_cast<u64>(LUT[attribute.type.Value() & 7] & mask) << (i * 2);
+    }
+    return types;
+}
+} // namespace
+
+void PipelineCache::AddIntelStaticLayout(const GraphicsPipelineCacheKey& key) {
+    if (key.state.dynamic_vertex_input != 0 || key.state.xfb_enabled != 0) {
+        return;
+    }
+    IntelStaticLayout layout;
+    for (size_t i = 0; i < layout.attributes.size(); ++i) {
+        layout.attributes[i] = key.state.attributes[i].raw;
+    }
+    layout.binding_divisors = key.state.binding_divisors;
+    layout.enabled_divisors = key.state.enabled_divisors;
+    std::scoped_lock lock{intel_layouts_mutex};
+    auto& list = intel_static_layouts[IntelVertexPair(key)];
+    if (list.size() < 8 && std::ranges::find(list, layout) == list.end()) {
+        list.push_back(layout);
+    }
+}
+
+/// Intel fork (2026-11-19): without dynamic vertex input the recipe's records (recorded with it)
+/// are skipped "for another device", so a walk over them is no preparation. The vertex input mode
+/// is part of the prepared stamp, and with INTEL_FORK_STATIC_PREP the number of vertex program
+/// pairs with known layouts (in steps of 256): layouts learned in play prepare the records they
+/// open up (those built before are driver cache hits).
+std::string PipelineCache::IntelForkPrepStamp() const {
+    if (device.IsExtVertexInputDynamicStateSupported()) {
+        return {};
+    }
+    if (!IntelForkStaticPrep()) {
+        return std::string{"vi-static"} + '\n';
+    }
+    std::scoped_lock lock{intel_layouts_mutex};
+    return fmt::format("vi-static layouts {}", intel_static_layouts.size() / 256) + '\n';
+}
+
+std::vector<GraphicsPipelineCacheKey> PipelineCache::IntelStaticKeys(
+    const GraphicsPipelineCacheKey& record) const {
+    std::vector<GraphicsPipelineCacheKey> keys;
+    if (record.state.dynamic_vertex_input == 0 || record.state.xfb_enabled != 0) {
+        return keys;
+    }
+    // The record's types are masked by the programs' inputs: only the fields it keeps nonzero
+    // (attributes the programs read) must agree with a layout.
+    const u64 recorded = record.state.attribute_types;
+    u64 compare = 0;
+    for (size_t i = 0; i < Maxwell::NumVertexAttributes; ++i) {
+        if (((recorded >> (i * 2)) & 3) != 0) {
+            compare |= u64{3} << (i * 2);
+        }
+    }
+    std::scoped_lock lock{intel_layouts_mutex};
+    const auto it = intel_static_layouts.find(IntelVertexPair(record));
+    if (it == intel_static_layouts.end()) {
+        return keys;
+    }
+    for (const IntelStaticLayout& layout : it->second) {
+        if ((IntelLayoutTypes(layout.attributes) & compare) != recorded) {
+            continue;
+        }
+        GraphicsPipelineCacheKey key = record;
+        key.state.dynamic_vertex_input.Assign(0);
+        key.state.enabled_divisors = layout.enabled_divisors;
+        for (size_t i = 0; i < layout.attributes.size(); ++i) {
+            key.state.attributes[i].raw = layout.attributes[i];
+        }
+        key.state.binding_divisors = layout.binding_divisors;
+        if (CanonicalKeys()) {
+            CanonicalizeKeyState(key.state, dynamic_features);
+        }
+        keys.push_back(key);
+        if (keys.size() >= 4) {
+            break;
+        }
+    }
+    return keys;
 }
 
 void PipelineCache::RecordedKeyForThisDevice(GraphicsPipelineCacheKey& key) const noexcept {
