@@ -200,8 +200,10 @@ void RunaheadOverlaidBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquir
 namespace DelayedShortcuts {
 [[nodiscard]] int Level() {
     static const int level = [] {
+        // Default 2 (2026-11-19, user-judged with Balanced: every visual fix, V6.2-like fps; it
+        // only acts while fences are delayed). INTEL_FORK_DELAYED_SHORTCUTS=0 turns it off.
         const char* const value = std::getenv("INTEL_FORK_DELAYED_SHORTCUTS");
-        return value == nullptr ? 0 : (std::max)(0, std::atoi(value));
+        return value == nullptr ? 2 : (std::max)(0, std::atoi(value));
     }();
     return level;
 }

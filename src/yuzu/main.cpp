@@ -380,6 +380,13 @@ bool Nx2IsTestSwitch(std::string_view name) {
 // The player's switch file, in Fritchii's data folder: the one Tools > Switches writes.
 std::filesystem::path Nx2UserSwitchFile() {
 #ifdef _WIN32
+    // Intel fork (2026-11-19): a portable build (a "user" folder next to the exe) reads only its
+    // own switch file, never an older Fritchii's in %APPDATA% (a test1 file with test switches
+    // would override this build's defaults).
+    if (const auto portable = Common::FS::GetExeDirectory() / "user";
+        std::filesystem::is_directory(portable)) {
+        return portable / "nx2_switches.txt";
+    }
     const auto app_data = Common::FS::GetAppDataRoamingDirectory();
 #else
     const auto app_data = Common::FS::GetDataDirectory("XDG_CONFIG_HOME");
@@ -390,6 +397,11 @@ std::filesystem::path Nx2UserSwitchFile() {
 // Before the first launch's import has copied it, the player's file is still in the old folder
 // (Fritchii v5.8 moved from eden to fritchii): read, never written.
 std::filesystem::path Nx2LegacyUserSwitchFile() {
+#ifdef _WIN32
+    if (std::filesystem::is_directory(Common::FS::GetExeDirectory() / "user")) {
+        return Common::FS::GetExeDirectory() / "user" / "nx2_switches.legacy-none.txt";
+    }
+#endif
     return Nx2UserSwitchFile().parent_path().parent_path() / EDEN_LEGACY_DIR / "nx2_switches.txt";
 }
 
