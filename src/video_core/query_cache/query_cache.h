@@ -5,6 +5,9 @@
 
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -788,6 +791,50 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
         return;
     }
     DAddr cpu_addr = *cpu_addr_opt;
+    // Intel fork (2026-11-19, Longshot's "a count not known yet reads visible"):
+    // FRITCHII_OCCL_PROVISIONAL=1 writes 4096 into a sample-count report's slot that still reads
+    // 0 when the report is requested. Without delayed fences the guest passes its syncpoint 1-3
+    // frames before the host GPU ran the queries, and a CPU read of the slot then saw the 0 the
+    // game cleared it with: the object was dropped for a frame (sky through rocks while turning).
+    // The real count overwrites it when it lands; the GPU-side 0xe2c read waits for the landing
+    // as before.
+    static const bool occl_provisional = [] {
+        const char* const v = std::getenv("FRITCHII_OCCL_PROVISIONAL");
+        return v != nullptr && v[0] == '1';
+    }();
+    if (occl_provisional && !is_fence && requested_type == QueryType::ZPassPixelCount64 &&
+        counter_type == QueryType::ZPassPixelCount64) [[unlikely]] {
+        if (u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr)) {
+            static std::atomic<u64> written{}, kept{};
+            static std::atomic<s64> window{};
+            u32 low = 0;
+            std::memcpy(&low, pointer, sizeof(low));
+            if (low == 0) {
+                if (has_timestamp) {
+                    const u64 visible = 4096;
+                    std::memcpy(pointer, &visible, sizeof(visible));
+                } else {
+                    const u32 visible = 4096;
+                    std::memcpy(pointer, &visible, sizeof(visible));
+                }
+                written.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                kept.fetch_add(1, std::memory_order_relaxed);
+            }
+            const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
+                                std::chrono::steady_clock::now().time_since_epoch())
+                                .count();
+            s64 begun = window.load(std::memory_order_relaxed);
+            if (begun == 0) {
+                window.compare_exchange_strong(begun, now);
+            } else if (now - begun >= 10 && window.compare_exchange_strong(begun, now)) {
+                LOG_INFO(HW_GPU,
+                         "Intel fork provisional occlusion counts (FRITCHII_OCCL_PROVISIONAL=1) "
+                         "in {} s: {} slots read 0 and got 4096, {} already held a count",
+                         now - begun, written.exchange(0), kept.exchange(0));
+            }
+        }
+    }
     const size_t new_query_id = streamer->WriteCounter(cpu_addr, has_timestamp, payload, subreport);
     auto* query = streamer->GetQuery(new_query_id);
     if (is_fence) {
