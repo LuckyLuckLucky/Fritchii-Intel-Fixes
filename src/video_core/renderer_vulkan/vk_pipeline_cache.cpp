@@ -913,6 +913,33 @@ bool AppCacheBesideDriver(const Device& device) {
     return AmdAppCache(device) || IntelDriverCache(device);
 }
 
+/// Intel fork phase D12 (2026-11-19): Intel's Windows driver cache holds at most 512 MiB for all
+/// programs (LocalLow\Intel\ShaderCache stopped at 536,870,140 bytes, full after one preparation),
+/// so a preparation built into it alone was lost by the next boot (rerun: 55 % hits).
+/// INTEL_FORK_PREP_APP_CACHE=1 builds the preparation and the warm-up into our VkPipelineCache
+/// file as well (Intel's cache data holds the binaries: 943 MB for a play cache), with the cap
+/// raised to INTEL_FORK_APP_CACHE_CAP_MIB (default 12288), saved every 5 minutes of the
+/// preparation and once more before its stamp is written.
+bool IntelPrepAppCache(const Device& device) {
+    static const bool on = [] {
+        const char* const v = std::getenv("INTEL_FORK_PREP_APP_CACHE");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on && IntelDriverCache(device);
+}
+
+size_t AppCacheCapBytes(const Device& device) {
+    if (!IntelPrepAppCache(device)) {
+        return size_t{512} << 20;
+    }
+    static const size_t cap = [] {
+        const char* const v = std::getenv("INTEL_FORK_APP_CACHE_CAP_MIB");
+        const size_t mib = v != nullptr ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : 0;
+        return (mib != 0 ? mib : size_t{12288}) << 20;
+    }();
+    return cap;
+}
+
 bool DriverCachesPipelines(const Device& device) {
     switch (device.GetDriverID()) {
     case VK_DRIVER_ID_NVIDIA_PROPRIETARY:
@@ -4042,6 +4069,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LogDriverCacheFolder(device, "at boot");
         LOG_INFO(Render_Vulkan, "Our VkPipelineCache file: {}",
                  !use_vulkan_pipeline_cache  ? "off (the driver's own cache only)"
+                 : IntelPrepAppCache(device)
+                     ? "on for the preparation, warm-up and play (Intel fork D12, "
+                       "INTEL_FORK_PREP_APP_CACHE=1, cap INTEL_FORK_APP_CACHE_CAP_MIB)"
                  : AppCacheBesideDriver(device) ? "on for pipelines built in play "
                                                 "(beside the driver's cache, up to 512 MiB)"
                                               : "on");
@@ -5861,6 +5891,8 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
         }
         return throttle_mode >= 2 ? (std::max<size_t>)(1, threads / 2) : threads;
     };
+    // Intel fork D12: when the preparation's builds in our VkPipelineCache were last saved.
+    auto app_cache_saved_at = std::chrono::steady_clock::now();
     const auto complete = [&](size_t position) {
         const size_t finished = state.finished.fetch_add(1) + 1;
         {
@@ -5907,6 +5939,16 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                          state.static_used.load());
                 state.rate_since = now;
                 state.rate_finished = finished;
+                // Intel fork D12: a killed run keeps what was saved (resumes at the checkpoint).
+                if (IntelPrepAppCache(device) &&
+                    now - app_cache_saved_at >= std::chrono::minutes{5}) {
+                    app_cache_saved_at = now;
+                    LOG_INFO(Render_Vulkan,
+                             "Intel fork D12: saving the preparation's pipelines in our "
+                             "VkPipelineCache file ({} MiB at the last save)",
+                             last_cache_size.load(std::memory_order_relaxed) >> 20);
+                    QueueVulkanPipelineCacheSave(false);
+                }
             }
         }
         if (state.throttle.Due()) {
@@ -6258,6 +6300,25 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
                         kept_part.filename().string());
         }
     }
+    if (finished && IntelPrepAppCache(device) && use_vulkan_pipeline_cache &&
+        !vulkan_pipeline_cache_filename.empty()) {
+        // Intel fork D12: the stamp only once the pipelines are on disk.
+        const auto save_begin = std::chrono::steady_clock::now();
+        serialization_thread.WaitForRequests();
+        SerializeVulkanPipelineCache(vulkan_pipeline_cache_filename, vulkan_pipeline_cache,
+                                     CACHE_VERSION);
+        size_t size = 0;
+        {
+            const vk::PipelineCacheReadLock read_lock;
+            vulkan_pipeline_cache.Read(&size, nullptr);
+        }
+        last_cache_size.store(size, std::memory_order_relaxed);
+        LOG_INFO(Render_Vulkan,
+                 "Intel fork D12: preparation saved in our VkPipelineCache file: {} MiB in {:.1f} s",
+                 size >> 20,
+                 std::chrono::duration<double>(std::chrono::steady_clock::now() - save_begin)
+                     .count());
+    }
     if (finished) {
         std::ofstream stamp_file(stamp_path, std::ios::binary | std::ios::trunc);
         stamp_file << stamp;
@@ -6329,7 +6390,10 @@ std::string PipelineCache::IntelForkPrepStamp() const {
         return std::string{"vi-static"} + '\n';
     }
     std::scoped_lock lock{intel_layouts_mutex};
-    return fmt::format("vi-static layouts {}", intel_static_layouts.size() / 256) + '\n';
+    // D12: a preparation that went to the driver's cache only is not one in our file.
+    return fmt::format("vi-static layouts {}{}", intel_static_layouts.size() / 256,
+                       IntelPrepAppCache(device) ? " app-cache" : "") +
+           '\n';
 }
 
 std::vector<GraphicsPipelineCacheKey> PipelineCache::IntelStaticKeys(
@@ -7277,8 +7341,9 @@ vk::PipelineCache& PipelineCache::PlayPipelineCache() {
     // The preparation's builds only go to the driver's own cache: the app cache would grow by
     // gigabytes. With EDEN_NX2_AMD_APP_CACHE, past 512 MiB no new pipeline goes into it either
     // (a VkPipelineCache can't evict; the file is read into RAM at every boot).
-    constexpr size_t AmdAppCacheCap = size_t{512} << 20;
-    if (t_precompile_build && AppCacheBesideDriver(device)) {
+    // Intel fork D12: with INTEL_FORK_PREP_APP_CACHE the preparation builds into it as well.
+    const size_t AmdAppCacheCap = AppCacheCapBytes(device);
+    if (t_precompile_build && AppCacheBesideDriver(device) && !IntelPrepAppCache(device)) {
         return no_pipeline_cache;
     }
     if (AppCacheBesideDriver(device) &&
@@ -7293,6 +7358,11 @@ vk::PipelineCache& PipelineCache::WarmPipelineCache() {
         const char* value = std::getenv("EDEN_NX2_WARM_APP_CACHE");
         return value != nullptr && value[0] == '1';
     }();
+    // Intel fork D12: the warm-up reads (and adds to) the file the preparation filled.
+    if (IntelPrepAppCache(device) && last_cache_size.load(std::memory_order_relaxed) <
+                                         AppCacheCapBytes(device)) {
+        return vulkan_pipeline_cache;
+    }
     return app_cache ? vulkan_pipeline_cache : no_pipeline_cache;
 }
 
