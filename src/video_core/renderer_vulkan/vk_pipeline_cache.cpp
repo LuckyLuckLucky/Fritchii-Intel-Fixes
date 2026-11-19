@@ -7242,7 +7242,8 @@ void PipelineCache::AddIntelStaticLayout(const GraphicsPipelineCacheKey& key) {
 
 /// Intel fork phase D3 (2026-11-19): the static vertex layouts learned from the disk cache, per
 /// vertex program pair, in a file of their own: intel_layouts.bin (written at each preparation,
-/// everything known) and any intel_layouts*.bin beside it (other players' files, read first).
+/// everything known) and any intel_layouts*.bin beside it or in "layouts" next to the emulator
+/// (other players' files and the ones a build ships, read first).
 /// They hold program hashes and attribute words only (no shader code, no game data), so players
 /// can share them; each new layout lets the preparation convert more of the recipe's records.
 /// Format: "IFLAYOUT", u32 version 1, u32 entry count, then per entry u64 vertex program pair and
@@ -7264,7 +7265,19 @@ void PipelineCache::SyncIntelLayoutFiles(const std::filesystem::path& base_dir) 
     size_t new_pairs = 0;
     std::error_code error;
     std::scoped_lock lock{intel_layouts_mutex};
-    for (const auto& entry : std::filesystem::directory_iterator(base_dir, error)) {
+    // Beside the cache, and in "layouts" beside the emulator (files shipped with a build).
+    std::vector<std::filesystem::directory_entry> candidates;
+    std::vector<std::filesystem::path> dirs{base_dir};
+#ifdef _WIN32
+    dirs.push_back(Common::FS::GetExeDirectory() / "layouts");
+#endif
+    for (const auto& dir : dirs) {
+        for (const auto& entry : std::filesystem::directory_iterator(dir, error)) {
+            candidates.push_back(entry);
+        }
+        error.clear();
+    }
+    for (const auto& entry : candidates) {
         const auto name = entry.path().filename().string();
         if (!entry.is_regular_file(error) || !name.starts_with("intel_layouts") ||
             !name.ends_with(".bin")) {
