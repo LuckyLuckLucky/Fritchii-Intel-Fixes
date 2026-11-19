@@ -807,19 +807,23 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
         if (u8* const pointer = impl->device_memory.template GetPointer<u8>(cpu_addr)) {
             static std::atomic<u64> written{}, kept{};
             static std::atomic<s64> window{};
+            // A GROWING value (+4096 a report, never 0), written over whatever the slot holds:
+            // OoT draws an object when its before and after reports differ, so a constant read
+            // 4096/4096 and still hid it, and a stale count from an earlier frame could be equal
+            // too (2026-11-19 user run: rarer flashes only).
+            static std::atomic<u32> next{};
+            u32 visible = next.fetch_add(4096, std::memory_order_relaxed) + 4096;
+            if (visible == 0) [[unlikely]] {
+                visible = next.fetch_add(4096, std::memory_order_relaxed) + 4096;
+            }
             u32 low = 0;
             std::memcpy(&low, pointer, sizeof(low));
-            if (low == 0) {
-                if (has_timestamp) {
-                    const u64 visible = 4096;
-                    std::memcpy(pointer, &visible, sizeof(visible));
-                } else {
-                    const u32 visible = 4096;
-                    std::memcpy(pointer, &visible, sizeof(visible));
-                }
-                written.fetch_add(1, std::memory_order_relaxed);
+            (low == 0 ? written : kept).fetch_add(1, std::memory_order_relaxed);
+            if (has_timestamp) {
+                const u64 wide = visible;
+                std::memcpy(pointer, &wide, sizeof(wide));
             } else {
-                kept.fetch_add(1, std::memory_order_relaxed);
+                std::memcpy(pointer, &visible, sizeof(visible));
             }
             const s64 now = std::chrono::duration_cast<std::chrono::seconds>(
                                 std::chrono::steady_clock::now().time_since_epoch())
@@ -830,7 +834,7 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
             } else if (now - begun >= 10 && window.compare_exchange_strong(begun, now)) {
                 LOG_INFO(HW_GPU,
                          "Intel fork provisional occlusion counts (FRITCHII_OCCL_PROVISIONAL=1) "
-                         "in {} s: {} slots read 0 and got 4096, {} already held a count",
+                         "in {} s: {} slots read 0, {} held a count; all got a growing provisional count",
                          now - begun, written.exchange(0), kept.exchange(0));
             }
         }
