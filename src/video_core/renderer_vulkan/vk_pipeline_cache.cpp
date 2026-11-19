@@ -1121,6 +1121,10 @@ std::string IntelForkSpirvStamp() {
     if (NanGuardMode() != 0) {
         stamp += fmt::format(" nan-mode {}", NanGuardMode());
     }
+    if (const char* const v = std::getenv("INTEL_FORK_FRAG_NO_SUBGROUP");
+        v != nullptr && (v[0] == '1' || v[0] == '2')) {
+        stamp += fmt::format(" frag-no-subgroup {}", v[0]);
+    }
     return stamp;
 }
 
@@ -1189,6 +1193,29 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
         subgroup_stage_bit(VK_SHADER_STAGE_MESH_BIT_EXT, Shader::Stage::Mesh)};
     if (driver_id == VK_DRIVER_ID_MESA_TURNIP) {
         supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Geometry));
+    }
+    // Intel fork (2026-11-19, grass shadow flicker lead): Arc runs graphics stages 16 wide and
+    // they can't be pinned to 32 (requiredSubgroupSizeStages = compute/task/mesh), so a guest
+    // 32-wide vote or ballot sees whichever 16 pixels the driver packed together, which changes
+    // frame to frame. INTEL_FORK_FRAG_NO_SUBGROUP=1: the fragment stage gets no subgroup ops
+    // (each invocation its own warp: votes = its own predicate, shuffles = its own value);
+    // =2: also vertex, tessellation and geometry. Part of the SPIR-V stamp.
+    if (driver_id == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS) {
+        if (const char* const v = std::getenv("INTEL_FORK_FRAG_NO_SUBGROUP");
+            v != nullptr && (v[0] == '1' || v[0] == '2')) {
+            supported_subgroup_stages &= ~(1u << static_cast<u32>(Shader::Stage::Fragment));
+            if (v[0] == '2') {
+                for (const auto stage :
+                     {Shader::Stage::VertexA, Shader::Stage::VertexB,
+                      Shader::Stage::TessellationControl, Shader::Stage::TessellationEval,
+                      Shader::Stage::Geometry}) {
+                    supported_subgroup_stages &= ~(1u << static_cast<u32>(stage));
+                }
+            }
+            LOG_INFO(Render_Vulkan, "Intel fork: INTEL_FORK_FRAG_NO_SUBGROUP={}: no subgroup "
+                                    "operations in {}",
+                     v[0], v[0] == '2' ? "fragment, vertex, tessellation, geometry" : "fragment");
+        }
     }
     profile = Shader::Profile{
         .supported_spirv = device.SupportedSpirvVersion(),
