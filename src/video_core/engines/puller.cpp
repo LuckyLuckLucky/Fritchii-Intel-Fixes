@@ -191,13 +191,28 @@ void RunaheadOverlaidBoundary(DmaPusher& dma_pusher, const Puller::PendingAcquir
 // resumes on its waiter's latch (the delayed write's OnWrite) instead of a forced drain that
 // waits for the host GPU. Compute 0x6c3 releases and words without a recorded plain release
 // (reports, QMD releases, the guest CPU) keep the drain. Off, or fences not delayed: no change.
+// =2: everything of 1, and the acquires on any other word (GPU-written payloads: reports,
+// queries, compute and QMD releases, the guest CPU) take the same no-wait fence and suspend too,
+// resuming only on the real write (the latch in WritePayloadNow's OnWrite, or a matching word
+// read); no value is predicted. The 1 ms re-release of a waiting acquire is the no-wait fence
+// for every word, and the acquires that are not honoured on the word (SEM_EXECUTE acquire, fence
+// action acquire) release the fences on the back without the host GPU wait.
 namespace DelayedShortcuts {
-[[nodiscard]] bool Enabled() {
-    static const bool on = [] {
+[[nodiscard]] int Level() {
+    static const int level = [] {
         const char* const value = std::getenv("INTEL_FORK_DELAYED_SHORTCUTS");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr ? 0 : (std::max)(0, std::atoi(value));
     }();
-    return on;
+    return level;
+}
+
+[[nodiscard]] bool Enabled() {
+    return Level() >= 1;
+}
+
+/// Level 2 and fences delayed now.
+[[nodiscard]] bool Level2() {
+    return Level() >= 2 && VideoCore::Nx2Debug::DelayedFences();
 }
 
 /// Whether the newest release recorded for the u32 at `device` (GpuSplit::NoteRelease) writes a
@@ -216,13 +231,18 @@ namespace DelayedShortcuts {
     }
 }
 
-/// The switch is on, fences are delayed, and the word's newest release is plain.
-[[nodiscard]] bool Allowed(DmaPusher& dma_pusher, GPUVAddr address) {
+/// The switch is on, fences are delayed, and the word's newest release is plain (level 2: any
+/// word). `plain` (optional): whether it was plain, for the counters.
+[[nodiscard]] bool Allowed(DmaPusher& dma_pusher, GPUVAddr address, bool* plain = nullptr) {
     if (!Enabled() || !VideoCore::Nx2Debug::DelayedFences()) {
         return false;
     }
     const auto device = dma_pusher.memory_manager.GpuToCpuAddress(address);
-    return device && PlainRelease(*device);
+    const bool is_plain = device && PlainRelease(*device);
+    if (plain) {
+        *plain = is_plain;
+    }
+    return is_plain || Level() >= 2;
 }
 
 /// Queues a fence that commits the pending (delayed) operations without waiting for the host
@@ -242,7 +262,8 @@ void SignalFenceNoWait(DmaPusher& dma_pusher) {
 struct Stats {
     u64 met_queued{}; ///< Acquires met by a queued release with delayed fences
     u64 avoided{};    ///< Forced drains (host GPU waits) replaced by a fence without a wait
-    u64 kept{};       ///< Forced drains kept: the word's newest release is not plain
+    u64 kept{};       ///< Forced drains kept (level 1: the word's newest release is not plain)
+    u64 converted{};  ///< Level 2: forced drains of other words replaced by the no-wait fence
     std::chrono::steady_clock::time_point since{};
 };
 Stats g_stats;
@@ -261,12 +282,14 @@ void Tick() {
         return;
     }
     LOG_INFO(HW_GPU,
-             "Intel fork delayed shortcuts (delayed fences {}): acquires met by queued release "
-             "{:.0f}/s, drains avoided {:.0f}/s, drains kept for GPU-written payloads {:.0f}/s",
-             VideoCore::Nx2Debug::DelayedFences() ? "on" : "off",
+             "Intel fork delayed shortcuts (level {}, delayed fences {}): acquires met by queued "
+             "release {:.0f}/s, drains avoided {:.0f}/s, drains kept for GPU-written payloads "
+             "{:.0f}/s, drains converted at level 2 {:.0f}/s",
+             Level(), VideoCore::Nx2Debug::DelayedFences() ? "on" : "off",
              static_cast<double>(g_stats.met_queued) / window,
              static_cast<double>(g_stats.avoided) / window,
-             static_cast<double>(g_stats.kept) / window);
+             static_cast<double>(g_stats.kept) / window,
+             static_cast<double>(g_stats.converted) / window);
     g_stats = {};
     g_stats.since = now;
 }
@@ -1823,8 +1846,11 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
     // INTEL_FORK_DELAYED_SHORTCUTS: with delayed fences, a word whose newest release is plain
     // takes the EXP12 path below; its fence release is a fence without a host GPU wait.
     const bool delayed = VideoCore::Nx2Debug::DelayedFences();
-    const bool delayed_shortcut = delayed && device && DelayedShortcuts::Enabled() &&
-                                  DelayedShortcuts::PlainRelease(*device);
+    // Level 2: any word (the suspension resumes on the real write only).
+    const bool delayed_plain = delayed && device && DelayedShortcuts::Enabled() &&
+                               DelayedShortcuts::PlainRelease(*device);
+    const bool delayed_shortcut =
+        delayed_plain || (delayed && device && DelayedShortcuts::Level() >= 2);
     if (mode <= 0 || mode > 6 || !device || !split.Active() || (delayed && !delayed_shortcut)) {
         if (delayed && DelayedShortcuts::Enabled() && mode > 0 && mode <= 6 && device &&
             split.Active()) {
@@ -1883,7 +1909,8 @@ static bool ReleaseFencesForReadable(DmaPusher& dma_pusher, const void* owner,
         // A forced release would wait for the host GPU (WaitPendingFences(true) waits for its
         // fence's callback, which delayed fences run once the host GPU passed it).
         DelayedShortcuts::SignalFenceNoWait(dma_pusher);
-        ++DelayedShortcuts::g_stats.avoided;
+        ++(delayed_plain ? DelayedShortcuts::g_stats.avoided
+                         : DelayedShortcuts::g_stats.converted);
         DelayedShortcuts::Tick();
     } else {
         // Memory stage tag Cache: the fence manager only; no 3D state.
@@ -2292,12 +2319,14 @@ bool Puller::CanResumeAcquire(DmaPusher& dma_pusher) {
     if (const auto now = std::chrono::steady_clock::now();
         delayed && now - pending_acquire->last_fences >= std::chrono::milliseconds{1}) {
         pending_acquire->last_fences = now;
-        if (DelayedShortcuts::Allowed(dma_pusher, pending_acquire->address)) {
+        if (bool plain = false;
+            DelayedShortcuts::Allowed(dma_pusher, pending_acquire->address, &plain)) {
             // INTEL_FORK_DELAYED_SHORTCUTS: a fence without the host GPU wait; the release lands
-            // on the fencing thread and latches the waiter, which a later poll finds.
+            // on the fencing thread and latches the waiter, which a later poll finds (level 2:
+            // for any word; a GPU-written word without a latch shows in a later poll's read).
             DelayedShortcuts::SignalFenceNoWait(dma_pusher);
             VideoCommon::GpuSplit::Get().Publish();
-            ++DelayedShortcuts::g_stats.avoided;
+            ++(plain ? DelayedShortcuts::g_stats.avoided : DelayedShortcuts::g_stats.converted);
             DelayedShortcuts::Tick();
             report_if_stuck(current);
             return false;
@@ -2531,9 +2560,17 @@ void Puller::ProcessFenceActionMethod(DmaPusher& dma_pusher) {
         // WaitFence(regs.fence_action.syncpoint_id, regs.fence_value);
         // Memory stage tag Cache (both closures here): the fence manager (its releases commit
         // the buffer cache's async flushes); no 3D state.
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::Nx2FastDrawCount::Neutral() |
-                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
+        // INTEL_FORK_DELAYED_SHORTCUTS=2: the acquire is not honoured on its syncpoint here, so
+        // the fences go out without the host GPU wait (the forced release waits for it).
+        if (DelayedShortcuts::Level2() && VideoCommon::GpuSplit::Get().Active()) {
+            DelayedShortcuts::SignalFenceNoWait(dma_pusher);
+            ++DelayedShortcuts::g_stats.converted;
+            DelayedShortcuts::Tick();
+        } else {
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+                   VideoCommon::Nx2FastDrawCount::Neutral() |
+                       VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
+        }
         VideoCommon::GpuSplit::Get().NoteSync();
         break;
     case Puller::FenceOperation::Increment:
@@ -2746,7 +2783,23 @@ void Puller::ProcessSemaphoreTriggerMethod(DmaPusher& dma_pusher) {
                     QmdPredictionMetBy(dma_pusher, *qmd_check, acquire, met);
                 }
             }
+        } else if (DelayedShortcuts::Level2()) {
+            // INTEL_FORK_DELAYED_SHORTCUTS=2: the back was drained above; the fences go out
+            // without the host GPU wait and the acquire suspends until the real write lands (the
+            // latch, or a later poll's read after its drain).
+            DelayedShortcuts::SignalFenceNoWait(dma_pusher);
+            VideoCommon::GpuSplit::Get().NoteSync();
+            VideoCommon::GpuSplit::Get().Publish();
+            ++DelayedShortcuts::g_stats.converted;
+            DelayedShortcuts::Tick();
+            // Read unmet right after the drain; not read again here while the back runs the
+            // fence (ReadSemaphoreWord asks the back's caches). The latch below still counts.
+            met_now = false;
         } else {
+            if (DelayedShortcuts::Enabled() && VideoCore::Nx2Debug::DelayedFences()) {
+                ++DelayedShortcuts::g_stats.kept;
+                DelayedShortcuts::Tick();
+            }
             ReleaseFences(dma_pusher);
             met_now = acquire.Matches(ReadSemaphoreWord(dma_pusher, acquire.address));
         }
@@ -2871,9 +2924,17 @@ void Puller::ProcessSemaphoreExecute(DmaPusher& dma_pusher, u32 argument) {
     // Memory stage tag Cache (both closures here, fable_stage_levelpoints 14.5): the fence manager
     // only; no 3D state.
     if (auto& split = VideoCommon::GpuSplit::Get(); split.Active()) {
-        OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
-               VideoCommon::Nx2FastDrawCount::Neutral() |
-                   VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
+        // INTEL_FORK_DELAYED_SHORTCUTS=2: not honoured on the word here either, so the fences go
+        // out without the host GPU wait the forced release makes with delayed fences.
+        if (DelayedShortcuts::Level2()) {
+            DelayedShortcuts::SignalFenceNoWait(dma_pusher);
+            ++DelayedShortcuts::g_stats.converted;
+            DelayedShortcuts::Tick();
+        } else {
+            OnBack([rasterizer = dma_pusher.rasterizer] { rasterizer->ReleaseFences(); },
+                   VideoCommon::Nx2FastDrawCount::Neutral() |
+                       VideoCommon::StageTagBits(VideoCommon::StageTag::Cache));
+        }
         split.NoteSync();
         return;
     }
