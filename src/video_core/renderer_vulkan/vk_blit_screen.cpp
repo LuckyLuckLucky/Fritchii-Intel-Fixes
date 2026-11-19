@@ -6,6 +6,7 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdlib>
 #include <vulkan/vulkan_core.h>
 #include "common/settings.h"
 #include "video_core/framebuffer_config.h"
@@ -39,6 +40,19 @@ void BlitScreen::WaitIdle(const Device& device) {
 
 void BlitScreen::SetWindowAdaptPass(const Device& device) {
     layers.clear();
+    {
+        // Intel fork: Area is black on Intel's Windows driver (present.h).
+        static const bool keep_area = [] {
+            const char* const v = std::getenv("INTEL_FORK_AREA_FILTER");
+            return v != nullptr && v[0] == '1';
+        }();
+        const bool broken =
+            !keep_area && device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+        if (g_present_area_broken.exchange(broken) != broken && broken) {
+            LOG_INFO(Render_Vulkan, "Intel fork: the Area window filter reads as Bilinear on "
+                                    "this driver (black picture; INTEL_FORK_AREA_FILTER=1 keeps it)");
+        }
+    }
     scaling_filter = filters.get_scaling_filter();
 
     switch (scaling_filter) {
