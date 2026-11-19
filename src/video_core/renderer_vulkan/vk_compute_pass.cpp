@@ -860,9 +860,16 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     // why EXP123 is held to 1 on AMD's driver and the one follower posts nothing there. 1 = the
     // decode and its barrier stay in this command buffer, ahead of the draw on the same queue, and
     // the next flush submits them.
-    static const bool held_defer = [] {
+    // Intel fork (2026-11-19): on by default on Intel's Windows driver too: the B580 lost the
+    // device twice right after such flushes ("Memory seam 5.5 ... vk_compute_pass.cpp:878", the
+    // decode's submit the oldest unfinished one); with 1 those flushes are gone, fps unchanged.
+    // FRITCHII_ASTC_HELD_DEFER=0 keeps the flush.
+    static const bool held_defer = [this] {
         const char* value = std::getenv("FRITCHII_ASTC_HELD_DEFER");
-        return value != nullptr && value[0] == '1';
+        if (value != nullptr && value[0] != ' ') {
+            return value[0] == '1';
+        }
+        return device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
     }();
     if (held_defer && SeamHook::Holding()) [[unlikely]] {
         static std::atomic<u32> held_skips{};
