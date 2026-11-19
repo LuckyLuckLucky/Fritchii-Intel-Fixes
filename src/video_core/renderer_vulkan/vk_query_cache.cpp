@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstddef>
@@ -47,13 +48,47 @@ using Tegra::Engines::Maxwell3D;
 using VideoCommon::QueryType;
 
 namespace {
+
+/// Intel fork (phase E, Longshot L5, 2026-11-19): on Intel's Windows driver every occlusion result
+/// read with vkGetQueryResults costs ~6.4 us of CPU (measured: ~300-345 ms a second in Hyrule Field
+/// by day / Kakariko). The results are copied on the GPU (vkCmdCopyQueryPoolResults, with
+/// availability) into a host-visible buffer per bank when the flush is committed and read from
+/// memory when it is popped; a range whose availability is not set falls back to the old read.
+/// Opt-in, INTEL_FORK_OCC_COPY=1: on the B580 (2026-11-19) it read 0 results through the fallback
+/// but changed no frame rate (the reads run on the fencing thread, off the critical path).
+bool IntelOccCopy(const Device& device) {
+    static const bool on = [] {
+        const char* const v = std::getenv("INTEL_FORK_OCC_COPY");
+        return v != nullptr && v[0] == '1';
+    }();
+    return on && device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+}
+std::atomic<u64> g_occ_copy_queries{};
+std::atomic<u64> g_occ_copy_fallbacks{};
 class SamplesQueryBank : public VideoCommon::BankBase {
 public:
     static constexpr size_t BANK_SIZE = 256;
     static constexpr size_t QUERY_SIZE = 8;
-    explicit SamplesQueryBank(const Device& device_, Scheduler& scheduler_, size_t index_)
+    explicit SamplesQueryBank(const Device& device_, Scheduler& scheduler_, size_t index_,
+                              const MemoryAllocator* allocator = nullptr)
         : BankBase(BANK_SIZE), device{device_}, scheduler{scheduler_}, index{index_} {
         const auto& dev = device.GetLogical();
+        if (allocator != nullptr && IntelOccCopy(device)) {
+            const VkBufferCreateInfo copy_ci{
+                .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .pNext = nullptr,
+                .flags = 0,
+                .size = BANK_SIZE * COPY_STRIDE,
+                .usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .queueFamilyIndexCount = 0,
+                .pQueueFamilyIndices = nullptr,
+            };
+            copy_buffer = allocator->CreateBuffer(copy_ci, MemoryUsage::Download);
+            if (copy_buffer.Mapped().size() < BANK_SIZE * COPY_STRIDE) {
+                copy_buffer = vk::Buffer{}; // not host visible: the old reads
+            }
+        }
         query_pool = dev.CreateQueryPool({
             .sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO,
             .pNext = nullptr,
@@ -84,6 +119,10 @@ public:
             });
         }
         host_results.fill(0ULL);
+        if (copy_buffer) {
+            std::memset(copy_buffer.Mapped().data(), 0, BANK_SIZE * COPY_STRIDE);
+            copy_buffer.Flush();
+        }
         next_bank = 0;
     }
 
@@ -96,14 +135,106 @@ public:
         return BankBase::IsDead() && scheduler.IsFree(last_used_tick);
     }
 
+    /// Intel fork L5: whether this bank's results are copied on the GPU.
+    bool HasCopy() const {
+        return static_cast<bool>(copy_buffer);
+    }
+
+    /// Intel fork L5 (the committing thread): copy [start, start + size) with availability.
+    void RecordCopy(size_t start, size_t size) {
+        scheduler.Record([pool = *query_pool, buffer = *copy_buffer, start,
+                          size](vk::CommandBuffer cmdbuf) {
+            cmdbuf.CopyQueryPoolResults(pool, static_cast<u32>(start), static_cast<u32>(size),
+                                        buffer, start * COPY_STRIDE, COPY_STRIDE,
+                                        VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT |
+                                            VK_QUERY_RESULT_WITH_AVAILABILITY_BIT);
+        });
+    }
+
+    /// Intel fork L5 (the popping thread, after the fence): the copied results, or false when a
+    /// slot's availability is not set (then Sync reads them).
+    bool ReadCopied(size_t start, size_t size) {
+        if (!copy_buffer) {
+            return false;
+        }
+        copy_buffer.Invalidate();
+        const u8* const base = copy_buffer.Mapped().data();
+        std::array<u64, 2> entry;
+        for (size_t i = start; i < start + size; ++i) {
+            std::memcpy(entry.data(), base + i * COPY_STRIDE, sizeof(entry));
+            if (entry[1] == 0) {
+                g_occ_copy_fallbacks.fetch_add(size, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        for (size_t i = start; i < start + size; ++i) {
+            std::memcpy(entry.data(), base + i * COPY_STRIDE, sizeof(entry));
+            host_results[i] = entry[0];
+        }
+        g_occ_copy_queries.fetch_add(size, std::memory_order_relaxed);
+        static std::atomic<s64> window_start{};
+        const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                               std::chrono::steady_clock::now().time_since_epoch())
+                               .count();
+        s64 begun = window_start.load(std::memory_order_relaxed);
+        if (begun == 0) {
+            window_start.compare_exchange_strong(begun, now_ms);
+        } else if (now_ms - begun >= 10000 && window_start.compare_exchange_strong(begun, now_ms)) {
+            LOG_INFO(Render_Vulkan,
+                     "Intel fork occlusion copies in {:.1f} s (INTEL_FORK_OCC_COPY=1): {} results "
+                     "read from host memory, {} fell back to vkGetQueryResults",
+                     static_cast<double>(now_ms - begun) / 1000.0, g_occ_copy_queries.exchange(0),
+                     g_occ_copy_fallbacks.exchange(0));
+        }
+        return true;
+    }
+
     void Sync(size_t start, size_t size) {
         if (VideoCommon::LinkStats::On()) [[unlikely]] {
             VideoCommon::LinkStats::NoteQueryResults(size);
         }
         const auto& dev = device.GetLogical();
+        // Intel fork (phase E precheck for L5, 2026-11-19): what the host's occlusion result reads
+        // cost (Longshot: ~3.4 us per query on Intel's Windows driver), once per 10 s.
+        const auto read_begin = std::chrono::steady_clock::now();
         const VkResult query_result = dev.GetQueryResults(
             *query_pool, static_cast<u32>(start), static_cast<u32>(size), sizeof(u64) * size,
             &host_results[start], sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        {
+            static std::atomic<u64> calls{}, queries{}, nanoseconds{}, longest{};
+            static std::atomic<s64> window_start{};
+            const auto read_end = std::chrono::steady_clock::now();
+            const u64 ns = static_cast<u64>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(read_end - read_begin)
+                    .count());
+            calls.fetch_add(1, std::memory_order_relaxed);
+            queries.fetch_add(size, std::memory_order_relaxed);
+            nanoseconds.fetch_add(ns, std::memory_order_relaxed);
+            u64 seen = longest.load(std::memory_order_relaxed);
+            while (ns > seen && !longest.compare_exchange_weak(seen, ns)) {
+            }
+            const s64 now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                   read_end.time_since_epoch())
+                                   .count();
+            s64 begun = window_start.load(std::memory_order_relaxed);
+            if (begun == 0) {
+                window_start.compare_exchange_strong(begun, now_ms);
+            } else if (now_ms - begun >= 10000 &&
+                       window_start.compare_exchange_strong(begun, now_ms)) {
+                const u64 c = calls.exchange(0), q = queries.exchange(0),
+                          t = nanoseconds.exchange(0), l = longest.exchange(0);
+                LOG_INFO(Render_Vulkan,
+                         "Intel fork occlusion host reads in {:.1f} s: {} calls, {} queries, "
+                         "{:.1f} ms in all ({:.2f} ms a second, {:.2f} us a query), longest "
+                         "{:.2f} ms",
+                         static_cast<double>(now_ms - begun) / 1000.0, c, q,
+                         static_cast<double>(t) / 1e6,
+                         static_cast<double>(t) / 1e6 /
+                             (static_cast<double>(now_ms - begun) / 1000.0),
+                         q != 0 ? static_cast<double>(t) / 1e3 / static_cast<double>(q) : 0.0,
+                         static_cast<double>(l) / 1e6);
+            }
+        }
         switch (query_result) {
         case VK_SUCCESS:
             return;
@@ -139,6 +270,8 @@ private:
     Scheduler& scheduler;
     const size_t index;
     vk::QueryPool query_pool;
+    static constexpr size_t COPY_STRIDE = 16; // result + availability, 64-bit each
+    vk::Buffer copy_buffer;                   // Intel fork L5: host-visible copy of the results
     std::array<u64, BANK_SIZE> host_results;
     u64 last_used_tick{};
 };
@@ -674,6 +807,34 @@ public:
     void PushUnsyncedQueries() override {
         PauseCounter();
         current_bank->Close();
+        // Intel fork L5: the results go to host memory on the GPU, read when the fence is done.
+        if (flag_map.load(std::memory_order_relaxed) == nullptr && IntelOccCopy(device) &&
+            !pending_flush_queries.empty()) {
+            bool any = false;
+            ApplyBanksWideOp<false>(
+                pending_flush_queries, [&any, this](SamplesQueryBank* bank, size_t start,
+                                                    size_t amount) {
+                    if (bank->HasCopy()) {
+                        if (!any) {
+                            scheduler.RequestOutsideRenderPassOperationContext();
+                            any = true;
+                        }
+                        bank->RecordCopy(start, amount);
+                    }
+                });
+            if (any) {
+                scheduler.Record([](vk::CommandBuffer cmdbuf) {
+                    const VkMemoryBarrier to_host{
+                        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                        .pNext = nullptr,
+                        .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                        .dstAccessMask = VK_ACCESS_HOST_READ_BIT,
+                    };
+                    cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_HOST_BIT, 0, to_host);
+                });
+            }
+        }
         {
             std::scoped_lock lk(flush_guard);
             pending_flush_sets.emplace_back(std::move(pending_flush_queries));
@@ -691,7 +852,9 @@ public:
         ApplyBanksWideOp<false>(
             current_flush_queries, [this, flags](SamplesQueryBank* bank, size_t start, size_t amount) {
                 if (flags == nullptr) {
-                    bank->Sync(start, amount);
+                    if (!bank->ReadCopied(start, amount)) {
+                        bank->Sync(start, amount);
+                    }
                     return;
                 }
                 // FRITCHII_OCCL_FLAG=1: query runs from the pool (never a slot no query ran in),
@@ -1045,7 +1208,7 @@ private:
     void ReserveBank() {
         current_bank_id =
             bank_pool.ReserveBank([this](std::deque<SamplesQueryBank>& queue, size_t index) {
-                queue.emplace_back(device, scheduler, index);
+                queue.emplace_back(device, scheduler, index, &memory_allocator);
             });
         if (current_bank) {
             current_bank->next_bank = current_bank_id + 1;
