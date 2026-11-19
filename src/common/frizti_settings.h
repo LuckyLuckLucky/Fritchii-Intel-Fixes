@@ -28,6 +28,7 @@ struct Record {
     std::map<std::string, std::string> global;   ///< label -> value written to qt-config.ini
     std::map<std::string, std::string> per_game; ///< label -> "global" or Ocarina's override
     bool oot_folded = false; ///< Ocarina's per-game settings were moved to the main ones once
+    u32 intel_revision = 0;  ///< Intel fork settings revision applied (intel_fork_revision=)
 };
 
 std::string SerializeRecord(const Record& record);

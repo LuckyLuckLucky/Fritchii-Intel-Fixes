@@ -12,6 +12,7 @@ constexpr std::string_view GlobalPrefix = "global.";
 constexpr std::string_view PerGamePrefix = "game.";
 constexpr std::string_view UseGlobal = "global";
 constexpr std::string_view FoldedKey = "oot_folded";
+constexpr std::string_view IntelRevisionKey = "intel_fork_revision";
 
 std::string_view Trim(std::string_view text) {
     while (!text.empty() && (text.front() == ' ' || text.front() == '\t')) {
@@ -57,6 +58,9 @@ std::string SerializeRecord(const Record& record) {
     if (record.oot_folded) {
         text += fmt::format("{}=1\n", FoldedKey);
     }
+    if (record.intel_revision != 0) {
+        text += fmt::format("{}={}\n", IntelRevisionKey, record.intel_revision);
+    }
     for (const auto& [label, value] : record.global) {
         text += fmt::format("{}{}={}\n", GlobalPrefix, label, value);
     }
@@ -86,6 +90,12 @@ Record ParseRecord(std::string_view text) {
             }
         } else if (key == FoldedKey) {
             record.oot_folded = value == "1";
+        } else if (key == IntelRevisionKey) {
+            try {
+                record.intel_revision = u32(std::stoul(value));
+            } catch (...) {
+                record.intel_revision = 0;
+            }
         } else if (key.starts_with(GlobalPrefix)) {
             record.global.insert_or_assign(std::string{key.substr(GlobalPrefix.size())}, value);
         } else if (key.starts_with(PerGamePrefix)) {

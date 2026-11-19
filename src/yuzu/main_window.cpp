@@ -918,9 +918,37 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
         }
     }
 
+    // Intel fork settings revision. This build is Intel-only, so no vendor detection is needed:
+    // the first start of a build with a higher IntelForkRevision than frizti.ini's records
+    // applies the tuned defaults (full) silently, without the prompt, then our Intel standard
+    // values below. Afterwards the normal path keeps the player's changes.
+    // INTEL_FORK_SETTINGS_REV=0 skips it (testing). Resetting: delete config/frizti.ini.
+    constexpr u32 IntelForkRevision = 1;
+    const bool intel_skip =
+        qEnvironmentVariable("INTEL_FORK_SETTINGS_REV").trimmed() == QStringLiteral("0");
+    const bool intel_apply = !intel_skip && record.intel_revision < IntelForkRevision;
+    if (intel_apply) {
+        if (!full && (stored != 0 || record.revision != 0)) {
+            const QString backup = FritchiiUi::BackupSettings();
+            LOG_INFO(Frontend, "Settings: Intel fork revision, previous settings saved in {}",
+                     backup.isEmpty() ? std::string{"(backup failed)"} : backup.toStdString());
+        }
+        full = true;
+    }
+
     auto changes = Frizti::ReconcileGlobal(tuned, record, full);
     for (auto& change : Frizti::FixDockedController(Settings::values)) {
         changes.push_back(std::move(change));
+    }
+    std::string intel_applied;
+    if (intel_apply) {
+        // Only what differs from the settings.h defaults that a full apply writes.
+        Settings::values.vsync_mode.SetValue(Settings::VSyncMode::Immediate);
+        Settings::values.oot_fps_asked.SetValue(true); // no 60/30 fps question (speed unchanged)
+        Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default);
+        Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Game);
+        intel_applied = "use_vsync=Immediate, oot_fps_asked=true, gpu_fence_behavior=Default, "
+                        "oot_anti_aliasing=Game";
     }
 
     // Ocarina's per-game config, loaded as a game boot does.
@@ -969,11 +997,14 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     // A newer Frizti build's revision is kept.
     const u32 revision = (std::max)(applied, Frizti::Revision);
     if (!changes.empty() || folded ||
-        Settings::values.frizti_settings_revision.GetValue() != revision) {
+        intel_apply || Settings::values.frizti_settings_revision.GetValue() != revision) {
         Settings::values.frizti_settings_revision.SetValue(revision);
         config->SaveAllValues();
     }
     record.revision = revision;
+    if (intel_apply) {
+        record.intel_revision = IntelForkRevision;
+    }
     if (folded) {
         record.oot_folded = true;
     }
@@ -982,6 +1013,11 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     SaveFriztiRecord(record);
     Config::on_written = RecordFriztiWrite;
 
+    if (intel_apply) {
+        LOG_INFO(Frontend,
+                 "Intel fork settings revision {} applied (first start of this build): {}",
+                 IntelForkRevision, intel_applied);
+    }
     if (full) {
         LOG_INFO(Frontend, "Frizti settings revision {} -> {}: {}", applied, revision,
                  changes.empty() ? std::string{"already set"} : Frizti::FormatChanges(changes));
