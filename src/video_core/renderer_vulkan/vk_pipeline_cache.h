@@ -291,11 +291,20 @@ private:
     [[nodiscard]] GraphicsPipeline* CurrentGraphicsPipelineClean(bool patch);
     /// The registers Refresh reads with these features, as (first word, words) ranges.
     /// `blend_by_value` (EXP50): the blend registers go to their own ranges.
-    void BuildCleanWatch(bool patch, bool blend_by_value, bool patch_vertex);
+    /// `vi_static` (INTEL_FORK_VI_STATIC_PATCH, static vertex input only): the vertex input
+    /// registers go to their own ranges (vi_ranges), patched instead of refreshed.
+    void BuildCleanWatch(bool patch, bool blend_by_value, bool patch_vertex, bool vi_static);
     [[nodiscard]] bool CleanInputsUnchanged() const;
     void TakeCleanSnapshot();
     [[nodiscard]] bool CleanBlendUnchanged() const;
     void TakeCleanBlendSnapshot();
+    [[nodiscard]] bool CleanViUnchanged() const;
+    void TakeCleanViSnapshot();
+    /// INTEL_FORK_VI_STATIC_PATCH: the vertex input part of FixedPipelineState::Refresh without
+    /// dynamic vertex input (attributes, divisors, enabled_divisors under a raised
+    /// Dirty::VertexInput, which it clears; strides without extended dynamic state; the static
+    /// vertex repack), in graphics_key, nothing else.
+    void PatchStaticVertexInput();
 
     struct CleanLookup {
         struct Range {
@@ -306,7 +315,16 @@ private:
         bool patch{};                  ///< Built for CurrentGraphicsPipelineClean(true)
         bool blend_by_value{};         ///< Built for EXP50: blend registers in blend_ranges
         bool patch_vertex{};           ///< Built for EXP55: vertex attribute formats left out
+        bool vi_static{};              ///< Built for INTEL_FORK_VI_STATIC_PATCH: vi_ranges
         std::vector<Range> ranges;     ///< Read by every Refresh
+        /// With vi_static: the vertex input registers (formats, instancing, divisors, strides).
+        std::vector<Range> vi_ranges;
+        std::vector<u32> vi_snapshot;  ///< vi_ranges' words the key's vertex input was made from
+        u64 vi_patched{};              ///< INTEL_FORK_VI_STATIC_PATCH: lookups patched
+        u64 vi_full{};                 ///< ... and full Refreshes, while the switch is on
+        u64 vi_mismatches{};           ///< =2: patched keys that differ from Refresh's (must be 0)
+        u32 vi_mismatches_logged{};
+        std::chrono::steady_clock::time_point vi_last_log{};
         std::vector<Range> xfb_ranges; ///< Read while transform feedback is enabled
         /// With blend_by_value: the registers the attachments and the dual-source bit come from.
         std::vector<Range> blend_ranges;

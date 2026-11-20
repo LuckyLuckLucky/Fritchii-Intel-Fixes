@@ -2916,7 +2916,8 @@ std::string DescribeProgramsKeyDiff(const GraphicsPipelineCacheKey& fast,
 }
 } // Anonymous namespace
 
-void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_vertex) {
+void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_vertex,
+                                    bool vi_static) {
     using Range = CleanLookup::Range;
     const Maxwell& regs = maxwell3d->regs;
     const DynamicFeatures& features = dynamic_features;
@@ -2970,15 +2971,20 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
         watch(rt.format);
     }
     watch(regs.point_size);
-    // Dirty::VertexInput (both branches) and the static vertex repack:
+    // Dirty::VertexInput (both branches) and the static vertex repack. INTEL_FORK_VI_STATIC_PATCH
+    // (static vertex input only): these go to vi_ranges, compared on their own; when only they
+    // (or Dirty::VertexInput) moved, PatchStaticVertexInput redoes that part of the key.
+    vi_static = vi_static && !features.has_dynamic_vertex_input;
+    std::vector<Range> vi_ranges;
+    std::vector<Range>& vertex_ranges = vi_static ? vi_ranges : ranges;
     if ((!patch && !patch_vertex) || !features.has_dynamic_vertex_input) {
-        watch(regs.vertex_attrib_format);
+        watch_into(vertex_ranges, regs.vertex_attrib_format);
     }
     const bool repack = !features.has_dynamic_vertex_input && features.has_static_vertex_repack;
     if (!features.has_dynamic_vertex_input) {
-        watch(regs.vertex_stream_instances);
+        watch_into(vertex_ranges, regs.vertex_stream_instances);
         for (const auto& stream : regs.vertex_streams) {
-            watch(stream.frequency);
+            watch_into(vertex_ranges, stream.frequency);
         }
     }
     if (!features.has_extended_dynamic_state || repack) {
@@ -2987,7 +2993,7 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
         for (const auto& stream : regs.vertex_streams) {
             const auto offset = static_cast<size_t>(reinterpret_cast<const char*>(&stream) -
                                                     reinterpret_cast<const char*>(&regs));
-            ranges.push_back({static_cast<u32>(offset / sizeof(u32)), 1});
+            vertex_ranges.push_back({static_cast<u32>(offset / sizeof(u32)), 1});
         }
     }
     // Dirty::ViewportSwizzles:
@@ -3084,6 +3090,12 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
         blend_words += range.count;
     }
     clean.blend_snapshot.assign(blend_words, 0);
+    clean.vi_ranges = merge(std::move(vi_ranges));
+    size_t vi_words = 0;
+    for (const Range& range : clean.vi_ranges) {
+        vi_words += range.count;
+    }
+    clean.vi_snapshot.assign(vi_words, 0);
     // FRITCHII_ONEF_KEY_KEEP: every word the compares read, for NoteRegWrite's count. The
     // snapshots are new (zeros): nothing is known until the next one is taken.
     {
@@ -3101,11 +3113,13 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
         mark(clean.ranges);
         mark(clean.xfb_ranges);
         mark(clean.blend_ranges);
+        mark(clean.vi_ranges);
         clean.key_seen = ~u64{0};
     }
     clean.built = true;
     clean.patch = patch;
     clean.patch_vertex = patch_vertex;
+    clean.vi_static = vi_static;
     clean.blend_by_value = blend_by_value;
     clean.pipeline = nullptr;
     LOG_INFO(Render_Vulkan,
@@ -3114,6 +3128,12 @@ void PipelineCache::BuildCleanWatch(bool patch, bool blend_by_value, bool patch_
              blend_by_value ? fmt::format(", {} blend words compared by value (EXP50)",
                                           blend_words)
                             : std::string{});
+    if (vi_static) {
+        LOG_INFO(Render_Vulkan,
+                 "INTEL_FORK_VI_STATIC_PATCH: {} vertex input words in {} ranges patched "
+                 "instead of refreshed",
+                 vi_words, clean.vi_ranges.size());
+    }
 }
 
 namespace {
@@ -3135,7 +3155,93 @@ u64 KeyWritesNow() noexcept {
                ? OneF::g_key_writes
                : ~u64{0};
 }
+/// INTEL_FORK_VI_STATIC_PATCH (read once, default 0): without dynamic vertex input, a clean
+/// lookup (EDEN_NX2_PIPELINE_CLEAN / EXP19) whose only moved inputs are the vertex input
+/// registers or Dirty::VertexInput patches the key's vertex input instead of a full Refresh.
+/// 2 = also run the full Refresh and compare the keys (mismatches must be 0; Refresh's key kept).
+int IntelForkViStaticPatch() {
+    static const int mode = [] {
+        const char* const value = std::getenv("INTEL_FORK_VI_STATIC_PATCH");
+        const int parsed = value == nullptr ? 0 : value[0] == '1' ? 1 : value[0] == '2' ? 2 : 0;
+        if (parsed != 0) {
+            LOG_INFO(Render_Vulkan, "INTEL_FORK_VI_STATIC_PATCH={}{}", parsed,
+                     parsed == 2 ? " (verify: every patch is checked against a full Refresh)"
+                                 : "");
+        }
+        return parsed;
+    }();
+    return mode;
+}
 } // Anonymous namespace
+
+bool PipelineCache::CleanViUnchanged() const {
+    const u32* const words = maxwell3d->regs.reg_array.data();
+    const u32* saved = clean.vi_snapshot.data();
+    for (const CleanLookup::Range& range : clean.vi_ranges) {
+        if (std::memcmp(words + range.first, saved, range.count * sizeof(u32)) != 0) {
+            return false;
+        }
+        saved += range.count;
+    }
+    return true;
+}
+
+void PipelineCache::TakeCleanViSnapshot() {
+    const u32* const words = maxwell3d->regs.reg_array.data();
+    u32* saved = clean.vi_snapshot.data();
+    for (const CleanLookup::Range& range : clean.vi_ranges) {
+        std::memcpy(saved, words + range.first, range.count * sizeof(u32));
+        saved += range.count;
+    }
+}
+
+// Line for line FixedPipelineState::Refresh's vertex input part without dynamic vertex input
+// (fixed_pipeline_state.cpp, the Dirty::VertexInput else branch, the strides without extended
+// dynamic state and the static repack at its end). Kept here so the shader stamp's files stay
+// as released; INTEL_FORK_VI_STATIC_PATCH=2 proves it builds Refresh's key byte for byte.
+// CanonicalizeNative touches none of these fields without dynamic vertex input.
+void PipelineCache::PatchStaticVertexInput() {
+    const Maxwell& regs = maxwell3d->regs;
+    auto& flags = maxwell3d->dirty.flags;
+    FixedPipelineState& state = graphics_key.state;
+    if (flags[Dirty::VertexInput]) {
+        flags[Dirty::VertexInput] = false;
+        state.enabled_divisors = 0;
+        for (size_t index = 0; index < Maxwell::NumVertexArrays; ++index) {
+            const bool is_enabled = regs.vertex_stream_instances.IsInstancingEnabled(index);
+            state.binding_divisors[index] = is_enabled ? regs.vertex_streams[index].frequency : 0;
+            state.enabled_divisors |= (is_enabled ? u64{1} : 0) << index;
+        }
+        for (size_t index = 0; index < Maxwell::NumVertexAttributes; ++index) {
+            const auto& input = regs.vertex_attrib_format[index];
+            auto& attribute = state.attributes[index];
+            attribute.raw = 0;
+            attribute.enabled.Assign(input.constant ? 0 : 1);
+            attribute.buffer.Assign(input.buffer);
+            attribute.offset.Assign(input.offset);
+            attribute.type.Assign(static_cast<u32>(input.type.Value()));
+            attribute.size.Assign(static_cast<u32>(input.size.Value()));
+        }
+    }
+    if (!state.extended_dynamic_state) {
+        std::ranges::transform(regs.vertex_streams, state.vertex_strides.begin(),
+                               [](const auto& array) {
+                                   return static_cast<u16>(array.stride.Value());
+                               });
+    }
+    if (!state.dynamic_vertex_input && dynamic_features.has_static_vertex_repack) {
+        const u32 repack_mask = VertexRepackMask(regs);
+        for (size_t index = 0; index < state.attributes.size(); ++index) {
+            const auto& input = regs.vertex_attrib_format[index];
+            state.attributes[index].offset.Assign(
+                RepackedVertexOffset(repack_mask, input.buffer, input.offset));
+        }
+        for (u32 binding = 0; binding < state.vertex_strides.size(); ++binding) {
+            state.vertex_strides[binding] = static_cast<u16>(
+                RepackedVertexStride(repack_mask, binding, regs.vertex_streams[binding].stride));
+        }
+    }
+}
 
 bool PipelineCache::CleanBlendUnchanged() const {
     const u32* const words = maxwell3d->regs.reg_array.data();
@@ -3194,6 +3300,7 @@ void PipelineCache::TakeCleanSnapshot() {
         }
     }
     TakeCleanBlendSnapshot(); // No ranges unless blend_by_value
+    TakeCleanViSnapshot();    // No ranges unless vi_static
     clean.key_seen = KeyWritesNow(); // FRITCHII_ONEF_KEY_KEEP: the snapshots are the registers
     clean.hashes = graphics_key.unique_hashes;
     clean.maxwell3d = maxwell3d;
@@ -3240,9 +3347,13 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     // Castle Town every "other state" refresh is vertex input (~20k/s). 2 = also run the full
     // Refresh after it and compare the keys (the verified/differ counts of the line).
     const int vertex_mode = VideoCore::Nx2Debug::Experiment(55);
+    // INTEL_FORK_VI_STATIC_PATCH (read once): the static vertex input counterpart of EXP55.
+    const int vi_static_mode =
+        dynamic_features.has_dynamic_vertex_input ? 0 : IntelForkViStaticPatch();
+    const bool vi_static = vi_static_mode != 0;
     if (!clean.built || clean.patch != patch || clean.blend_by_value != by_value ||
-        clean.patch_vertex != (vertex_mode != 0)) {
-        BuildCleanWatch(patch, by_value, vertex_mode != 0);
+        clean.patch_vertex != (vertex_mode != 0) || clean.vi_static != vi_static) {
+        BuildCleanWatch(patch, by_value, vertex_mode != 0, vi_static);
     }
     auto& flags = maxwell3d->dirty.flags;
     const bool dynamic_blend = dynamic_features.has_extended_dynamic_state_3_blend;
@@ -3251,6 +3362,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     const bool patch_blending = patch && !by_value && blending_dirty;
     const bool patch_vertex_input = (patch || vertex_mode != 0) && vertex_input_dirty &&
                                     dynamic_features.has_dynamic_vertex_input;
+    // A raised Dirty::VertexInput is no miss with vi_static: the patch below redoes that part.
+    const bool vi_flag_patchable = vi_static && vertex_input_dirty;
     // The first reason the last Refresh's key may not stand (index into clean.miss_reasons),
     // EDEN_NX2_EXP54 (live, 0 = off): with extended dynamic state 1 and 2 the key holds only the
     // topology's class (FixedPipelineState::KeyTopology) and the draw sets the topology itself, so
@@ -3279,8 +3392,8 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         miss = 1;
     } else if (blending_dirty && !patch_blending && !by_value) {
         miss = 2;
-    } else if ((vertex_input_dirty && !patch_vertex_input) || flags[Dirty::ViewportSwizzles] ||
-               topology_differs() ||
+    } else if ((vertex_input_dirty && !patch_vertex_input && !vi_flag_patchable) ||
+               flags[Dirty::ViewportSwizzles] || topology_differs() ||
                clean.engine_state != maxwell3d->engine_state ||
                (patch && !by_value &&
                 FixedPipelineState::DualSourceBlend(maxwell3d->regs) !=
@@ -3289,7 +3402,7 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         // Which part of "other state" (fable52_answer_2 Q3: the key holds the topology's class
         // under EDS1+2, this compares the raw topology): counted only, the first that differs.
         const size_t part =
-            (vertex_input_dirty && !patch_vertex_input) ? 0
+            (vertex_input_dirty && !patch_vertex_input && !vi_flag_patchable) ? 0
             : flags[Dirty::ViewportSwizzles]           ? 1
             : topology_differs()                                             ? 2
             : clean.engine_state != maxwell3d->engine_state                 ? 3
@@ -3321,6 +3434,10 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     if (key_skip) {
         ++clean.key_skipped;
     }
+    // INTEL_FORK_VI_STATIC_PATCH: every other Refresh input stands; the vertex input registers
+    // moved or Dirty::VertexInput is raised, so only that part of the key is redone (below).
+    const bool patch_static_vi =
+        miss < 0 && vi_static && (vertex_input_dirty || (!key_skip && !CleanViUnchanged()));
     bool patch_blend_value = false;
     // Only reached with EXP52 on: miss 1 catches a change of programs otherwise.
     const bool programs_only = miss < 0 && programs_changed;
@@ -3396,6 +3513,16 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
                          per_second(clean.key_skipped), per_second(clean.key_failed),
                          clean.key_failed_session);
             }
+            if (vi_static) {
+                LOG_INFO(Render_Vulkan,
+                         "Intel fork VI static patch {:.0f} s: patched {}/s, full refreshes {}/s, "
+                         "verify mismatches {} (must be 0)",
+                         seconds, per_second(clean.vi_patched), per_second(clean.vi_full),
+                         clean.vi_mismatches);
+            }
+            clean.vi_patched = 0;
+            clean.vi_full = 0;
+            clean.vi_mismatches = 0;
             clean.key_untouched = 0;
             clean.key_skipped = 0;
             clean.key_failed = 0;
@@ -3412,13 +3539,20 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
         }
     }
     if (clean.pipeline != nullptr && mesh_vertex_input_cleared &&
-        (patch_blending || patch_vertex_input || patch_blend_value || programs_only)) {
+        (patch_blending || patch_vertex_input || patch_blend_value || programs_only ||
+         patch_static_vi)) {
         // The patches edit a task/mesh key, which holds no vertex input (RefreshGraphicsKey):
         // new programs may read the registers' one, so the key is refreshed instead.
         clean.pipeline = nullptr;
     }
+    if (clean.pipeline != nullptr && patch_static_vi && MeshKeysDropVertexInput() &&
+        maxwell3d->GetNativeMacroEngine().native_turing && maxwell3d->regs.IsMeshEnabled()) {
+        // RefreshGraphicsKey would clear the vertex input of this task/mesh key: refreshed.
+        clean.pipeline = nullptr;
+    }
     if (clean.pipeline != nullptr) {
-        const bool patching = patch_blending || patch_vertex_input || patch_blend_value;
+        const bool patching =
+            patch_blending || patch_vertex_input || patch_blend_value || patch_static_vi;
         if (!patching && !programs_only) {
             current_pipeline->MarkUsed(frame_count);
             return BuiltPipeline(current_pipeline);
@@ -3429,6 +3563,17 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
             ++clean.patches;
         }
         clean.pipeline = nullptr;
+        // INTEL_FORK_VI_STATIC_PATCH=2: the key as this lookup found it (after RefreshStages)
+        // and the flag, for the full Refresh the patched key is compared with.
+        std::optional<GraphicsPipelineCacheKey> vi_before;
+        if (patch_static_vi) {
+            if (vi_static_mode == 2) {
+                vi_before = graphics_key;
+            }
+            PatchStaticVertexInput(); // Clears Dirty::VertexInput, as Refresh does here
+            TakeCleanViSnapshot();
+            ++clean.vi_patched;
+        }
         if (patch_vertex_input) {
             vertex_attribute_types = FixedPipelineState::DynamicAttributeTypes(maxwell3d->regs);
         }
@@ -3453,6 +3598,25 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
             }
             TakeCleanBlendSnapshot(); // No ranges unless by_value
         }
+        if (vi_before) {
+            // Verify: the full Refresh from the key and flag this lookup found must build the
+            // patched key (blend patches included), byte for byte. Refresh's key is kept.
+            const GraphicsPipelineCacheKey fast = graphics_key;
+            graphics_key = *vi_before;
+            flags[Dirty::VertexInput] = vertex_input_dirty;
+            RefreshGraphicsKey();
+            if (std::memcmp(&fast, &graphics_key, sizeof(fast)) != 0) {
+                ++clean.vi_mismatches;
+                if (clean.vi_mismatches_logged < 16) {
+                    ++clean.vi_mismatches_logged;
+                    LOG_WARNING(Render_Vulkan,
+                                "INTEL_FORK_VI_STATIC_PATCH=2: patched key differs from "
+                                "Refresh{} (VI flag {}):{}",
+                                fast == graphics_key ? " outside the hashed bytes" : "",
+                                vertex_input_dirty, DescribeProgramsKeyDiff(fast, graphics_key));
+                }
+            }
+        }
         if ((programs_only && programs_mode == 2) || (patch_vertex_input && vertex_mode == 2)) {
             // Verify: the full Refresh must build the same key, byte for byte. Its key is kept
             // (and its flag clears, as a miss would do them).
@@ -3475,6 +3639,9 @@ GraphicsPipeline* PipelineCache::CurrentGraphicsPipelineClean(bool patch) {
     } else {
         TakeCleanSnapshot();
         RefreshGraphicsKey();
+        if (vi_static) {
+            ++clean.vi_full;
+        }
     }
     if (current_pipeline) {
         GraphicsPipeline* const next{NextGraphicsPipeline()};
