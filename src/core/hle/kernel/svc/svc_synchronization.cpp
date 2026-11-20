@@ -3,6 +3,10 @@
 
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <string>
+
+#include "common/nx2_hitch.h"
 #include "common/scope_exit.h"
 #include "common/scratch_buffer.h"
 #include "core/core.h"
@@ -11,6 +15,7 @@
 #include "core/hle/kernel/k_readable_event.h"
 #include "core/hle/kernel/svc.h"
 #include "core/hle/kernel/svc_results.h"
+#include "core/hle/service/kernel_helpers.h"
 
 namespace Kernel::Svc {
 
@@ -94,7 +99,30 @@ Result WaitSynchronization(Core::System& system, int32_t* out_index, u64 user_ha
     }
 
     // Wait on the objects.
+    const auto wait_begin = std::chrono::steady_clock::now();
     Result res = KSynchronizationObject::Wait(system.Kernel(), out_index, objs.data(), num_handles, timeout);
+    // Intel fork: long waits go into the hitch line by what they waited on (class-2 spikes).
+    if (const u64 waited = static_cast<u64>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                               std::chrono::steady_clock::now() - wait_begin)
+                               .count());
+        waited >= 500'000) {
+        auto cause = Common::Nx2Hitch::Cause::GuestWaitOther;
+        for (auto i = 0; i < num_handles; ++i) {
+            const auto* event = objs[i]->DynamicCast<KReadableEvent*>();
+            if (event == nullptr) {
+                continue;
+            }
+            const std::string name = Service::KernelHelpers::DebugEventName(event);
+            if (name.find("yncpt") != std::string::npos || name.find("gsv") != std::string::npos) {
+                cause = Common::Nx2Hitch::Cause::GuestWaitGpu;
+                break;
+            }
+            if (name.find("Audio") != std::string::npos) {
+                cause = Common::Nx2Hitch::Cause::GuestWaitAudio;
+            }
+        }
+        Common::Nx2Hitch::Add(cause, waited);
+    }
 
     R_SUCCEED_IF(res == ResultSessionClosed);
     R_RETURN(res);

@@ -53,6 +53,11 @@ enum class Cause : u8 {
     TextureUpload,    ///< TextureCache::UploadImageContents (read, untile, staging write), bytes
     ZeroUpload,       ///< FRITCHII_ZERO_UPLOAD: the zero check of an upload, bytes looked at
     RecompileListed,  ///< Recompile of a FRITCHII_JIT_BLOCK_LIST block the warm-up had not reached
+    // Intel fork: guest WaitSynchronization of 0.5 ms or more, by the event's name (summed over
+    // threads; the longest single wait says what held a frame back)
+    GuestWaitGpu,     ///< syncpoint / gsv events: the guest waiting for the GPU
+    GuestWaitAudio,   ///< audio renderer events
+    GuestWaitOther,   ///< any other event or object
     Count,
 };
 
@@ -68,7 +73,9 @@ inline constexpr std::array<const char*, static_cast<size_t>(Cause::Count)> Caus
     "game code dropped by invalidations (blocks)", "game code dropped by fastmem faults (blocks)",
     "warm compiles refused (code cache full)", "staging buffers made",
     "texture uploads (CPU side)", "zero checks of texture uploads",
-    "recompiling listed game code the warm-up had not compiled yet (summed over cores)"};
+    "recompiling listed game code the warm-up had not compiled yet (summed over cores)",
+    "guest waits on the GPU (summed over threads)", "guest waits on audio (summed over threads)",
+    "guest waits on other events (summed over threads)"};
 
 struct Counters {
     std::array<std::atomic<u64>, static_cast<size_t>(Cause::Count)> ns{};
