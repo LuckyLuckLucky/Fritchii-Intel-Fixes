@@ -5078,6 +5078,13 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         LOG_WARNING(Render_Vulkan, "Pipeline cache: the last boot ended while building cached "
                                    "pipelines; building none at boot this time "
                                    "(INTEL_FORK_NO_CACHE_HARDENING=1 builds them)");
+        // Intel fork: skip once, not forever. This boot neither makes nor removes the marker, so
+        // a single crash used to switch the boot and background builds off for good: every
+        // session then translated ~1000 cached pipelines on the GPU thread in play (stutter when
+        // turning into busy areas). Removed here (under the lock), the next boot builds again.
+        if (boot_lock_held) {
+            Common::FS::RemoveFile(boot_marker);
+        }
     }
     size_t skipped_pipelines = 0;
     size_t queued_graphics = 0;
