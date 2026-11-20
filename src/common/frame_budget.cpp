@@ -2,6 +2,9 @@
 
 #include "common/lowend_sim.h"
 #include "common/frame_budget.h"
+#include "common/logging.h"
+#include <array>
+#include <cstdlib>
 
 #include <algorithm>
 #include <chrono>
@@ -265,5 +268,52 @@ Sample Take() {
     }
     return sample;
 }
+
+// Intel fork (2026-11-20, spike analysis): INTEL_FORK_BUDGET_LOG=<ms> (100-5000) logs the overlay's
+// sample (busiest thread per group + GPU + the overlay's limit rule) every <ms> from a thread of its
+// own, so frame-time spikes in a harness run can be matched with what held the frame. It takes the
+// samples itself: with the overlay open at the same time both see shorter windows. Off by default.
+namespace {
+struct BudgetLogger {
+    BudgetLogger() {
+        const char* const value = std::getenv("INTEL_FORK_BUDGET_LOG");
+        if (value == nullptr) {
+            return;
+        }
+        const int ms = std::atoi(value);
+        if (ms < 100 || ms > 5000) {
+            return;
+        }
+        std::thread([ms] {
+            std::this_thread::sleep_for(std::chrono::seconds{10}); // logging is up by then
+            SetWanted(true);
+            static_cast<void>(Take());
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds{ms});
+                const Sample s = Take();
+                if (!s.valid) {
+                    continue;
+                }
+                static constexpr std::array<const char*, Groups> names{"front", "back", "render",
+                                                                       "game"};
+                double top = s.gpu;
+                const char* limit = "gpu";
+                for (size_t i = 0; i < Groups; ++i) {
+                    if (s.busy[i] > top) {
+                        top = s.busy[i];
+                        limit = names[i];
+                    }
+                }
+                LOG_INFO(Render, "Intel fork frame budget {:.0f} ms: front {:.0f}% back {:.0f}% render "
+                                 "{:.0f}% game {:.0f}% gpu {:.0f}% cpu {:.0f}% -> limit {}",
+                         s.seconds * 1000.0, s.busy[0] * 100.0, s.busy[1] * 100.0,
+                         s.busy[2] * 100.0, s.busy[3] * 100.0, s.gpu * 100.0, s.cpu * 100.0,
+                         top >= 0.85 ? limit : "sync");
+            }
+        }).detach();
+    }
+};
+const BudgetLogger g_budget_logger;
+} // Anonymous namespace
 
 } // namespace Common::FrameBudget
