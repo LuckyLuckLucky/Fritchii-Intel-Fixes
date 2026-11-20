@@ -17,6 +17,14 @@
 #include "video_core/renderer_vulkan/vk_submit_times.h"
 #include "video_core/vulkan_common/vulkan_device.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+#include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
 namespace Vulkan {
 
 bool SubmitTimes::Enabled() {
@@ -462,7 +470,126 @@ void SlowGpu::Poll(MasterSemaphore& master, u64 now) {
     }
 }
 
+void SlowGpu::LaunchStats(const Entry& entry, u64 start_raw, u64 end_raw, u64 now) {
+    if (!launch_checked) {
+        launch_checked = true;
+        const char* const value = std::getenv("INTEL_FORK_LAUNCH_STATS");
+        launch_on = value != nullptr && value[0] == '1';
+        if (launch_on) {
+            const auto& dld = device->GetDispatchLoader();
+            calibrate_fn = dld.vkGetDeviceProcAddr != nullptr
+                               ? reinterpret_cast<void*>(dld.vkGetDeviceProcAddr(
+                                     *device->GetLogical(), "vkGetCalibratedTimestampsEXT"))
+                               : nullptr;
+            LOG_INFO(Render_Vulkan, "INTEL_FORK_LAUNCH_STATS: {}",
+                     calibrate_fn ? "on (calibrated timestamps)"
+                                  : "no vkGetCalibratedTimestampsEXT, off");
+            launch_on = calibrate_fn != nullptr;
+            launch_window_start = now;
+        }
+    }
+    if (!launch_on || entry.submit_ns == 0) {
+        return;
+    }
+    if (cal_at_ns == 0 || now - cal_at_ns > 500 * Ms) {
+        const VkCalibratedTimestampInfoEXT infos[2]{
+            {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr, VK_TIME_DOMAIN_DEVICE_EXT},
+            {VK_STRUCTURE_TYPE_CALIBRATED_TIMESTAMP_INFO_EXT, nullptr,
+             VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT}};
+        u64 stamps[2]{};
+        u64 deviation{};
+        const auto fn = reinterpret_cast<PFN_vkGetCalibratedTimestampsEXT>(calibrate_fn);
+        if (fn(*device->GetLogical(), 2, infos, stamps, &deviation) == VK_SUCCESS) {
+            LARGE_INTEGER freq;
+            QueryPerformanceFrequency(&freq);
+            cal_gpu_raw = stamps[0] & mask;
+            cal_cpu_ns = static_cast<double>(stamps[1]) * 1e9 / static_cast<double>(freq.QuadPart);
+            cal_at_ns = now;
+        }
+    }
+    if (cal_at_ns == 0) {
+        return;
+    }
+    const auto to_cpu = [&](u64 raw) {
+        const u64 delta = (raw - cal_gpu_raw) & mask;
+        const double ticks = delta > mask / 2 ? -static_cast<double>((cal_gpu_raw - raw) & mask)
+                                              : static_cast<double>(delta);
+        return cal_cpu_ns + ticks * period_ns;
+    };
+    static FILE* csv = [] {
+        const char* const path = std::getenv("INTEL_FORK_SUBMIT_CSV");
+        FILE* f = path != nullptr && path[0] != 0 ? std::fopen(path, "w") : nullptr;
+        if (f != nullptr) {
+            std::fprintf(f, "tick,start_ms,end_ms,submit_ms,gpu_us,launch_us,idle,draws,indirect_draws,dispatches,indirect_dispatches,"
+                            "render_passes,clears,fills,buffer_copies,image_uploads,image_downloads,image_copies,"
+                            "query_ops,barriers,barrier_items,pipeline_binds,texture_passes,presents,"
+                            "buffer_copy_kib,fill_kib,thread,site,finish\n");
+        }
+        return f;
+    }();
+    const double start_cpu = to_cpu(start_raw);
+    const double end_cpu = to_cpu(end_raw);
+    const double submit = static_cast<double>(entry.submit_ns);
+    ++launch_n;
+    if (launch_prev_end_cpu != 0.0 && launch_prev_end_cpu < submit) {
+        // The GPU had finished everything before this submit: an idle-queue launch.
+        ++launch_idle;
+        const double launch_us = (start_cpu - submit) / 1e3;
+        launch_idle_sum_us += launch_us;
+        launch_samples.push_back(static_cast<float>(launch_us));
+        launch_gap_cpu_ms += (submit - launch_prev_end_cpu) / 1e6;
+        launch_gap_launch_ms += (std::max)(0.0, start_cpu - submit) / 1e6;
+    }
+    if (csv != nullptr) {
+        const vk::CmdStats& c = entry.stats;
+        const bool idle = launch_prev_end_cpu != 0.0 && launch_prev_end_cpu < submit;
+        std::fprintf(csv, "%llu,%.3f,%.3f,%.3f,%.1f,%.1f,%d,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%llu,%llu,%s,%s:%u,%d\n",
+                     static_cast<unsigned long long>(entry.tick), start_cpu / 1e6, end_cpu / 1e6, submit / 1e6, (end_cpu - start_cpu) / 1e3,
+                     (start_cpu - submit) / 1e3, idle ? 1 : 0, c.draws, c.indirect_draws, c.dispatches,
+                     c.indirect_dispatches, c.render_passes, c.clears, c.fills, c.buffer_copies,
+                     c.image_uploads, c.image_downloads, c.image_copies, c.query_ops, c.barriers,
+                     c.barrier_items, c.pipeline_binds, c.texture_passes, c.presents,
+                     static_cast<unsigned long long>(c.buffer_copy_bytes >> 10),
+                     static_cast<unsigned long long>(c.fill_bytes >> 10), entry.origin.thread.data(),
+                     entry.origin.file != nullptr
+                         ? (std::strrchr(entry.origin.file, '/') ? std::strrchr(entry.origin.file, '/') + 1
+                                                                  : entry.origin.file)
+                         : "?",
+                     entry.origin.line, entry.origin.finish ? 1 : 0);
+    }
+    launch_prev_end_cpu = (std::max)(launch_prev_end_cpu, end_cpu);
+    if (now - launch_window_start >= Second) {
+        const double secs = static_cast<double>(now - launch_window_start) / 1e9;
+        float med = 0;
+        float p90 = 0;
+        if (!launch_samples.empty()) {
+            std::sort(launch_samples.begin(), launch_samples.end());
+            med = launch_samples[launch_samples.size() / 2];
+            p90 = launch_samples[launch_samples.size() * 9 / 10];
+        }
+        LOG_INFO(Render_Vulkan,
+                 "INTEL_FORK_LAUNCH_STATS {:.1f} s: {} submissions, {} to an idle queue; idle-queue "
+                 "launch (CPU submit -> GPU start) median {:.0f} us p90 {:.0f} us, {:.1f} ms/s; GPU "
+                 "idle gaps before them {:.1f} ms/s = CPU side (GPU done -> next submit) {:.1f} "
+                 "ms/s + launch {:.1f} ms/s",
+                 secs, launch_n, launch_idle, med, p90, launch_idle_sum_us / 1e3 / secs,
+                 (launch_gap_cpu_ms + launch_gap_launch_ms) / secs, launch_gap_cpu_ms / secs,
+                 launch_gap_launch_ms / secs);
+        if (csv != nullptr) {
+            std::fflush(csv);
+        }
+        launch_window_start = now;
+        launch_n = 0;
+        launch_idle = 0;
+        launch_idle_sum_us = 0;
+        launch_gap_cpu_ms = 0;
+        launch_gap_launch_ms = 0;
+        launch_samples.clear();
+    }
+}
+
 void SlowGpu::Process(const Entry& entry, u64 start_raw, u64 end_raw, u64 sequence, u64 now) {
+    LaunchStats(entry, start_raw, end_raw, now);
     const double start_ns = static_cast<double>(Unwrap(start_raw)) * period_ns;
     const double end_ns = static_cast<double>(Unwrap(end_raw)) * period_ns;
     const double gpu_ms = end_ns > start_ns ? (end_ns - start_ns) / 1e6 : 0.0;

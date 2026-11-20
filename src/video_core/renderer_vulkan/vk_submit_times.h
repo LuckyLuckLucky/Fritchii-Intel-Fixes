@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <vector>
+
 #include <array>
 #include <atomic>
 #include <memory>
@@ -173,6 +175,23 @@ private:
     u64 previous_end_ns{};     ///< the previous read submission's end (GPU clock, ns)
     u64 previous_sequence{~u64{0}};
     double offset_min{1e300};  ///< min over this window of GPU start - CPU submit (ns)
+    // INTEL_FORK_LAUNCH_STATS=1: calibrated CPU<->GPU clocks; per second: submissions to an idle queue,
+    // their CPU submit -> GPU start time (launch latency), the GPU idle gaps split in CPU side / launch.
+    void LaunchStats(const Entry& entry, u64 start_raw, u64 end_raw, u64 now);
+    bool launch_on{};
+    bool launch_checked{};
+    void* calibrate_fn{};
+    u64 cal_gpu_raw{};
+    double cal_cpu_ns{};
+    u64 cal_at_ns{};
+    double launch_prev_end_cpu{};
+    u64 launch_window_start{};
+    u32 launch_n{};
+    u32 launch_idle{};
+    double launch_idle_sum_us{};
+    double launch_gap_cpu_ms{};
+    double launch_gap_launch_ms{};
+    std::vector<float> launch_samples;
     double offset_min_previous{1e300};
 
     // Lines and the 10 s summary (worker only).
