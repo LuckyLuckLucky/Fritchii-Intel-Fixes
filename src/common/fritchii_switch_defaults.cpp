@@ -60,6 +60,11 @@ void LoadExperiments() {
         // predecessors). Castle Town live toggles: EXP43 0/3 46.3 -> 49.3 fps, EXP42 0/1 on top
         // 44.7 -> 47.9 (each won all 4 pairs); 21 loads 0 washed out; owner playtest: no visual
         // bugs, rarely under 40 fps.
+        // EXP33 = 3 (Intel fork, 2026-11-21, user-confirmed): only occlusion COUNTER reports wait for
+        // their fence; semaphore payloads land at once (Unfixedeward/Lichii e8908408ef). With Default
+        // fences (Intel settings revision 4) instead of Balanced: Hyrule day 28.5 -> 41.0, Kakariko
+        // 24.0 -> 38.6, Zora 33.1 -> 45.4 fps; sky-through-objects stays fixed (user judge).
+        g_experiments[33].store(3, std::memory_order_relaxed);
         g_experiments[42].store(1, std::memory_order_relaxed);
         g_experiments[43].store(3, std::memory_order_relaxed);
         // EXP56 = 1 (2026-11-09): a cleared depth target larger than its colour targets is not

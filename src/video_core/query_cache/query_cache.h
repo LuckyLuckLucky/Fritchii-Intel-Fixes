@@ -903,7 +903,13 @@ void QueryCacheBase<Traits>::CounterReportAt(GPUVAddr addr, std::optional<DAddr>
     // (as Balanced already does), and its fence is made and waited for even when empty
     // (g_signaling_query_report_fence). Both halves: the fence alone, with the query freed at
     // once, left a stale operation behind (three channels waiting forever on a semaphore).
-    const bool keep_fence_report = is_fence && VideoCore::Nx2Debug::Experiment(33) != 0;
+    // EXP33 = 3 (Intel fork, after Unfixedeward/Lichii intel-arc e8908408ef, EDEN_NX2_FENCE_REPORTS=1):
+    // only COUNTER reports (occlusion samples) wait for their fence; a semaphore payload is known
+    // when it is sent and still lands at once (holding it turns the acquires waiting on it into
+    // GPU round trips). For the Default fence behaviour, in place of Balanced's delay of everything.
+    const int exp33 = VideoCore::Nx2Debug::Experiment(33);
+    const bool keep_fence_report =
+        is_fence && exp33 != 0 && (exp33 != 3 || counter_type != QueryType::Payload);
     const bool is_synced = !keep_fence_report &&
                            (Settings::IsGPUFenceBehaviorDefault()
                                 ? !VideoCore::Nx2Debug::AccuratePart(1)

@@ -923,7 +923,7 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
     // applies the tuned defaults (full) silently, without the prompt, then our Intel standard
     // values below. Afterwards the normal path keeps the player's changes.
     // INTEL_FORK_SETTINGS_REV=0 skips it (testing). Resetting: delete config/frizti.ini.
-    constexpr u32 IntelForkRevision = 3; // 2: Balanced fences; 3: keep Fritchii's VSync default
+    constexpr u32 IntelForkRevision = 4; // 2: Balanced; 3: Fritchii VSync; 4: Default fences + EXP33=3
     const bool intel_skip =
         qEnvironmentVariable("INTEL_FORK_SETTINGS_REV").trimmed() == QStringLiteral("0");
     const bool intel_apply = !intel_skip && record.intel_revision < IntelForkRevision;
@@ -946,9 +946,9 @@ void MainWindow::MigrateFriztiSettings(FriztiStart start) {
         // Revision 3 (2026-11-20): VSync stays Fritchii's default (Mailbox): with VSync off and an
         // unlimited fps cap the game can crash right after a loading screen (Fritchii's note).
         Settings::values.oot_fps_asked.SetValue(true); // no 60/30 fps question (speed unchanged)
-        Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Balanced);
+        Settings::values.gpu_fence_behavior.SetValue(Settings::GpuFenceBehavior::Default); // rev 4
         Settings::values.oot_anti_aliasing.SetValue(Settings::OotAntiAliasing::Game);
-        intel_applied = "use_vsync=Fritchii default, oot_fps_asked=true, gpu_fence_behavior=Balanced, "
+        intel_applied = "use_vsync=Fritchii default, oot_fps_asked=true, gpu_fence_behavior=Default (rev 4, counter reports wait), "
                         "oot_anti_aliasing=Game";
     }
 
