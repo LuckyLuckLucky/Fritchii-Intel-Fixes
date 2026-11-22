@@ -150,6 +150,19 @@ inline s64 IntelForkAsyncBudgetUs() {
     return budget;
 }
 
+/// INTEL_FORK_ASYNC_MESH_SKIP (read once, default 0), with INTEL_FORK_ASYNC_MODE: 0 = mesh draws wait
+/// (Lichii's default); 1 = a mesh draw is judged by the same rule as other draws (depth-tested,
+/// colour only into targets written in an earlier frame); 2 = Lichii's skip_unbuilt_mesh_draws
+/// (every unbuilt native mesh draw is skipped).
+inline int IntelForkAsyncMeshSkip() {
+    static const int mode = [] {
+        const char* const v = std::getenv("INTEL_FORK_ASYNC_MESH_SKIP");
+        const int m = v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
+        return m >= 0 && m <= 2 ? m : 0;
+    }();
+    return mode;
+}
+
 /// INTEL_FORK_ASYNC_MODE: hands the class of the draw just looked up to the next
 /// PipelineBuild::WaitFor on this thread (PipelineCache passes it through
 /// GraphicsPipeline::WaitBuiltFor with a zero timeout, so no shader-stamped file changes).

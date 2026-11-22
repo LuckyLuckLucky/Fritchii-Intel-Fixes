@@ -9463,8 +9463,14 @@ LichiiDrawClass PipelineCache::ClassifyLichiiDraw() const {
                regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
                regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
     };
+    // INTEL_FORK_ASYNC_MESH_SKIP: 2 = Lichii's skip_unbuilt_mesh_draws (L:vk_pipeline_cache.cpp:2715),
+    // 1 = mesh draws judged by the rule below like any other draw, 0 = mesh draws wait.
+    const int mesh_skip = IntelForkAsyncMeshSkip();
+    if (mesh_skip == 2 && regs.IsMeshEnabled()) {
+        return LichiiDrawClass::Skip;
+    }
     return ClassifyLichiiNativeDraw(
-        regs.zeta_enable != 0, regs.depth_test_enable != 0, regs.IsMeshEnabled(),
+        regs.zeta_enable != 0, regs.depth_test_enable != 0, regs.IsMeshEnabled() && mesh_skip == 0,
         (std::min)(static_cast<u32>(regs.rt_control.count),
                    static_cast<u32>(Maxwell::NumRenderTargets)),
         [&regs](u32 i) { return static_cast<u32>(regs.rt_control.Map(i)); }, writes_color,
