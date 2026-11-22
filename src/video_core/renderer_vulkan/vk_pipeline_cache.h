@@ -373,6 +373,24 @@ private:
 
     [[nodiscard]] GraphicsPipeline* BuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
 
+    /// INTEL_FORK_ASYNC_MODE (Intel's Windows driver only, Off elsewhere; set by the
+    /// constructor): dry, lichii or lichii-bounded hand every unbuilt pipeline to
+    /// LichiiBuiltPipeline instead of DrawMayBeSkipped / WaitBudgetSkips.
+    IntelForkAsyncMode async_mode{IntelForkAsyncMode::Off};
+    /// Port of Lichii build-386 PipelineCache::BuiltPipeline (L:vk_pipeline_cache.cpp:2720-2799)
+    /// for an unbuilt `pipeline`: the pipeline (the draw waits) or nullptr (the draw is skipped).
+    /// Dry always returns the pipeline. GPU thread (the thread that looks pipelines up).
+    [[nodiscard]] GraphicsPipeline* LichiiBuiltPipeline(GraphicsPipeline* pipeline) const noexcept;
+    /// Lichii's verdict on the current draw (Skip, or why it waits).
+    [[nodiscard]] LichiiDrawClass ClassifyLichiiDraw() const;
+    /// lichii-bounded: the wait budget left in frame `frame` (Lichii's native_wait_budget_us,
+    /// reset each frame).
+    struct LichiiBudget {
+        u64 frame{~u64{0}};
+        s64 left_us{};
+    };
+    mutable LichiiBudget lichii_budget;
+
     /// Whether the current draw may be skipped while its pipeline is not ready (native draws
     /// unless EDEN_NX2_ASYNC_DISCARD=0, and the legacy heuristic; full-screen passes never; with
     /// EDEN_NX2_ASYNC_DISCARD=2 only into recurring render targets). The one test BuiltPipeline

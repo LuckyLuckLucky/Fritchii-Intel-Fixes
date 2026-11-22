@@ -581,6 +581,21 @@ void NoteSkippedLookup() {
     }
 }
 
+/// INTEL_FORK_ASYNC_MODE: the mode on this device (Intel's Windows driver only).
+IntelForkAsyncMode IntelForkAsyncModeFor(const Device& device) {
+    return device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS
+               ? IntelForkAsyncModeSetting()
+               : IntelForkAsyncMode::Off;
+}
+
+/// INTEL_FORK_ASYNC_MODE: records `verdict` on the pipeline's build, for the held time the
+/// recording thread counts in WaitForDraw (t_lichii_attach rides a zero-timeout WaitBuiltFor).
+void AttachLichiiVerdict(const GraphicsPipeline& pipeline, LichiiDrawClass verdict) {
+    t_lichii_attach = 1u << static_cast<u32>(verdict);
+    [[maybe_unused]] const bool built = pipeline.WaitBuiltFor(std::chrono::nanoseconds{0});
+    t_lichii_attach = 0;
+}
+
 /// EDEN_NX2_ASYNC_TRANSLATE: translations in flight at most (each holds its constant buffer
 /// copies until translated), how long a draw that must not be skipped waits for one before
 /// building its pipeline itself, unusable translations of a key before it is built on the GPU
@@ -1083,7 +1098,36 @@ bool IntelForkSyncShaders(const Device& device) {
         return false;
     }
     const char* const v = std::getenv("INTEL_FORK_ASYNC_SHADERS");
-    const bool sync = v == nullptr || v[0] != '1';
+    // INTEL_FORK_ASYNC_MODE (pipeline_build.h): lichii and lichii-bounded turn asynchronous
+    // shaders on; dry keeps them off whatever INTEL_FORK_ASYNC_SHADERS says (every draw waits).
+    const IntelForkAsyncMode async_mode = IntelForkAsyncModeSetting();
+    const bool lichii = async_mode == IntelForkAsyncMode::Lichii ||
+                        async_mode == IntelForkAsyncMode::LichiiBounded;
+    const bool sync =
+        !lichii && (async_mode == IntelForkAsyncMode::Dry || v == nullptr || v[0] != '1');
+    {
+        const char* const raw = std::getenv("INTEL_FORK_ASYNC_MODE");
+        static constexpr std::array<const char*, 4> what{
+            "as before (async shaders off on Intel unless INTEL_FORK_ASYNC_SHADERS=1)",
+            "every draw waits as before; unbuilt draws are classified by Lichii build-386's skip "
+            "rule (\"Intel fork Lichii skip dry\" every 10 s)",
+            "async shaders on; an unbuilt draw is skipped only by Lichii build-386's Skip rule "
+            "(depth-tested, not mesh, colour only into targets written in an earlier frame), "
+            "every other draw waits",
+            "async shaders on; as lichii, but a skippable draw first waits what is left of a "
+            "per-frame budget",
+        };
+        LOG_INFO(Render_Vulkan,
+                 "Intel fork async mode: INTEL_FORK_ASYNC_MODE={} -> {}: {}{} | budget {} ms a "
+                 "frame",
+                 raw != nullptr ? raw : "(unset)", IntelForkAsyncModeName(async_mode),
+                 what[static_cast<size_t>(async_mode)],
+                 raw != nullptr && async_mode == IntelForkAsyncMode::Off &&
+                         std::string_view{raw} != "off"
+                     ? " (unknown value: off)"
+                     : "",
+                 IntelForkAsyncBudgetUs() / 1000);
+    }
     const auto env_is = [](const char* name, char c) {
         const char* const e = std::getenv(name);
         return e != nullptr && e[0] == c;
@@ -1095,7 +1139,7 @@ bool IntelForkSyncShaders(const Device& device) {
              "own pipeline cache file {} (cap {} MiB) | occlusion slots {}",
              env_is("INTEL_FORK_SAFE_SHUFFLE", '0') ? "OFF" : "on",
              device.IsExtVertexInputDynamicStateSupported() ? "on" : "OFF",
-             sync ? "OFF (forced on Intel)" : "user setting",
+             sync ? "OFF (forced on Intel)" : lichii ? "on (INTEL_FORK_ASYNC_MODE)" : "user setting",
              env_is("INTEL_FORK_EQUAL_DEPTH_BIAS", '1') ? "on" : "OFF",
              env_is("INTEL_FORK_TEXARRAY_BOUND", '1') ? "on" : "OFF",
              NanGuardEnabled() ? "on" : "OFF", NanGuardMode(),
@@ -1173,6 +1217,10 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
               "VkPipelineBuilder", {}, Common::ThreadPlacement::Background),
       serialization_thread(1, "VkPipelineSerialization", {},
                            Common::ThreadPlacement::Background) {
+    async_mode = IntelForkAsyncModeFor(device);
+    if (async_mode != IntelForkAsyncMode::Off) {
+        LichiiSkipStats::Get().SetMode(async_mode);
+    }
     const auto& float_control{device.FloatControlProperties()};
     const VkDriverId driver_id{device.GetDriverID()};
     const VkShaderStageFlags subgroup_stages{device.GetSubgroupSupportedStages()};
@@ -1461,7 +1509,13 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
     // EDEN_NX2_ASYNC_TRANSLATE=1/2: new pipelines of draws that may be skipped are translated on
     // threads of their own. It relies on the asynchronous shaders' draw skipping.
     if (VideoCommon::AsyncTranslateWorkers()) {
-        if (use_asynchronous_shaders) {
+        if (use_asynchronous_shaders && async_mode != IntelForkAsyncMode::Off) {
+            // Its draws are skipped by DrawMayBeSkipped, our own rule: Lichii translates on the
+            // GPU thread's lookup and skips only by its rule, so the queue stays off.
+            LOG_INFO(Render_Vulkan, "EDEN_NX2_ASYNC_TRANSLATE: off with INTEL_FORK_ASYNC_MODE={} "
+                                    "(translating on the GPU thread)",
+                     IntelForkAsyncModeName(async_mode));
+        } else if (use_asynchronous_shaders) {
             const size_t threads = TranslateThreads();
             translate_queue = std::make_unique<TranslateQueue>(
                 threads, MaxTranslationsInFlight,
@@ -9368,6 +9422,12 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
     if (pipeline->IsBuilt()) {
         return pipeline;
     }
+    if (async_mode != IntelForkAsyncMode::Off) [[unlikely]] {
+        // INTEL_FORK_ASYNC_MODE: Lichii build-386's rule only. DrawMayBeSkipped (with
+        // EDEN_NX2_ASYNC_DISCARD and FRITCHII_ASYNC_REDRAWN / _DEPTH) and WaitBudgetSkips
+        // (FRITCHII_PIPELINE_WAIT_BUDGET) are not asked.
+        return LichiiBuiltPipeline(pipeline);
+    }
     if (!use_asynchronous_shaders) {
         return pipeline;
     }
@@ -9383,6 +9443,92 @@ GraphicsPipeline* PipelineCache::BuiltPipeline(GraphicsPipeline* pipeline) const
         return nullptr;
     }
     return pipeline;
+}
+
+LichiiDrawClass PipelineCache::ClassifyLichiiDraw() const {
+    const auto& regs = maxwell3d->regs;
+    if (!maxwell3d->GetNativeMacroEngine().native_turing) {
+        // Lichii judges non-native draws by the legacy heuristic in every mode (its
+        // CanDiscardPendingDraw with native = false: depth buffer bound, or more than 6 elements).
+        const u32 count = maxwell3d->draw_manager.draw_state.draw_element_count;
+        return CanDiscardPendingDraw(false, regs.zeta_enable != 0, count, count)
+                   ? LichiiDrawClass::Skip
+                   : LichiiDrawClass::Other;
+    }
+    // L:vk_pipeline_cache.cpp:2744-2764: zeta_enable and depth_test_enable (a bound depth buffer
+    // alone does not count), not a mesh draw, and colour written only into render targets first
+    // written in an earlier frame (TextureCache::ColorTargetWrittenBeforeThisFrame).
+    const auto writes_color = [&regs](u32 rt_index) {
+        return rt_index < Maxwell::NumRenderTargets &&
+               regs.rt[rt_index].format != Tegra::RenderTargetFormat::NONE &&
+               regs.color_mask[regs.color_mask_common ? 0 : rt_index].raw != 0;
+    };
+    return ClassifyLichiiNativeDraw(
+        regs.zeta_enable != 0, regs.depth_test_enable != 0, regs.IsMeshEnabled(),
+        (std::min)(static_cast<u32>(regs.rt_control.count),
+                   static_cast<u32>(Maxwell::NumRenderTargets)),
+        [&regs](u32 i) { return static_cast<u32>(regs.rt_control.Map(i)); }, writes_color,
+        [this](u32 rt_index) { return texture_cache.ColorTargetWrittenBeforeThisFrame(rt_index); });
+}
+
+GraphicsPipeline* PipelineCache::LichiiBuiltPipeline(GraphicsPipeline* pipeline) const noexcept {
+    // Port of Lichii build-386 BuiltPipeline (L:vk_pipeline_cache.cpp:2720-2799) with
+    // native_async_draws = Skip (lichii) or Bounded (lichii-bounded), and as a count only (dry).
+    // Lichii's skip_unbuilt_mesh_draws (default off) and render-follower lend are not ported.
+    auto& stats = LichiiSkipStats::Get();
+    const LichiiDrawClass verdict = ClassifyLichiiDraw();
+    const auto wait = [&] {
+        // The draw waits for the build where it is recorded (Configure's WaitForDraw).
+        AttachLichiiVerdict(*pipeline, verdict);
+        stats.NoteLookup(verdict, LichiiSkipStats::Lookup::Waited);
+        return pipeline;
+    };
+    if (async_mode == IntelForkAsyncMode::Dry) {
+        return wait();
+    }
+    const bool can_discard = verdict == LichiiDrawClass::Skip;
+    bool discard = can_discard;
+    if (maxwell3d->GetNativeMacroEngine().native_turing) {
+        const NativePendingMode mode = async_mode == IntelForkAsyncMode::LichiiBounded
+                                           ? NativePendingMode::Bounded
+                                           : NativePendingMode::Skip;
+        // Lichii resets the budget in TickFrame; here on the frame's first unbuilt lookup.
+        if (lichii_budget.frame != frame_count) {
+            lichii_budget.frame = frame_count;
+            lichii_budget.left_us = IntelForkAsyncBudgetUs();
+        }
+        switch (DecideNativePending(mode, can_discard, lichii_budget.left_us)) {
+        case NativeDrawAction::Wait:
+            discard = false;
+            break;
+        case NativeDrawAction::Skip:
+            discard = true;
+            break;
+        case NativeDrawAction::WaitTimed: {
+            s64 used_us = 0;
+            const bool built = WaitWithinBudget(lichii_budget.left_us, used_us,
+                                                [&](std::chrono::microseconds timeout) {
+                                                    return pipeline->WaitBuiltFor(timeout);
+                                                });
+            stats.NoteBoundedWait(used_us);
+            if (built) {
+                stats.NoteLookup(verdict, LichiiSkipStats::Lookup::BoundedBuilt);
+                return pipeline;
+            }
+            discard = true;
+            break;
+        }
+        }
+    }
+    if (!discard) {
+        return wait();
+    }
+    // Skipped: the rasterizer returns at "no pipeline", before any render target, buffer, query
+    // or transform feedback work (as L:vk_rasterizer.cpp:1159-1181).
+    AttachLichiiVerdict(*pipeline, verdict);
+    stats.NoteLookup(verdict, LichiiSkipStats::Lookup::Skipped);
+    NoteSkippedLookup();
+    return nullptr;
 }
 
 bool PipelineCache::WaitBudgetSkips(const GraphicsPipeline& pipeline) const {

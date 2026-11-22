@@ -167,6 +167,10 @@ struct ImageBase {
     u64 last_write_frame = ~u64{0};
     /// Consecutive render frames with a write, up to last_write_frame (NextWriteStreak).
     u32 write_streak = 0;
+    /// INTEL_FORK_ASYNC_MODE (Lichii build-386 first_written_frame, image_base.h:146): the render
+    /// frame (RenderFrame) a draw first wrote it as a render target (not a clear, blit, copy or
+    /// DMA), ~0 = never. Set once; only a move to a new address (relocation) resets it.
+    u64 first_write_frame = ~u64{0};
     u8 relocation_guard_noted = 0;
     /// FRITCHII_COVERED_RETIRE: the frame a newer image last came to overlap this one (a bad
     /// overlap in JoinImages), and the frame its coverage was last checked.

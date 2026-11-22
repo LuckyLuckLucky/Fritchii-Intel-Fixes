@@ -3,7 +3,9 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
@@ -11,6 +13,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <string_view>
 #include <utility>
 
 #include "common/common_types.h"
@@ -94,6 +97,183 @@ private:
     s64 max_held_ns{};
 };
 
+/// Intel fork (2026-11-22): INTEL_FORK_ASYNC_MODE (read once), Lichii build-386's draw skip.
+/// off (unset) = as before: asynchronous shaders off on Intel, every draw waits.
+/// dry = every draw waits as before; each lookup of an unbuilt pipeline is classified with
+///       Lichii's rule and the held time counted by class ("Intel fork Lichii skip dry").
+/// lichii = asynchronous shaders on; Lichii's native_async_draws = Skip rule only.
+/// lichii-bounded = as lichii, but a draw Lichii may skip first waits what is left of a per-frame
+///       budget (INTEL_FORK_ASYNC_BUDGET_MS, default 8, Lichii's native_pipeline_wait_ms).
+enum class IntelForkAsyncMode : int { Off, Dry, Lichii, LichiiBounded };
+
+inline IntelForkAsyncMode IntelForkAsyncModeSetting() {
+    static const IntelForkAsyncMode mode = [] {
+        const char* const v = std::getenv("INTEL_FORK_ASYNC_MODE");
+        if (v == nullptr) {
+            return IntelForkAsyncMode::Off;
+        }
+        const std::string_view value{v};
+        if (value == "dry") {
+            return IntelForkAsyncMode::Dry;
+        }
+        if (value == "lichii") {
+            return IntelForkAsyncMode::Lichii;
+        }
+        if (value == "lichii-bounded") {
+            return IntelForkAsyncMode::LichiiBounded;
+        }
+        return IntelForkAsyncMode::Off;
+    }();
+    return mode;
+}
+
+inline const char* IntelForkAsyncModeName(IntelForkAsyncMode mode) {
+    switch (mode) {
+    case IntelForkAsyncMode::Dry:
+        return "dry";
+    case IntelForkAsyncMode::Lichii:
+        return "lichii";
+    case IntelForkAsyncMode::LichiiBounded:
+        return "lichii-bounded";
+    default:
+        return "off";
+    }
+}
+
+/// INTEL_FORK_ASYNC_BUDGET_MS (read once, default 8): lichii-bounded's wait budget per frame, in us.
+inline s64 IntelForkAsyncBudgetUs() {
+    static const s64 budget = [] {
+        const char* const v = std::getenv("INTEL_FORK_ASYNC_BUDGET_MS");
+        const int ms = v != nullptr && v[0] != '\0' ? std::atoi(v) : 8;
+        return static_cast<s64>(ms > 0 ? ms : 0) * 1000;
+    }();
+    return budget;
+}
+
+/// INTEL_FORK_ASYNC_MODE: hands the class of the draw just looked up to the next
+/// PipelineBuild::WaitFor on this thread (PipelineCache passes it through
+/// GraphicsPipeline::WaitBuiltFor with a zero timeout, so no shader-stamped file changes).
+/// 0 = nothing to hand over, else 1 << LichiiDrawClass.
+inline thread_local u32 t_lichii_attach = 0;
+
+/// INTEL_FORK_ASYNC_MODE counts, one line per 10 s window. Lookups are noted on the thread that
+/// looks pipelines up (GPU thread), holds where the draw waits (the recording thread, WaitForDraw).
+class LichiiSkipStats {
+public:
+    enum class Lookup { Waited, Skipped, BoundedBuilt };
+
+    static LichiiSkipStats& Get() {
+        static LichiiSkipStats stats;
+        return stats;
+    }
+
+    void SetMode(IntelForkAsyncMode value) {
+        mode.store(static_cast<int>(value), std::memory_order_relaxed);
+    }
+
+    bool Enabled() const {
+        return mode.load(std::memory_order_relaxed) != 0;
+    }
+
+    /// A lookup of an unbuilt pipeline: its class and what was done with it.
+    void NoteLookup(LichiiDrawClass verdict, Lookup what) {
+        std::scoped_lock lock{mutex};
+        ++lookups[static_cast<size_t>(verdict)];
+        if (what == Lookup::Skipped) {
+            ++skipped;
+            ++session_skipped;
+        } else if (what == Lookup::BoundedBuilt) {
+            ++bounded_built;
+        }
+        MaybeLog();
+    }
+
+    /// lichii-bounded: one wait within the frame's budget.
+    void NoteBoundedWait(s64 used_us) {
+        std::scoped_lock lock{mutex};
+        ++bounded_waits;
+        bounded_us += used_us;
+    }
+
+    /// A draw held for its pipeline (WaitForDraw), by the class its pipeline's lookups gave.
+    void NoteHeld(LichiiDrawClass verdict, s64 held_ns) {
+        std::scoped_lock lock{mutex};
+        ++holds[static_cast<size_t>(verdict)];
+        held_ns_by[static_cast<size_t>(verdict)] += held_ns > 0 ? held_ns : 0;
+        MaybeLog();
+    }
+
+private:
+    void MaybeLog() {
+        const s64 now = BuildClockNs();
+        if (window_start == 0) {
+            window_start = now;
+        }
+        if (now - window_start < 10'000'000'000LL) {
+            return;
+        }
+        using C = LichiiDrawClass;
+        const auto n = [&](C c) { return lookups[static_cast<size_t>(c)]; };
+        const auto ms = [&](C c) { return held_ns_by[static_cast<size_t>(c)] / 1e6; };
+        u64 total = 0;
+        for (const u64 count : lookups) {
+            total += count;
+        }
+        const u64 wait_lookups = n(C::NoDepthTest) + n(C::Mesh) + n(C::NoColour) +
+                                 n(C::NewTarget) + n(C::Other);
+        const double wait_ms =
+            ms(C::NoDepthTest) + ms(C::Mesh) + ms(C::NoColour) + ms(C::NewTarget) + ms(C::Other);
+        const double seconds = (now - window_start) / 1e9;
+        const auto current = static_cast<IntelForkAsyncMode>(mode.load(std::memory_order_relaxed));
+        if (current == IntelForkAsyncMode::Dry) {
+            LOG_INFO(Render_Vulkan,
+                     "Intel fork Lichii skip dry ({:.1f} s): {} unbuilt draws | would skip {} "
+                     "({:.0f} ms held) | would wait {} ({:.0f} ms held): no depth test {}, mesh "
+                     "{}, no colour {}, new target {}, other {} | held ms by reason: no depth "
+                     "test {:.0f}, mesh {:.0f}, no colour {:.0f}, new target {:.0f}, other {:.0f} "
+                     "| holds no lookup classified {} ({:.0f} ms)",
+                     seconds, total, n(C::Skip), ms(C::Skip), wait_lookups, wait_ms,
+                     n(C::NoDepthTest), n(C::Mesh), n(C::NoColour), n(C::NewTarget), n(C::Other),
+                     ms(C::NoDepthTest), ms(C::Mesh), ms(C::NoColour), ms(C::NewTarget),
+                     ms(C::Other), holds[static_cast<size_t>(C::Unclassified)],
+                     ms(C::Unclassified));
+        } else {
+            LOG_INFO(Render_Vulkan,
+                     "Intel fork Lichii skip {} ({:.1f} s): {} unbuilt draws | skipped {} | built "
+                     "within the budget {} ({} waits, {:.1f} ms) | waited {} ({:.0f} ms held): no "
+                     "depth test {}, mesh {}, no colour {}, new target {}, other {} | held ms by "
+                     "reason: no depth test {:.0f}, mesh {:.0f}, no colour {:.0f}, new target "
+                     "{:.0f}, other {:.0f} | holds of skippable-only pipelines {} ({:.0f} ms), "
+                     "no lookup classified {} ({:.0f} ms) | {} skipped this session",
+                     IntelForkAsyncModeName(current), seconds, total, skipped, bounded_built,
+                     bounded_waits, bounded_us / 1e3, wait_lookups, wait_ms, n(C::NoDepthTest),
+                     n(C::Mesh), n(C::NoColour), n(C::NewTarget), n(C::Other), ms(C::NoDepthTest),
+                     ms(C::Mesh), ms(C::NoColour), ms(C::NewTarget), ms(C::Other),
+                     holds[static_cast<size_t>(C::Skip)], ms(C::Skip),
+                     holds[static_cast<size_t>(C::Unclassified)], ms(C::Unclassified),
+                     session_skipped);
+        }
+        lookups = {};
+        holds = {};
+        held_ns_by = {};
+        skipped = bounded_built = bounded_waits = 0;
+        bounded_us = 0;
+        window_start = now;
+    }
+
+    std::atomic<int> mode{};
+    std::mutex mutex;
+    s64 window_start{};
+    std::array<u64, LichiiDrawClassCount> lookups{};
+    std::array<u64, LichiiDrawClassCount> holds{};
+    std::array<s64, LichiiDrawClassCount> held_ns_by{};
+    u64 skipped{};
+    u64 bounded_built{};
+    u64 bounded_waits{};
+    s64 bounded_us{};
+    u64 session_skipped{};
+};
+
 class EmissionBudget {
 public:
     class Reservation {
@@ -170,6 +350,10 @@ class PipelineBuild {
         std::atomic_bool claimed{};
         std::atomic_bool complete{};
         std::atomic_bool promoted{};
+        /// INTEL_FORK_ASYNC_MODE: the classes (bits, 1 << LichiiDrawClass) of the lookups that
+        /// found this build unfinished, and the first wait reason among them (class + 1, 0 = none).
+        std::atomic<u32> lichii_classes{};
+        std::atomic<u32> lichii_first_wait{};
         Common::ThreadWorker* workers{};
         s64 queued_ns{};
         std::atomic<s64> start_ns{};
@@ -248,12 +432,37 @@ public:
         const s64 finish = shared->end_ns.load(std::memory_order_relaxed);
         BuildWaitStats::Get().Note(was_queued, ran_inline, end - begin, start - shared->queued_ns,
                                    finish - start);
+        if (auto& lichii = LichiiSkipStats::Get(); lichii.Enabled()) [[unlikely]] {
+            // Held for a wait-class lookup if any lookup of this build was one (Lichii would wait
+            // there too); "skip" only when every lookup that found it unbuilt was skippable.
+            const u32 first_wait = shared->lichii_first_wait.load(std::memory_order_relaxed);
+            const u32 classes = shared->lichii_classes.load(std::memory_order_relaxed);
+            const LichiiDrawClass verdict =
+                first_wait != 0 ? static_cast<LichiiDrawClass>(first_wait - 1)
+                : (classes & 1u) != 0 ? LichiiDrawClass::Skip
+                                      : LichiiDrawClass::Unclassified;
+            lichii.NoteHeld(verdict, end - begin);
+        }
     }
 
     /// Waits at most `timeout` for the build, never running it on this thread (one build can
     /// take seconds). True once built.
     bool WaitFor(std::chrono::nanoseconds timeout) const {
         const auto shared = state;
+        if (const u32 attach = t_lichii_attach; attach != 0) [[unlikely]] {
+            // INTEL_FORK_ASYNC_MODE: a lookup hands over its draw's class (see t_lichii_attach).
+            t_lichii_attach = 0;
+            shared->lichii_classes.fetch_or(attach, std::memory_order_relaxed);
+            if (const u32 wait_bits = attach & ~1u; wait_bits != 0) {
+                u32 none = 0;
+                shared->lichii_first_wait.compare_exchange_strong(
+                    none, static_cast<u32>(std::countr_zero(wait_bits)) + 1,
+                    std::memory_order_relaxed);
+            }
+            if (timeout.count() <= 0) {
+                return shared->complete.load(std::memory_order_acquire);
+            }
+        }
         std::unique_lock lock{shared->mutex};
         return shared->condition.wait_for(
             lock, timeout, [&] { return shared->complete.load(std::memory_order_acquire); });

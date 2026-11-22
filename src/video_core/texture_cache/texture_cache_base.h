@@ -397,6 +397,12 @@ public:
     /// missing, so it runs per miss, not per draw.
     [[nodiscard]] DrawTargets ClassifyDrawTargets();
 
+    /// INTEL_FORK_ASYNC_MODE (port of Lichii build-386 texture_cache.h:2375-2405): whether
+    /// colour target `index` of the current registers was first written by a draw in an earlier
+    /// render frame (first_write_frame). The bound target while its dirty flags are clear, else
+    /// the registered image at the registers' address (nothing is created). Takes the lock.
+    [[nodiscard]] bool ColorTargetWrittenBeforeThisFrame(u32 index);
+
     /// Mark images in a range as modified from the CPU
     void WriteMemory(DAddr cpu_addr, size_t size);
 
@@ -1730,6 +1736,9 @@ private:
     /// True while a clear binds its render targets (UpdateRenderTargets(true)), so JoinImages can
     /// skip the upload of a new target the clear overwrites whole.
     bool clearing_render_targets = false;
+    /// True while a draw binds its render targets (UpdateRenderTargets(false)): only these writes
+    /// set first_written_frame, not clears, blits, copies or DMA (Lichii build-386).
+    bool drawing_render_targets = false;
     /// True while FindRenderTargetView looks a render target up (clear or draw), so JoinImages
     /// knows a new image is a render target (EDEN_NX2_RT_DEPTH_NOUPLOAD bit 1).
     bool render_target_lookup = false;

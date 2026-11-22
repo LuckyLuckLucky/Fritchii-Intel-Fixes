@@ -3518,6 +3518,15 @@ void TextureCache<P>::UpdateRenderTargets(bool is_clear) {
         }
     } clearing_scope{clearing_render_targets};
     clearing_render_targets = is_clear;
+    // INTEL_FORK_ASYNC_MODE: a draw's targets get first_write_frame (Lichii's
+    // drawing_render_targets), on every path out reset.
+    struct DrawingScope {
+        bool& flag;
+        ~DrawingScope() {
+            flag = false;
+        }
+    } drawing_scope{drawing_render_targets};
+    drawing_render_targets = !is_clear;
     // EDEN_NX2_DEPTH_CENSUS: the depth target bound once this update is done, on every path out.
     struct CensusScope {
         TextureCache& cache;
@@ -8378,6 +8387,8 @@ void TextureCache<P>::RelocateImage(ImageId image_id, GPUVAddr gpu_addr, DAddr c
     image.flags |= ImageFlagBits::CpuModified;
     image.last_write_frame = ~u64{0};
     image.write_streak = 0;
+    // A new target at the new address (Lichii would make a new image, first_written_frame 0).
+    image.first_write_frame = ~u64{0};
     image.relocation_guard_noted = 0;
     image.lost_contents = 0;
     // A new target to the asynchronous shaders' skip rule too: its draws wait until it was
@@ -9120,6 +9131,10 @@ void TextureCache<P>::PrepareImage(ImageId image_id, bool is_modification, bool 
             VideoCommon::Nx2FastDrawCount::Break(VideoCommon::Nx2FastDrawCount::Reason::Invalidation);
         }
         MarkModification(image);
+        // INTEL_FORK_ASYNC_MODE (Lichii build-386 texture_cache.h:5930-5931): set once.
+        if (drawing_render_targets && image.first_write_frame == ~u64{0}) {
+            image.first_write_frame = RenderFrame();
+        }
     }
     TouchImageLru(image);
 }
@@ -9424,6 +9439,47 @@ DrawTargets TextureCache<P>::ClassifyDrawTargets() {
         result.kind_if_redrawn = DrawTargetClass::Persistent;
     }
     return result;
+}
+
+template <class P>
+bool TextureCache<P>::ColorTargetWrittenBeforeThisFrame(u32 index) {
+    if (!maxwell3d || index >= NUM_RT) {
+        return false;
+    }
+    const auto& regs = maxwell3d->regs;
+    const auto& rt = regs.rt[index];
+    const GPUVAddr gpu_addr = rt.Address();
+    if (gpu_addr == 0 || rt.format == Tegra::RenderTargetFormat::NONE) {
+        return false;
+    }
+    std::scoped_lock lock{mutex};
+    const ImageBase* image{};
+    if (!maxwell3d->dirty.flags[Dirty::RenderTargets] &&
+        !maxwell3d->dirty.flags[Dirty::ColorBuffer0 + index]) {
+        // Lichii reads rt_image_id; the bound view gives the same image (as ClassifyDrawTargets).
+        const ImageViewId view = render_targets.color_buffer_ids[index];
+        if (view && view != NULL_IMAGE_VIEW_ID && !slot_image_views[view].IsBuffer()) {
+            if (const ImageId image_id = slot_image_views[view].image_id; image_id) {
+                image = &slot_images[image_id];
+            }
+        }
+    } else {
+        const ImageInfo info(rt, regs.anti_alias_samples_mode);
+        if (info.format == PixelFormat::Invalid || info.size.width == 0 ||
+            info.size.height == 0 || info.size.depth == 0 || info.size.width > 65536 ||
+            info.size.height > 65536 || info.size.depth > 2048 || info.resources.layers <= 0 ||
+            info.resources.layers > 2048) {
+            return false;
+        }
+        if (const ImageId image_id = FindImage(info, gpu_addr, RelaxedOptions{}); image_id) {
+            image = &slot_images[image_id];
+        }
+    }
+    if (image == nullptr) {
+        return false;
+    }
+    // Lichii: first_written_frame != 0 && first_written_frame < frame_tick + 1, on our clock.
+    return image->first_write_frame != ~u64{0} && image->first_write_frame < RenderFrame();
 }
 
 template <class P>
