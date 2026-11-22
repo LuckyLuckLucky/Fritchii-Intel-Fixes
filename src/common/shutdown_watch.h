@@ -24,6 +24,13 @@ namespace Common::ShutdownWatch {
 void Begin(const char* step);
 /// Names the next step (a string literal); nothing while the watch is not armed.
 void Step(const char* step);
+// INTEL_FORK_CLOSE_WATCHDOG (boot, seconds, default 0 = off): once the user closes the window
+// (MarkClosing), that many seconds without any step or teardown progress end the process (exit
+// code 2) after the report, also while the game's teardown is still running (a long-session close
+// sat at 0 % CPU in 'suspending emulation, closing services' for good, 2026-11-20). Game saves and
+// the pipeline cache file are written during play, so only a deadlocked teardown is cut short.
+/// The window close began (the app ends after this stop): arms INTEL_FORK_CLOSE_WATCHDOG.
+void MarkClosing();
 /// Names a step after the frontend's close: only the process exit is left.
 void Exiting(const char* step);
 /// Disarms (a stop finished and the app stays open).

@@ -57,6 +57,11 @@ int ExitSeconds() {
     return seconds;
 }
 
+int CloseSeconds() {
+    static const int seconds = SecondsSwitch("INTEL_FORK_CLOSE_WATCHDOG", 0);
+    return seconds;
+}
+
 struct StepEntry {
     const char* name{};
     u64 ns{};
@@ -67,6 +72,7 @@ struct State {
     std::condition_variable cv;
     bool armed{};
     bool exiting{};
+    bool closing{}; ///< the window close began (MarkClosing); never reset
     bool thread_started{};
     u64 begin_ns{};
     u64 epoch{}; ///< bumps at every step
@@ -191,6 +197,15 @@ void Run() {
                          static_cast<double>(quiet) / 1e9, CurrentStep(state), exit_seconds);
             EndProcess();
         }
+        const int close_seconds = CloseSeconds();
+        if (reported && state.closing && !state.exiting && close_seconds > 0 &&
+            quiet >= static_cast<u64>(close_seconds) * 1'000'000'000ULL) {
+            LOG_CRITICAL(Frontend,
+                         "Shutdown watch: window close stuck for {:.1f} s in step '{}', ending "
+                         "the process (INTEL_FORK_CLOSE_WATCHDOG={})",
+                         static_cast<double>(quiet) / 1e9, CurrentStep(state), close_seconds);
+            EndProcess();
+        }
     }
 }
 
@@ -243,6 +258,18 @@ void Exiting(const char* step) {
         state.exiting = true;
         AddStep(state, step);
     }
+}
+
+void MarkClosing() {
+    if (WatchSeconds() <= 0) {
+        return;
+    }
+    State& state = GetState();
+    {
+        std::scoped_lock lock{state.mutex};
+        state.closing = true;
+    }
+    state.cv.notify_all();
 }
 
 void End() {

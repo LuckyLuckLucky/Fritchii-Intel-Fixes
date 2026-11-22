@@ -6351,6 +6351,7 @@ void MainWindow::closeEvent(QCloseEvent* event) {
         return;
     }
     close_pending = true;
+    Common::ShutdownWatch::MarkClosing();
     game_list->SetScanEnabled(false);
     if (boot_in_progress) {
         event->ignore();
