@@ -58,7 +58,7 @@ int ExitSeconds() {
 }
 
 int CloseSeconds() {
-    static const int seconds = SecondsSwitch("INTEL_FORK_CLOSE_WATCHDOG", 0);
+    static const int seconds = SecondsSwitch("INTEL_FORK_CLOSE_WATCHDOG", 20);
     return seconds;
 }
 

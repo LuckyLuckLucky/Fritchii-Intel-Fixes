@@ -109,8 +109,9 @@ enum class IntelForkAsyncMode : int { Off, Dry, Lichii, LichiiBounded };
 inline IntelForkAsyncMode IntelForkAsyncModeSetting() {
     static const IntelForkAsyncMode mode = [] {
         const char* const v = std::getenv("INTEL_FORK_ASYNC_MODE");
-        if (v == nullptr) {
-            return IntelForkAsyncMode::Off;
+        // Default (IntelFix10, 2026-11-23, T2/T2b/T2c): lichii. "off" turns it off.
+        if (v == nullptr || v[0] == '\0') {
+            return IntelForkAsyncMode::Lichii;
         }
         const std::string_view value{v};
         if (value == "dry") {
@@ -157,8 +158,9 @@ inline s64 IntelForkAsyncBudgetUs() {
 inline int IntelForkAsyncMeshSkip() {
     static const int mode = [] {
         const char* const v = std::getenv("INTEL_FORK_ASYNC_MESH_SKIP");
-        const int m = v != nullptr && v[0] != '\0' ? std::atoi(v) : 0;
-        return m >= 0 && m <= 2 ? m : 0;
+        // Default (IntelFix10, 2026-11-23, T2): 1, mesh draws follow the same rule as others.
+        const int m = v != nullptr && v[0] != '\0' ? std::atoi(v) : 1;
+        return m >= 0 && m <= 2 ? m : 1;
     }();
     return mode;
 }
