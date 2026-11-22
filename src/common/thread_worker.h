@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <deque>
 #include <functional>
 #include <mutex>
 #include <string>
@@ -73,16 +74,23 @@ public:
                     Task task;
                     {
                         std::unique_lock lock{queue_mutex};
-                        if (requests.empty()) {
+                        if (requests.empty() && urgent.empty()) {
                             wait_condition.notify_all();
                         }
-                        condition.wait(lock, stop_token,
-                                       [this] { return !requests.empty(); });
+                        condition.wait(lock, stop_token, [this] {
+                            return !requests.empty() || !urgent.empty();
+                        });
                         if (stop_token.stop_requested()) {
                             break;
                         }
-                        task = std::move(requests.front());
-                        requests.pop();
+                        // Urgent work (QueueUrgent) is taken before the FIFO.
+                        if (!urgent.empty()) {
+                            task = std::move(urgent.front());
+                            urgent.pop_front();
+                        } else {
+                            task = std::move(requests.front());
+                            requests.pop();
+                        }
                     }
                     if constexpr (with_state) {
                         task(&state);
@@ -119,6 +127,16 @@ public:
         condition.notify_one();
     }
 
+    /// Queues work that the next free thread takes before anything queued with QueueWork.
+    void QueueUrgent(Task work) {
+        {
+            std::unique_lock lock{queue_mutex};
+            urgent.emplace_back(std::move(work));
+            ++work_scheduled;
+        }
+        condition.notify_one();
+    }
+
     bool TryQueueWork(Task work) {
         {
             std::unique_lock lock{queue_mutex};
@@ -146,6 +164,7 @@ public:
 
 private:
     std::queue<Task> requests;
+    std::deque<Task> urgent;
     std::mutex queue_mutex;
     std::condition_variable_any condition;
     std::condition_variable wait_condition;

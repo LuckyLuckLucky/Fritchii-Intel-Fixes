@@ -38,7 +38,9 @@ set(KnownStamps "143b6220486fb09b;3dc8b3ea00f9b392;1f51cf4a5778b528")
 # So the prepared pipelines are 6.1's, with Full on or off.
 # Intel fork: 602f24ca9813f84f = the Intel fork merged with 6.2, whose own shader changes 6.2 maps to 6.1's stamp
 # (above); the boot check of the kept pipelines (CheckKeptSample) prepares again if a sample translates otherwise.
-set(SameAsReleased "096d887be421a8e2=143b6220486fb09b;6f72127d45416a88=3dc8b3ea00f9b392;602f24ca9813f84f=1f51cf4a5778b528")
+# Intel fork: 702cf8d89a6fed6c = 602f24ca9813f84f + INTEL_FORK_BUILD_PRIORITY (2026-11-22): vk_graphics_pipeline.cpp only
+# changes how a draw waits for its build (Promote / WaitForDraw), never what is built.
+set(SameAsReleased "096d887be421a8e2=143b6220486fb09b;6f72127d45416a88=3dc8b3ea00f9b392;602f24ca9813f84f=1f51cf4a5778b528;702cf8d89a6fed6c=1f51cf4a5778b528")
 
 # The SHA-256 of a file as if its FRITCHII_STAMP_SKIP blocks weren't there, line endings as in the
 # file. file(READ) gives LF line endings on every platform, so CRLF goes back on before hashing.

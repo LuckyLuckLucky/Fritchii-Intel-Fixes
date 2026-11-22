@@ -2800,7 +2800,9 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         // triangles the draw then reads; both use the descriptor set committed here.
         scheduler.RequestOutsideRenderPassOperationContext();
         if (!IsBuilt()) {
-            scheduler.Record([this](vk::CommandBuffer) { build->Wait(!worker_only_build); });
+            build->Promote();
+            scheduler.Record(
+                [this](vk::CommandBuffer) { build->WaitForDraw(!worker_only_build); });
         }
         // EDEN_NX2_MESH_FIRST: the task (or mesh) compute shader adds the draw's first
         // workgroup index, as the native mesh path does.
@@ -2968,10 +2970,12 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
         scheduler.NoteRenderPassStores();
     }
     if (!IsBuilt()) {
+        // INTEL_FORK_BUILD_PRIORITY: the build jumps the builder queue while this draw is recorded.
+        build->Promote();
         // Wait for the pipeline to be built
         scheduler.Record([this](vk::CommandBuffer) {
             const auto begin = std::chrono::steady_clock::now();
-            build->Wait(!worker_only_build);
+            build->WaitForDraw(!worker_only_build);
             const auto held = std::chrono::steady_clock::now() - begin;
             const auto held_ns =
                 std::chrono::duration_cast<std::chrono::nanoseconds>(held).count();
