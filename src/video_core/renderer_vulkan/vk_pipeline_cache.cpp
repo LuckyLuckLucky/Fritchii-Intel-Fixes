@@ -5026,6 +5026,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         graphics_warm_threads.clear();
         compute_warm_threads.clear();
         precompile_thread = {};
+        compute_precache.reset();
         warm_stop_callback.reset();
         compute_warm_done = true;
         // The earlier load's background builds too: its pipelines no draw took are dropped
@@ -5705,7 +5706,11 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 warm_cancel = true;
                 background_stop.store(true, std::memory_order_relaxed);
             }});
-        StartComputeWarm(title_id);
+        // Intel fork build 1: the pre-launch compute precache takes the title's warm-compute.bin
+        // over (built at the gate, not beside the game).
+        if (!LoadComputePrecache(title_id)) {
+            StartComputeWarm(title_id);
+        }
         StartGraphicsWarm(title_id);
         StartPrecompiled(title_id, base_dir);
     }
@@ -6098,6 +6103,443 @@ void PipelineCache::StartComputeWarm(u64 title_id) {
     }
 }
 
+namespace {
+/// INTEL_FORK_COMPUTE_PRECACHE (boot): unset = on with Intel's Windows driver only, 0 = off
+/// (StartComputeWarm beside the game, as before), 1 = on with any driver.
+bool ComputePrecacheOn(const Device& device) {
+    static const int mode = [] {
+        const char* const value = std::getenv("INTEL_FORK_COMPUTE_PRECACHE");
+        if (value == nullptr || *value == '\0') {
+            return -1;
+        }
+        return std::atoi(value);
+    }();
+    if (mode == 0) {
+        return false;
+    }
+    return mode > 0 || device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
+}
+
+/// INTEL_FORK_COMPUTE_PRECACHE_THREADS (1 to 32), else Lichii's driver-compile cap: half the CPU
+/// threads, at least 2, at most the pipeline workers (6 on a 12-thread CPU).
+size_t ComputePrecacheThreads(const Device& device) {
+    if (const char* const value = std::getenv("INTEL_FORK_COMPUTE_PRECACHE_THREADS");
+        value != nullptr && *value != '\0') {
+        const int threads = std::atoi(value);
+        if (threads >= 1 && threads <= 32) {
+            return static_cast<size_t>(threads);
+        }
+    }
+    const size_t half =
+        (std::max)(static_cast<size_t>(Common::LowEndSim::LogicalProcessors()) / 2, size_t{2});
+    return (std::min)(GetTotalPipelineWorkers(device), half);
+}
+
+/// Set on the compute precache's threads: CreateComputePipeline leaves the SPIR-V hash of the
+/// build in t_compute_precache_spirv.
+thread_local bool t_compute_precache_build = false;
+thread_local u64 t_compute_precache_spirv = 0;
+
+u64 SpirvHash(std::span<const u32> code) {
+    return Common::CityHash64(reinterpret_cast<const char*>(code.data()), code.size_bytes());
+}
+
+/// The SPIR-V hash of each compute key the precache built (this run and earlier ones, from its
+/// progress file), and how play's compute translations compared with them. Never destroyed: a
+/// worker may translate while static destruction runs.
+struct ComputePrecacheSpirv {
+    std::mutex mutex;
+    std::unordered_map<u64, u64> by_key; ///< ComputePipelineCacheKey::Hash -> SPIR-V hash
+    std::atomic<bool> any{false};
+    u64 same{};
+    u64 differ{};
+    u64 absent{};
+    u32 lines{};
+};
+
+ComputePrecacheSpirv& GetComputePrecacheSpirv() {
+    static ComputePrecacheSpirv* const registry = new ComputePrecacheSpirv;
+    return *registry;
+}
+
+void NoteComputePrecacheSpirv(u64 key_hash, u64 spirv_hash) {
+    auto& registry = GetComputePrecacheSpirv();
+    std::scoped_lock lock{registry.mutex};
+    registry.by_key[key_hash] = spirv_hash;
+    registry.any.store(true, std::memory_order_release);
+}
+
+/// A dispatch's compute translation (CreateComputePipeline, a worker build): its SPIR-V against
+/// the precache's for the same key. The same SPIR-V finds the precache's driver build; another
+/// one is compiled by the driver (the "compiled by the driver at run time" line follows).
+void CheckComputePrecacheSpirv(const ComputePipelineCacheKey& key, std::span<const u32> code) {
+    constexpr u32 LineLimit = 64;
+    auto& registry = GetComputePrecacheSpirv();
+    if (!registry.any.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u64 spirv = SpirvHash(code);
+    std::scoped_lock lock{registry.mutex};
+    const auto it = registry.by_key.find(key.Hash());
+    const char* verdict = "";
+    if (it == registry.by_key.end()) {
+        ++registry.absent;
+        verdict = "not built by the precache";
+    } else if (it->second == spirv) {
+        ++registry.same;
+        verdict = "the same as the precache's (its driver build is reused)";
+    } else {
+        ++registry.differ;
+        verdict = "not the precache's (the game's state differs from the guessed one)";
+    }
+    if (registry.lines < LineLimit) {
+        ++registry.lines;
+        LOG_INFO(Render_Vulkan,
+                 "Compute precache check: pipeline {:016x} (shader {:016x}) translated in play, "
+                 "SPIR-V {}; this session {} the same, {} different, {} not precached{}",
+                 key.Hash(), key.unique_hash, verdict, registry.same, registry.differ,
+                 registry.absent,
+                 registry.lines == LineLimit ? " (last such line this session)" : "");
+    }
+}
+
+/// The precache's progress file, opened to append to a file of this stamp or started over.
+std::ofstream OpenComputePrecacheProgress(const std::filesystem::path& path,
+                                          const std::string& stamp, bool append) {
+    std::error_code ec;
+    std::filesystem::create_directories(path.parent_path(), ec);
+    if (append) {
+        return std::ofstream(path, std::ios::app);
+    }
+    std::ofstream out(path, std::ios::trunc);
+    out << stamp << '\n';
+    out.flush();
+    return out;
+}
+} // Anonymous namespace
+
+struct PipelineCache::ComputePrecache {
+    struct Entry {
+        ComputePipelineCacheKey key{};
+        FileEnvironment env;
+    };
+    std::vector<Entry> entries;
+    std::filesystem::path warm_file;
+    std::filesystem::path progress_path; ///< stamp, then "<key hash> <SPIR-V hash>" lines, "done"
+    std::filesystem::path running_path;  ///< stamp and strike count while a precache runs
+    std::string stamp;
+    bool progress_matches{}; ///< The progress file holds this stamp: appended to
+    u32 strikes{};           ///< Earlier precaches of this stamp that did not end
+    size_t file_entries{};
+    size_t in_disk_cache{};
+    size_t built_before{};
+};
+
+bool PipelineCache::LoadComputePrecache(u64 title_id) {
+    compute_precache.reset();
+    if (!ComputePrecacheOn(device)) {
+        return false;
+    }
+    const std::filesystem::path title_file = VideoCommon::ShaderWarm::ComputeWarmPath(title_id);
+    const std::filesystem::path warm_file = WarmFile("EDEN_NX2_COMPUTE_WARM", title_file);
+    if (warm_file.empty()) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute precache (INTEL_FORK_COMPUTE_PRECACHE): no compute programs file ({} "
+                 "not found; Prepare shaders (warm-up) in the game list makes it from the game "
+                 "files, EDEN_NX2_COMPUTE_WARM=<file> names one): nothing to precache",
+                 Common::FS::PathToUTF8String(title_file));
+        return false;
+    }
+    const std::string file_path = Common::FS::PathToUTF8String(warm_file);
+    auto precache = std::make_shared<ComputePrecache>();
+    precache->warm_file = warm_file;
+    const std::filesystem::path title_dir = title_file.parent_path();
+    precache->progress_path =
+        title_dir / fmt::format("intel_compute_precache.fork-v{}.txt", CACHE_VERSION);
+    precache->running_path =
+        title_dir / fmt::format("intel_compute_precache.fork-v{}.running", CACHE_VERSION);
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(warm_file, ec);
+    if (ec) {
+        LOG_WARNING(Render_Vulkan, "Compute precache: cannot read the size of {}", file_path);
+        return false;
+    }
+    const auto modified = static_cast<s64>(
+        std::filesystem::last_write_time(warm_file, ec).time_since_epoch().count());
+    // The file, the driver and this build's SPIR-V: a new translator (NX2_SHADER_STAMP) or SPIR-V
+    // setting builds the programs again.
+    precache->stamp = fmt::format("{} {} {:#x} {:#x} v{} spirv {:#x} shaders-{}",
+                                  static_cast<u64>(size), modified, device.GetDriverVersion(),
+                                  device.GetDeviceID(), CACHE_VERSION, SpirvSettingsStamp(device),
+                                  NX2_SHADER_STAMP);
+
+    // A precache that did not end (killed, or a driver crash): run once more, resuming; after a
+    // second one that did not end, skip it until the file, driver or build changes.
+    if (std::filesystem::exists(precache->running_path, ec)) {
+        std::ifstream in(precache->running_path);
+        std::string line;
+        std::string strikes_line;
+        std::getline(in, line);
+        std::getline(in, strikes_line);
+        in.close();
+        if (line == precache->stamp) {
+            precache->strikes = static_cast<u32>(std::strtoul(strikes_line.c_str(), nullptr, 10));
+        }
+        if (precache->strikes >= 2) {
+            LOG_WARNING(Render_Vulkan,
+                        "Compute precache: skipped, the last {} did not end (the emulator was "
+                        "killed or the driver crashed during them); delete {} to run it again",
+                        precache->strikes, Common::FS::PathToUTF8String(precache->running_path));
+            return true;
+        }
+        if (line != precache->stamp) {
+            std::filesystem::remove(precache->running_path, ec);
+        }
+    }
+
+    std::unordered_set<u64> built;
+    bool done = false;
+    {
+        std::ifstream in(precache->progress_path);
+        std::string line;
+        if (in && std::getline(in, line) && line == precache->stamp) {
+            precache->progress_matches = true;
+            while (std::getline(in, line)) {
+                if (line == "done") {
+                    done = true;
+                    continue;
+                }
+                const char* const text = line.c_str();
+                char* end = nullptr;
+                const u64 key_hash = std::strtoull(text, &end, 16);
+                if (end == text) {
+                    continue;
+                }
+                const u64 spirv_hash = std::strtoull(end, nullptr, 16);
+                built.insert(key_hash);
+                NoteComputePrecacheSpirv(key_hash, spirv_hash);
+            }
+        }
+    }
+    if (done) {
+        LOG_INFO(Render_Vulkan,
+                 "Compute precache: already done for this file, driver and build ({} programs "
+                 "built; play's compute translations are compared with them)",
+                 built.size());
+        return true;
+    }
+
+    // Read the whole file here (its own reader: the disk cache loader deletes files it rejects).
+    bool read_ok = false;
+    try {
+        std::ifstream file(warm_file, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            LOG_WARNING(Render_Vulkan, "Compute precache: cannot open {}", file_path);
+            return false;
+        }
+        file.exceptions(std::ifstream::failbit);
+        const auto end{file.tellg()};
+        file.seekg(0, std::ios::beg);
+        std::array<char, 8> magic{};
+        u32 version{};
+        file.read(magic.data(), magic.size())
+            .read(reinterpret_cast<char*>(&version), sizeof(version));
+        constexpr std::array<char, 8> expected_magic{'y', 'u', 'z', 'u', 'c', 'a', 'c', 'h'};
+        if (magic != expected_magic || version != CACHE_VERSION) {
+            LOG_WARNING(Render_Vulkan, "Compute precache: {} is not a version {} file", file_path,
+                        CACHE_VERSION);
+            return false;
+        }
+        while (file.tellg() != end) {
+            u32 num_envs{};
+            file.read(reinterpret_cast<char*>(&num_envs), sizeof(num_envs));
+            if (num_envs != 1) {
+                LOG_WARNING(Render_Vulkan, "Compute precache: unexpected entry in {}", file_path);
+                break;
+            }
+            if (!FileEnvironment::RecordFits(file, static_cast<u64>(end - file.tellg()))) {
+                LOG_WARNING(Render_Vulkan,
+                            "Compute precache: entry {} of {} is larger than the file, skipping "
+                            "the rest",
+                            precache->file_entries + 1, file_path);
+                break;
+            }
+            ComputePrecache::Entry entry;
+            entry.env.Deserialize(file);
+            if (entry.env.ShaderStage() != Shader::Stage::Compute) {
+                LOG_WARNING(Render_Vulkan, "Compute precache: non-compute entry in {}", file_path);
+                break;
+            }
+            file.read(reinterpret_cast<char*>(&entry.key), sizeof(entry.key));
+            ++precache->file_entries;
+            // Programs already in the disk cache were built at boot from the game's own state;
+            // those an earlier precache built are in the driver's cache.
+            if (compute_cache.contains(entry.key)) {
+                ++precache->in_disk_cache;
+                continue;
+            }
+            if (built.contains(entry.key.Hash())) {
+                ++precache->built_before;
+                continue;
+            }
+            precache->entries.push_back(std::move(entry));
+        }
+        read_ok = file.tellg() == end;
+    } catch (const std::exception& e) {
+        LOG_WARNING(Render_Vulkan, "Compute precache: reading {} failed: {}", file_path, e.what());
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute precache (INTEL_FORK_COMPUTE_PRECACHE): {} compute programs found in {}, {} "
+             "to build before play ({} in the disk cache already, {} built by an earlier "
+             "precache){}",
+             precache->file_entries, file_path, precache->entries.size(), precache->in_disk_cache,
+             precache->built_before, read_ok ? "" : " (file read only in part)");
+    if (precache->entries.empty()) {
+        if (read_ok && precache->file_entries != 0) {
+            std::ofstream progress = OpenComputePrecacheProgress(
+                precache->progress_path, precache->stamp, precache->progress_matches);
+            progress << "done\n";
+        }
+        return true;
+    }
+    compute_precache = std::move(precache);
+    return true;
+}
+
+void PipelineCache::RunComputePrecache(ComputePrecache& precache, std::stop_token stop) {
+    // Only while the gate holds the game ("Preparing shaders" at full speed, or paused before
+    // it shows): never beside play.
+    const auto held = [this] {
+        return shader_notify.PrecompileFullSpeed() || shader_notify.WarmMayBuild();
+    };
+    const auto wait_begin = std::chrono::steady_clock::now();
+    while (!held()) {
+        if (stop.stop_requested() || warm_cancel) {
+            return;
+        }
+        if (std::chrono::steady_clock::now() - wait_begin > std::chrono::seconds{30}) {
+            LOG_WARNING(Render_Vulkan,
+                        "Compute precache: not run, nothing held the game for it within 30 s "
+                        "(no \"Preparing shaders\" gate); {} programs left for the next gate",
+                        precache.entries.size());
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds{50});
+    }
+    const size_t total = precache.entries.size();
+    const size_t num_threads = (std::min)(ComputePrecacheThreads(device), total);
+    {
+        std::error_code ec;
+        std::filesystem::create_directories(precache.running_path.parent_path(), ec);
+        std::ofstream marker(precache.running_path, std::ios::trunc);
+        marker << precache.stamp << '\n' << precache.strikes + 1 << '\n';
+    }
+    std::ofstream progress = OpenComputePrecacheProgress(precache.progress_path, precache.stamp,
+                                                         precache.progress_matches);
+    precache.progress_matches = true;
+    std::mutex progress_mutex;
+    std::atomic<size_t> next{0};
+    std::atomic<size_t> built{0};
+    std::atomic<size_t> failed{0};
+    std::atomic<size_t> done{0};
+    std::atomic<bool> released{false};
+    static const GuessMissing guess{};
+    const auto begin = std::chrono::steady_clock::now();
+    const auto seconds = [&begin] {
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+    };
+    shader_notify.SetWarmProgress(3, 0, total);
+    LOG_INFO(Render_Vulkan,
+             "Compute precache: building {} compute programs on {} threads at normal priority "
+             "while the gate holds the game (Play now leaves the rest for the next gate)",
+             total, num_threads);
+    {
+        std::vector<std::jthread> threads;
+        threads.reserve(num_threads);
+        for (size_t thread = 0; thread < num_threads; ++thread) {
+            threads.emplace_back([&] {
+                Common::SetCurrentThreadName("VkComputePrecache");
+                PlacePrecompileThread(true);
+                t_compute_precache_build = true;
+                for (;;) {
+                    if (stop.stop_requested() || warm_cancel) {
+                        break;
+                    }
+                    if (!held()) {
+                        // Play now: the builds already in the driver end, no new one starts.
+                        released.store(true, std::memory_order_relaxed);
+                        break;
+                    }
+                    const size_t index = next.fetch_add(1);
+                    if (index >= total) {
+                        break;
+                    }
+                    ComputePrecache::Entry& entry = precache.entries[index];
+                    entry.env.SetGuessMissing(&guess);
+                    t_compute_precache_spirv = 0;
+                    bool ok = false;
+                    try {
+                        ShaderPools pools;
+                        // Built and destroyed here: the driver's cache and our VkPipelineCache
+                        // (WarmPipelineCache) keep it.
+                        ok = CreateComputePipeline(pools, entry.key, entry.env, nullptr, false,
+                                                   true)
+                                 .pipeline != nullptr;
+                    } catch (const std::exception& e) {
+                        LOG_DEBUG(Render_Vulkan, "Compute precache {:016x}: {}",
+                                  entry.key.unique_hash, e.what());
+                    }
+                    entry.env = FileEnvironment{};
+                    if (ok) {
+                        built.fetch_add(1);
+                        const u64 key_hash = entry.key.Hash();
+                        const u64 spirv_hash = t_compute_precache_spirv;
+                        NoteComputePrecacheSpirv(key_hash, spirv_hash);
+                        std::scoped_lock lock{progress_mutex};
+                        progress << fmt::format("{:016x} {:016x}\n", key_hash, spirv_hash);
+                        progress.flush();
+                    } else {
+                        failed.fetch_add(1);
+                    }
+                    const size_t now_done = done.fetch_add(1) + 1;
+                    if (now_done % 8 == 0 || now_done == total) {
+                        shader_notify.SetWarmProgress(3, now_done, total);
+                    }
+                    if (now_done % 250 == 0) {
+                        LOG_INFO(Render_Vulkan,
+                                 "Compute precache: {} of {} done ({} built, {} failed), {:.0f} s",
+                                 now_done, total, built.load(), failed.load(), seconds());
+                    }
+                }
+                t_compute_precache_build = false;
+            });
+        }
+    } // joined
+    std::error_code ec;
+    std::filesystem::remove(precache.running_path, ec);
+    const bool stopped = stop.stop_requested() || warm_cancel;
+    const bool finished = !stopped && done.load() >= total;
+    if (finished) {
+        progress << "done\n";
+    }
+    progress.close();
+    shader_notify.SetWarmProgress(3, 0, 0);
+    shader_notify.SetWarmProgress(0, 0, 0);
+    if (built.load() != 0 && !stopped) {
+        // Our VkPipelineCache file now, not only at exit: a later crash keeps these builds.
+        QueueVulkanPipelineCacheSave(true);
+    }
+    LOG_INFO(Render_Vulkan,
+             "Compute precache: {}, {} built, {} failed, {} not reached, {:.1f} s on {} threads",
+             finished   ? "finished"
+             : stopped  ? "stopped"
+             : released.load(std::memory_order_relaxed)
+                 ? "skipped by Play now (the rest at the next gate)"
+                 : "ended early (the rest at the next gate)",
+             built.load(), failed.load(), total - (std::min)(total, done.load()), seconds(),
+             num_threads);
+}
+
 void PipelineCache::StartGraphicsWarm(u64 title_id) {
     if (!graphics_warm_threads.empty() || !device.IsExtGraphicsPipelineLibrarySupported()) {
         return;
@@ -6320,24 +6762,33 @@ bool PipelineCache::WaitForWarmTurn(std::stop_token stop) {
 void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& base_dir) {
     precompile_thread = {};
     shader_notify.SetPrecompileAvailable(false);
+    // Intel fork build 1: the compute precache (LoadComputePrecache) runs first on this thread,
+    // while the gate holds the game; it keeps the gate up (pending) even when the recipe
+    // preparation has nothing to do or is off.
+    std::shared_ptr<ComputePrecache> precache = std::move(compute_precache);
     const int mode = VideoCommon::Nx2Precompile::Mode();
-    if (mode == 0) {
-        return;
-    }
+    bool prepare = mode != 0;
     // The prepared pipelines are kept by the driver's own cache. Without one they would go to the
     // emulator's pipeline cache file, which is loaded whole at boot: only on request there.
-    if (!DriverCachesPipelines(device) && mode < 2) {
+    if (prepare && !DriverCachesPipelines(device) && mode < 2) {
         LOG_INFO(Render_Vulkan, "Precompiled pipelines skipped: the driver keeps no pipeline cache "
                                 "of its own (EDEN_NX2_PRECOMPILE=2 prepares them anyway)");
+        prepare = false;
+    }
+    if (!prepare && !precache) {
         return;
     }
-    // Taken here, before the GPU thread starts adding to it.
-    precompile_disk_keys = std::make_shared<const std::unordered_set<u64>>(disk_pipelines);
-    precompile_used_keys = std::make_shared<const std::unordered_map<u64, u8>>(used_pipelines);
+    if (prepare) {
+        // Taken here, before the GPU thread starts adding to it.
+        precompile_disk_keys = std::make_shared<const std::unordered_set<u64>>(disk_pipelines);
+        precompile_used_keys =
+            std::make_shared<const std::unordered_map<u64, u8>>(used_pipelines);
+    }
     // Pending until the first preparation ends (or there is nothing to prepare); set before the
     // thread starts so a frontend asking right after loading sees it.
     shader_notify.SetPrecompilePending(true);
-    precompile_thread = std::jthread([this, title_id, base_dir](std::stop_token stop) {
+    precompile_thread = std::jthread([this, title_id, base_dir, prepare,
+                                      precache](std::stop_token stop) {
         Common::SetCurrentThreadName("VkPrecompile");
         PlacePrebuildThread(true);
         struct PendingGuard {
@@ -6346,6 +6797,14 @@ void PipelineCache::StartPrecompiled(u64 title_id, const std::filesystem::path& 
                 notify.SetPrecompilePending(false);
             }
         } pending_guard{shader_notify};
+        if (precache) {
+            RunComputePrecache(*precache, stop);
+            // Back to this thread's own placement for the preparation beside the game.
+            PlacePrebuildThread(true);
+        }
+        if (!prepare || stop.stop_requested() || warm_cancel) {
+            return;
+        }
         const auto file = VideoCommon::Nx2Precompile::EnsurePrecompiledFile(title_id, base_dir,
                                                                             CACHE_VERSION, stop);
         if (file.empty() || stop.stop_requested() || warm_cancel) {
@@ -11362,6 +11821,13 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(
         if (keep->translate_only) {
             return {};
         }
+    }
+    // Intel fork build 1: the compute precache keeps each build's SPIR-V hash; a dispatch's
+    // translation is compared with it (same SPIR-V = the driver build the precache made).
+    if (t_compute_precache_build) {
+        t_compute_precache_spirv = SpirvHash(code);
+    } else if (build_in_parallel && !warm) {
+        CheckComputePrecacheSpirv(key, code);
     }
     SelfCheckSpirv(code, key.unique_hash, "compute");
     device.SaveShader(code);

@@ -686,6 +686,21 @@ private:
     std::vector<std::jthread> compute_warm_threads;
     std::atomic<bool> compute_warm_done{true};
 
+    /// Intel fork build 1 (INTEL_FORK_COMPUTE_PRECACHE, default on on Intel's Windows driver):
+    /// Lichii's pre-launch compute precache. The compute programs of the title's warm-compute.bin
+    /// (found in the game files, missing reads guessed, as StartComputeWarm builds them) are
+    /// built while the "Preparing shaders" gate holds the game, before the recipe preparation,
+    /// on several threads at normal priority; never in play (Play now ends it after the builds
+    /// already in the driver). Progress (the built keys and their SPIR-V hashes) is kept next to
+    /// the title's cache, so a skipped precache builds only the rest at the next gate.
+    /// LoadComputePrecache (end of LoadDiskResources) reads the file; true when the precache
+    /// owns the compute warm-up of this title (StartComputeWarm then does not run).
+    struct ComputePrecache;
+    bool LoadComputePrecache(u64 title_id);
+    /// On precompile_thread, while the gate holds the game.
+    void RunComputePrecache(ComputePrecache& precache, std::stop_token stop);
+    std::shared_ptr<ComputePrecache> compute_precache;
+
     /// The title's warm-graphics.bin (ShaderWarm::GraphicsWarmPath, EDEN_NX2_GRAPHICS_WARM=<file>
     /// overrides; needs graphics pipeline libraries): vertex and fragment programs prepared from
     /// the game files are built as single-stage libraries in the background after the compute
