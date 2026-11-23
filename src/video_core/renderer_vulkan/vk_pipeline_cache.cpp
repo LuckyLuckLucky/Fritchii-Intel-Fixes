@@ -6120,8 +6120,22 @@ bool ComputePrecacheOn(const Device& device) {
     return mode > 0 || device.GetDriverID() == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS;
 }
 
+/// IntelFix10 A-series build (branch intel/a-series, a separate kit for Arc A380/A750/A770; the
+/// normal build never has this). Tester logs: an A770's preparation ran 31.8/s, then 0/s at 2 %
+/// in the compute phase; Longshot 6abf2f5f (#496): an A750 froze building 4 big compute pipelines
+/// at once, fixed by one compute build at a time on Intel. Here: the shader preparation uses at
+/// most 2 threads and the compute precache 1, unless the player sets EDEN_NX2_PRECOMPILE_THREADS
+/// (preparation) or INTEL_FORK_COMPUTE_PRECACHE_THREADS (compute precache) themselves.
+size_t ASeriesPrepThreads(size_t threads) {
+    if (const char* const value = std::getenv("EDEN_NX2_PRECOMPILE_THREADS");
+        value != nullptr && *value != '\0') {
+        return threads;
+    }
+    return (std::min)(threads, size_t{2});
+}
+
 /// INTEL_FORK_COMPUTE_PRECACHE_THREADS (1 to 32), else Lichii's driver-compile cap: half the CPU
-/// threads, at least 2, at most the pipeline workers (6 on a 12-thread CPU).
+/// threads, at least 2, at most the pipeline workers (6 on a 12-thread CPU). A-series build: 1.
 size_t ComputePrecacheThreads(const Device& device) {
     if (const char* const value = std::getenv("INTEL_FORK_COMPUTE_PRECACHE_THREADS");
         value != nullptr && *value != '\0') {
@@ -6130,9 +6144,8 @@ size_t ComputePrecacheThreads(const Device& device) {
             return static_cast<size_t>(threads);
         }
     }
-    const size_t half =
-        (std::max)(static_cast<size_t>(Common::LowEndSim::LogicalProcessors()) / 2, size_t{2});
-    return (std::min)(GetTotalPipelineWorkers(device), half);
+    static_cast<void>(device); // A-series build: one compute build at a time
+    return size_t{1};
 }
 
 /// Set on the compute precache's threads: CreateComputePipeline leaves the SPIR-V hash of the
@@ -7141,7 +7154,7 @@ void PipelineCache::PreparePrecompiled(const std::filesystem::path& base_dir,
     const auto progress_path =
         base_dir / fmt::format("precompiled_progress.fork-v{}.txt", CACHE_VERSION);
     const size_t threads =
-        CapLegacyAmdBuildThreads(device, VideoCommon::Nx2Precompile::Threads());
+        ASeriesPrepThreads(CapLegacyAmdBuildThreads(device, VideoCommon::Nx2Precompile::Threads()));
     size_t start_index = 0;
     u32 restarts = 0;
     // The checkpoint is a position in the order the records are taken in: the file's order, or
